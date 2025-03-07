@@ -1,12 +1,7 @@
 # Active Context
 
-**Current Work Focus:** Implementing the "From Files To Databases" chapter of the guide.
+**Current Work Focus:** Implementing the "B+tree node" task (4.1) of the guide.
 
-**Recent Changes:** Completed the "1.1 Updating files in-place" sub-task.
+**Recent Changes:** Completed the "Atomic renaming" sub-task (1.2).
 
-**Next Steps:** Implement the "1.2 Atomic renaming" sub-task.
-
-**Active Decisions and Considerations:**
-
-- How to implement atomic renaming in Rust.
-- What libraries or techniques to use for file manipulation.
+**Next Steps:** Implement the "B+tree node" task (4.1).

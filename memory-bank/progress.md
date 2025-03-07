@@ -2,15 +2,15 @@
 
 **What works:**
 
-- Updating files in-place (1.1)
+- Updating files in-place (1.1), Atomic renaming (1.2)
 
 **What's left to build:**
 
-- Atomic renaming (1.2)
+- B+tree node (4.1)
 
 **Current status:**
 
-- Working on implementing atomic renaming.
+- Currently planning and implementing the "B+tree node" task (4.1).
 
 **Known issues:**
 
