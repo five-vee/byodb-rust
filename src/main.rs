@@ -25,6 +25,7 @@ fn main() -> Result<(), std::io::Error> {
         .output()?;
 
     let temp_file_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    println!("Created file: {}", temp_file_path);
 
     if let Err(e) = save_data1(&temp_file_path, "hello world".as_bytes()) {
         eprintln!("Error saving data: {}", e);
