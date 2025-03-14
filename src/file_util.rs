@@ -5,7 +5,7 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum SaveError {
-    #[error("I/O error: {0}")]
+    #[error(transparent)]
     IOError(#[from] std::io::Error),
     #[error("I/O error on tmp file {0}: {1}")]
     TmpFileError(Rc<str>, std::io::Error),
