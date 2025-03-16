@@ -2,6 +2,7 @@ use std::fs;
 use std::process::Command;
 
 mod file_util;
+mod bplus_tree;
 
 fn main() {
     let output = match Command::new("mktemp").output() {
