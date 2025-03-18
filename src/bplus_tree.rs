@@ -2,7 +2,7 @@
 //! 
 //! Here is our node format. The 2nd row is the encoded field size in bytes.
 //! 
-//! ```
+//! ```ignore
 //! | type | nkeys |  pointers  |  offsets   | key-values | unused |
 //! |  2B  |   2B  | nkeys × 8B | nkeys × 2B |     ...    |        |
 //! ```
@@ -19,7 +19,7 @@
 //! Each KV pair is prefixed by its size. For internal nodes,
 //! the value size is 0.
 //! 
-//! ```
+//! ```ignore
 //! | key_size | val_size | key | val |
 //! |    2B    |    2B    | ... | ... |
 //! ```
@@ -30,10 +30,10 @@
 //! 
 //! For example, a leaf node `{"k1":"hi", "k3":"hello"}` is encoded as:
 //! 
-//! ```
+//! ```ignore
 //! | type | nkeys | pointers | offsets |            key-values           | unused |
 //! |   2  |   2   | nil nil  |  8 19   | 2 2 "k1" "hi"  2 5 "k3" "hello" |        |
-//! |  2B  |  2B   |   2×8B   |  2×4B   | 4B + 2B + 2B + 4B + 2B + 5B     |        |
+//! |  2B  |  2B   |   2×8B   |  2×2B   | 4B + 2B + 2B + 4B + 2B + 5B     |        |
 //! ```
 //! 
 //! The offset of the first KV pair is always 0, so it’s not stored. To find the
@@ -89,6 +89,7 @@
 //! long as nodes contain the necessary information.
 
 /// The B+ Tree node type of the page.
+#[derive(Debug)]
 enum NodeType {
     Leaf,
     Internal,
@@ -105,8 +106,15 @@ impl From<u16> for NodeType {
 }
 
 /// The on-disk buffer representation of a B+ Tree node.
+#[derive(Clone, Copy)]
 struct BNode {
     buf: [u8; Self::BTREE_PAGE_SIZE]
+}
+
+impl Default for BNode {
+    fn default() -> Self {
+        BNode{buf: [0; Self::BTREE_PAGE_SIZE]}
+    }
 }
 
 impl BNode {
@@ -124,9 +132,13 @@ impl BNode {
         u16::from_le_bytes([self.buf[2], self.buf[3]]).into()
     }
 
-    /// Sets the page header.
-    fn set_header(&mut self, node_type: NodeType, num_keys: u16) {
+    /// Sets the node type of the page.
+    fn set_node_type(&mut self, node_type: NodeType) {
         self.buf[0..2].copy_from_slice(&(node_type as u16).to_le_bytes());
+    }
+
+    /// Sets the number of keys in the page.
+    fn set_num_keys(&mut self, num_keys: u16) {
         self.buf[2..4].copy_from_slice(&num_keys.to_le_bytes());
     }
 
@@ -188,6 +200,9 @@ impl BNode {
     }
 
     /// Sets the `i`th key and value.
+    /// If not careful, this can overwrite the key-values for `i+1` onwards;
+    /// please use `copy_on_insert`/`copy_on_update`
+    /// or `inplace_insert`/`inplace_update` instead.
     fn set_key_value(&mut self, i: u16, k: &[u8], v: &[u8]) {
         assert!(i < self.get_num_keys());
         assert!(k.len() <= Self::BTREE_MAX_KEY_SIZE);
@@ -199,19 +214,189 @@ impl BNode {
         self.set_offset(i + 1, (self.get_key_value_position(i) as u16) + 4 + key_len + val_len);
 
         // Fill in the key-value pair.
-        {
-            let pos = self.get_key_value_position(i);
-            self.buf[pos..pos+2].copy_from_slice(&key_len.to_le_bytes());
-            self.buf[pos+2..pos+4].copy_from_slice(&val_len.to_le_bytes());
-            self.buf[pos+4..pos+4+usize::from(key_len)].copy_from_slice(k);
-            self.buf[pos+4+usize::from(key_len)..pos+4+usize::from(key_len)+usize::from(val_len)].copy_from_slice(v);
-        }
-
-        assert!(self.num_bytes() <= Self::BTREE_PAGE_SIZE);
+        let pos = self.get_key_value_position(i);
+        self.buf[pos..pos+2].copy_from_slice(&key_len.to_le_bytes());
+        self.buf[pos+2..pos+4].copy_from_slice(&val_len.to_le_bytes());
+        self.buf[pos+4..pos+4+usize::from(key_len)].copy_from_slice(k);
+        self.buf[pos+4+usize::from(key_len)..pos+4+usize::from(key_len)+usize::from(val_len)].copy_from_slice(v);
     }
 
     /// Gets the number of bytes taken up by the B+ Tree node.
-    fn num_bytes(&self) -> usize {
+    fn get_num_bytes(&self) -> usize {
         self.get_key_value_position(self.get_num_keys())
+    }
+
+    /// Creates a copy of the node, but with a newly inserted key-value pair at
+    /// position `i`.
+    fn copy_on_insert(&self, i: u16, k: &[u8], v: &[u8]) -> Self {
+        // For simplicity, we re-use inplace_insert.
+        let mut new_node = self.clone();
+        new_node.inplace_insert(i, k, v);
+        new_node
+    }
+
+    /// Creates a copy of the node, but with an updated key-value pair at
+    /// position `i`.
+    fn copy_on_update(&self, i: u16, k: &[u8], v: &[u8]) -> Self {
+        // For simplicity, we re-use inplace_update.
+        let mut new_node = self.clone();
+        new_node.inplace_update(i, k, v);
+        new_node
+    }
+
+    /// Find the index of the (lexicographically) largest key
+    /// less-than-or-equal (i.e. lte) to the query.
+    /// If no such key exists, retuns None.
+    fn lookup_lte(&self, query_key: &[u8]) -> Option<usize> {
+        // Linear search for simplicity.
+        let mut result = None::<usize>;
+        for i in 0..self.get_num_keys() {
+            if self.get_key(i) <= query_key {
+                result = Some(i as usize);
+            }
+        }
+        result
+    }
+
+    /// Splits a node to stay within the page size limit.
+    fn copy_on_split(&self) -> (Self, Self) {
+        let old_num_keys = self.get_num_keys();
+        assert!(old_num_keys > 1);
+        // Lookup the largest index at which the right node
+        // will have >= half the page size.
+        //
+        // The right node can bigger than the left b/c by convention, we
+        // insert/update the left node after split.
+        //
+        // Use linear search for simplicity.
+        let mut right_i: u16 = 1;
+        for i in 2..old_num_keys {
+            let left_num_bytes = self.get_key_value_position(i);
+            let right_num_bytes = self.get_num_bytes() - left_num_bytes;
+            if right_num_bytes < Self::BTREE_PAGE_SIZE / 2 {
+                break;
+            }
+            right_i = i;
+        }
+        let mut left_node = BNode::default();
+        let mut right_node = BNode::default();
+        left_node.set_node_type(self.get_node_type());
+        left_node.set_num_keys(right_i);
+        for j in 0..right_i {
+            left_node.set_child_pointer(j, self.get_child_pointer(j));
+            left_node.set_key_value(j, self.get_key(j), self.get_value(j));
+        }
+        right_node.set_node_type(self.get_node_type());
+        right_node.set_num_keys(old_num_keys - right_i);
+        for j in right_i..old_num_keys {
+            right_node.set_child_pointer(j - right_i, self.get_child_pointer(j));
+            right_node.set_key_value(j - right_i, self.get_key(j), self.get_value(j));
+        }
+        (left_node, right_node)
+    }
+
+    /// Inserts a key-value pair in-place at position `i`.
+    fn inplace_insert(&mut self, i: u16, k: &[u8], v: &[u8]) {
+        // Shift key-values to the right:
+        // 8 for child pointers array
+        // 2 for offsets array
+        // 2 for key_size                (only for i <= j < n)
+        // 2 for val_size                (only for i <= j < n)
+        // k.len()                       (only for i <= j < n)
+        // v.len()                       (only for i <= j < n)
+        //
+        // total: 10                     (only for 0 <= j < i)
+        // total: 14 + k.len() + v.len() (only for i <= j < n)
+        {
+            let src_start = self.get_key_value_position(i);
+            let src_end = self.get_num_bytes();
+            let shift = 14 + k.len() + v.len();
+            self.buf.copy_within(src_start..src_end, src_start + shift);
+        }
+        if i > 0 {
+            let src_start = self.get_key_value_position(0);
+            let src_end = src_start + self.get_key_value_position(i);
+            self.buf.copy_within(src_start..src_end, src_start+10);
+        }
+
+        // Shift offsets array to the right:
+        // 8 for child pointers array
+        // 2 for offsets array (only for i <= j < n)
+        //
+        // total: 8            (only for 0 <= j < i)
+        // total: 10           (only for i <= j < n)
+        //
+        // Furthermore, increase the offset values (only for i <= j < n):
+        // 2 for key_size
+        // 2 for val_size
+        // k.len()
+        // v.len()
+        //
+        // total: 4 + k.len() + v.len()
+        {
+            let old_num_keys = self.get_num_keys();
+            let src_start = usize::from(4 + 8*old_num_keys + i*2);
+            let src_end = src_start + usize::from(old_num_keys-i)*2;
+            self.buf.copy_within(src_start..src_end, src_start + 10);
+            let offset_shift = 4 + (k.len() as u16) + (v.len() as u16);
+            for j in i..old_num_keys {
+                self.set_offset(j+1, self.get_offset(j+1) + offset_shift);
+            }
+        }
+        if i > 0 {
+            let src_start = usize::from(4 + 8*self.get_num_keys());
+            let src_end = src_start + usize::from(i)*2;
+            self.buf.copy_within(src_start..src_end, src_start+8);
+        }
+
+        // Shift pointers array by 8 only for i <= j < n:
+        {
+            let src_start = 4 + usize::from(8*i);
+            let src_end = src_start + usize::from(self.get_num_keys() - i)*8;
+            self.buf.copy_within(src_start..src_end, src_start+8);
+        }
+
+        self.set_num_keys(self.get_num_keys()+1);
+        self.set_child_pointer(i, 0 /* safe default */);
+        self.set_key_value(i, k, v);
+    }
+
+    /// Updates a key-value pair in-place at position `i`.
+    fn inplace_update(&mut self, i: u16, k: &[u8], v: &[u8]) {
+        // Short-cuts.
+        if k.len() == self.get_key(i).len() && v.len() == self.get_value(i).len() {
+            self.set_key_value(i, k, v);
+            return
+        }
+        if i == self.get_num_keys() - 1 {
+            self.set_key_value(i, k, v);
+            return
+        }
+
+        // Shift key-values (only for i < j < n):
+        // k.len()
+        // v.len()
+        // -old_k.len()
+        // -old_v.len()
+        {
+            let src_start = self.get_key_value_position(i + 1);
+            let src_end = self.get_num_bytes();
+            let shift = k.len() + v.len() - self.get_key(i).len() - self.get_value(i).len();
+            self.buf.copy_within(src_start..src_end, src_start + shift);
+        }
+
+        // Increase the offset values (only for i < j < n):
+        // k.len()
+        // v.len()
+        // -old_k.len()
+        // -old_v.len()
+        {
+            let offset_shift = (k.len() + v.len() - self.get_key(i).len() - self.get_value(i).len()) as u16;
+            for j in i+1..self.get_num_keys() {
+                self.set_offset(j+1, self.get_offset(j+1) + offset_shift);
+            }
+        }
+
+        self.set_key_value(i, k, v);
     }
 }
