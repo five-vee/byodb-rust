@@ -24,7 +24,7 @@
 //! ```ignore
 //! | key_size* | val_size* | key | val** |
 //! |    2B     |    2B     | ... | ...   |
-//! 
+//!
 //! *  key_size & val_size are omitted for internal nodes.
 //! ** val is omitted for internal nodes.
 //! ```
@@ -93,6 +93,12 @@
 //! The node format is just an implementation detail. The B+tree will work as
 //! long as nodes contain the necessary information.
 
+pub(crate) const BTREE_PAGE_SIZE: usize = 4096;
+const BTREE_MAX_KEY_SIZE: usize = 1000;
+const BTREE_MAX_VAL_SIZE: usize = 3000;
+
+pub(crate) type Buffer = [u8; BTREE_PAGE_SIZE];
+
 /// The B+ Tree node type of the page.
 #[derive(Debug, PartialEq, Eq)]
 enum NodeType {
@@ -110,63 +116,68 @@ impl From<u16> for NodeType {
     }
 }
 
-const BTREE_PAGE_SIZE: usize = 4096;
-const BTREE_MAX_KEY_SIZE: usize = 1000;
-const BTREE_MAX_VAL_SIZE: usize = 3000;
+pub(crate) enum Revision {
+    Insert,
+    Update,
+}
+
+pub(crate) enum Node {
+    Leaf(Leaf),
+    Internal(Internal),
+}
 
 /// Contains utilities commonly used to manipulate leaf and internal nodes.
-mod page {
-    pub(crate) type Buffer = [u8; super::BTREE_PAGE_SIZE];
+mod page_header {
 
-    pub(crate) fn new_buffer() -> Buffer {
+    pub(crate) fn new_buffer() -> super::Buffer {
         [0; super::BTREE_PAGE_SIZE]
     }
 
     /// Gets the node type of the page.
-    pub(crate) fn get_node_type(buf: &Buffer) -> super::NodeType {
+    pub(crate) fn get_node_type(buf: &super::Buffer) -> super::NodeType {
         u16::from_le_bytes([buf[2], buf[3]]).into()
     }
 
     /// Sets the node type of the page.
-    pub(crate) fn set_node_type(buf: &mut Buffer, node_type: super::NodeType) {
+    pub(crate) fn set_node_type(buf: &mut super::Buffer, node_type: super::NodeType) {
         buf[0..2].copy_from_slice(&(node_type as u16).to_le_bytes());
     }
 
     /// Gets the number of keys in the page.
-    pub(crate) fn get_num_keys(buf: &Buffer) -> u16 {
+    pub(crate) fn get_num_keys(buf: &super::Buffer) -> u16 {
         u16::from_le_bytes([buf[2], buf[3]]).into()
     }
 
     /// Sets the number of keys in the page.
-    pub(crate) fn set_num_keys(buf: &mut Buffer, num_keys: u16) {
+    pub(crate) fn set_num_keys(buf: &mut super::Buffer, num_keys: u16) {
         buf[2..4].copy_from_slice(&num_keys.to_le_bytes());
     }
 }
 
 /// The on-disk buffer representation of a B+ Tree leaf node.
 #[derive(Clone, Copy)]
-struct LeafNode {
-    buf: page::Buffer,
+pub(crate) struct Leaf {
+    buf: Buffer,
 }
 
-impl Default for LeafNode {
+impl Default for Leaf {
     /// Create a leaf node with zero keys.
     fn default() -> Self {
-        let mut buf = page::new_buffer();
-        page::set_node_type(&mut buf, NodeType::Leaf);
-        LeafNode { buf }
+        let mut buf = page_header::new_buffer();
+        page_header::set_node_type(&mut buf, NodeType::Leaf);
+        Leaf { buf }
     }
 }
 
-impl LeafNode {
+impl Leaf {
     /// Gets the number of keys in the page.
     fn get_num_keys(&self) -> u16 {
-        page::get_num_keys(&self.buf)
+        page_header::get_num_keys(&self.buf)
     }
 
     /// Sets the number of keys in the page.
     fn set_num_keys(&mut self, num_keys: u16) {
-        page::set_num_keys(&mut self.buf, num_keys);
+        page_header::set_num_keys(&mut self.buf, num_keys);
     }
 
     /// Gets the `i`th offset.
@@ -195,7 +206,7 @@ impl LeafNode {
     }
 
     /// Gets the `i`th key.
-    fn get_key(&self, i: u16) -> &[u8] {
+    pub(crate) fn get_key(&self, i: u16) -> &[u8] {
         assert!(i < self.get_num_keys());
         let pos = self.get_key_value_position(i);
         let key_len = u16::from_le_bytes([self.buf[pos], self.buf[pos + 1]]);
@@ -240,26 +251,22 @@ impl LeafNode {
     }
 
     /// Gets the number of bytes taken up by the B+ Tree node.
-    fn get_num_bytes(&self) -> usize {
+    pub(crate) fn get_num_bytes(&self) -> usize {
         self.get_key_value_position(self.get_num_keys())
     }
 
-    /// Find the index of the (lexicographically) largest key
-    /// less-than-or-equal (i.e. lte) to the query.
-    /// If no such key exists, retuns None.
-    fn lookup_lte(&self, query_key: &[u8]) -> Option<usize> {
-        // Linear search for simplicity.
-        let mut result = None::<usize>;
-        for i in 0..self.get_num_keys() {
-            if self.get_key(i) <= query_key {
-                result = Some(i as usize);
-            }
-        }
-        result
+    /// Looks up which index to insert the key into
+    /// while maintaining sort order.
+    pub(crate) fn lookup_insert(&self, key: &[u8]) -> u16 {
+        unimplemented!();
+    }
+
+    pub(crate) fn needs_split(&self, rev: Revision, key_val_len: usize) -> bool {
+        unimplemented!();
     }
 
     /// Inserts a key-value pair in-place at position `i`.
-    fn inplace_insert(&mut self, i: u16, k: &[u8], v: &[u8]) {
+    pub(crate) fn inplace_insert(&mut self, i: u16, k: &[u8], v: &[u8]) {
         // Shift key-values to the right:
         // 2 for offsets array
         // 2 for key_size               (only for i <= j < n)
@@ -305,7 +312,7 @@ impl LeafNode {
     }
 
     /// Updates a key-value pair in-place at position `i`.
-    fn inplace_update(&mut self, i: u16, k: &[u8], v: &[u8]) {
+    pub(crate) fn inplace_update(&mut self, i: u16, k: &[u8], v: &[u8]) {
         // Short-cuts.
         if k.len() == self.get_key(i).len() && v.len() == self.get_value(i).len() {
             self.set_key_value(i, k, v);
@@ -346,7 +353,7 @@ impl LeafNode {
 
     /// Creates a copy of the node, but with a newly inserted key-value pair at
     /// position `i`.
-    fn copy_on_insert(&self, i: u16, k: &[u8], v: &[u8]) -> Self {
+    pub(crate) fn copy_on_insert(&self, i: u16, k: &[u8], v: &[u8]) -> Self {
         // For simplicity, we re-use inplace_insert.
         let mut new_node = self.clone();
         new_node.inplace_insert(i, k, v);
@@ -355,7 +362,7 @@ impl LeafNode {
 
     /// Creates a copy of the node, but with an updated key-value pair at
     /// position `i`.
-    fn copy_on_update(&self, i: u16, k: &[u8], v: &[u8]) -> Self {
+    pub(crate) fn copy_on_update(&self, i: u16, k: &[u8], v: &[u8]) -> Self {
         // For simplicity, we re-use inplace_update.
         let mut new_node = self.clone();
         new_node.inplace_update(i, k, v);
@@ -363,7 +370,7 @@ impl LeafNode {
     }
 
     /// Splits a node to stay within the page size limit.
-    fn copy_on_split(&self) -> (Self, Self) {
+    pub(crate) fn copy_on_split(&self) -> (Self, Self) {
         let old_num_keys = self.get_num_keys();
         assert!(old_num_keys > 1);
         // Lookup the largest index at which the right node
@@ -383,12 +390,12 @@ impl LeafNode {
             right_i = i;
         }
 
-        let mut left_node = LeafNode::default();
+        let mut left_node = Leaf::default();
         left_node.set_num_keys(right_i);
         for j in 0..right_i {
             left_node.set_key_value(j, self.get_key(j), self.get_value(j));
         }
-        let mut right_node = LeafNode::default();
+        let mut right_node = Leaf::default();
         right_node.set_num_keys(old_num_keys - right_i);
         for j in right_i..old_num_keys {
             right_node.set_key_value(j - right_i, self.get_key(j), self.get_value(j));
@@ -399,32 +406,32 @@ impl LeafNode {
 
 /// The on-disk buffer representation of a B+ Tree internal node.
 #[derive(Clone, Copy)]
-struct InternalNode {
-    buf: page::Buffer,
+pub(crate) struct Internal {
+    buf: Buffer,
 }
 
-impl Default for InternalNode {
+impl Default for Internal {
     /// Create a leaf node with zero keys.
     fn default() -> Self {
-        let mut buf = page::new_buffer();
-        page::set_node_type(&mut buf, NodeType::Internal);
-        InternalNode { buf }
+        let mut buf = page_header::new_buffer();
+        page_header::set_node_type(&mut buf, NodeType::Internal);
+        Internal { buf }
     }
 }
 
-impl InternalNode {
+impl Internal {
     /// Gets the number of keys in the page.
     fn get_num_keys(&self) -> u16 {
-        page::get_num_keys(&self.buf)
+        page_header::get_num_keys(&self.buf)
     }
 
     /// Sets the number of keys in the page.
-    fn set_num_keys(&mut self, num_keys: u16) {
-        page::set_num_keys(&mut self.buf, num_keys);
+    pub(crate) fn set_num_keys(&mut self, num_keys: u16) {
+        page_header::set_num_keys(&mut self.buf, num_keys);
     }
 
     /// Gets the `i`th child pointer.
-    fn get_child_pointer(&self, i: u16) -> u64 {
+    pub(crate) fn get_child_pointer(&self, i: u16) -> u64 {
         assert!(i < self.get_num_keys());
         let pos = usize::from(4 + 8 * i);
         let sub: [u8; 8] = std::array::from_fn(|j| self.buf[pos + j]);
@@ -432,7 +439,7 @@ impl InternalNode {
     }
 
     /// Sets the `i`th child pointer.
-    fn set_child_pointer(&mut self, i: u16, val: u64) {
+    pub(crate) fn set_child_pointer(&mut self, i: u16, val: u64) {
         assert!(i < self.get_num_keys());
         let pos = usize::from(4 + 8 * i);
         self.buf[pos..pos + 8].copy_from_slice(&val.to_le_bytes());
@@ -464,7 +471,7 @@ impl InternalNode {
     }
 
     /// Gets the `i`th key.
-    fn get_key(&self, i: u16) -> &[u8] {
+    pub(crate) fn get_key(&self, i: u16) -> &[u8] {
         assert!(i < self.get_num_keys());
         let pos = self.get_key_position(i);
         let key_len = self.get_key_position(i + 1) - pos;
@@ -475,16 +482,13 @@ impl InternalNode {
     /// If not careful, this can overwrite the key for `i+1` onwards;
     /// please use `copy_on_insert`/`copy_on_update`
     /// or `inplace_insert`/`inplace_update` instead.
-    fn set_key(&mut self, i: u16, k: &[u8]) {
+    pub(crate) fn set_key(&mut self, i: u16, k: &[u8]) {
         assert!(i < self.get_num_keys());
         assert!(k.len() <= BTREE_MAX_KEY_SIZE);
         let key_len = k.len();
 
         // Set the next offset.
-        self.set_offset(
-            i + 1,
-            (self.get_key_position(i) + key_len) as u16,
-        );
+        self.set_offset(i + 1, (self.get_key_position(i) + key_len) as u16);
 
         // Fill in the key.
         let pos = self.get_key_position(i);
@@ -496,22 +500,23 @@ impl InternalNode {
         self.get_key_position(self.get_num_keys())
     }
 
-    /// Find the index of the (lexicographically) largest key
-    /// less-than-or-equal (i.e. lte) to the query.
-    /// If no such key exists, retuns None.
-    fn lookup_lte(&self, query_key: &[u8]) -> Option<usize> {
-        // Linear search for simplicity.
-        let mut result = None::<usize>;
-        for i in 0..self.get_num_keys() {
-            if self.get_key(i) <= query_key {
-                result = Some(i as usize);
-            }
-        }
-        result
+    pub(crate) fn needs_split(&self, delta: isize) -> bool {
+        unimplemented!();
     }
 
-    /// Inserts a key in-place at position `i`.
-    fn inplace_insert(&mut self, i: u16, k: &[u8]) {
+    /// Looks up the index of the child that should insert/update a key.
+    pub(crate) fn lookup_child(&self, key: &[u8]) -> u16 {
+        unimplemented!();
+    }
+
+    /// Looks up the index where to insert a key and its corresponding child.
+    pub(crate) fn lookup_insert(&self, key: &[u8]) -> u16 {
+        unimplemented!();
+    }
+
+    /// Inserts a key and its corresponding child pointer in-place
+    /// at position `i`.
+    pub(crate) fn inplace_insert(&mut self, i: u16, k: &[u8], child: u64) {
         // Shift key-values to the right:
         // 8 for child pointers array
         // 2 for offsets array
@@ -564,12 +569,13 @@ impl InternalNode {
         }
 
         self.set_num_keys(self.get_num_keys() + 1);
-        self.set_child_pointer(i, 0 /* safe default */);
+        self.set_child_pointer(i, child);
         self.set_key(i, k);
     }
 
-    /// Updates a key in-place at position `i`.
-    fn inplace_update(&mut self, i: u16, k: &[u8]) {
+    /// Updates a key and its corresponding child pointer in-place
+    /// at position `i`.
+    pub(crate) fn inplace_update(&mut self, i: u16, k: &[u8], child: u64) {
         // Short-cuts.
         if k.len() == self.get_key(i).len() {
             self.set_key(i, k);
@@ -601,28 +607,11 @@ impl InternalNode {
         }
 
         self.set_key(i, k);
-    }
-
-    /// Creates a copy of the node, but with a newly inserted key at
-    /// position `i`.
-    fn copy_on_insert(&self, i: u16, k: &[u8]) -> Self {
-        // For simplicity, we re-use inplace_insert.
-        let mut new_node = self.clone();
-        new_node.inplace_insert(i, k);
-        new_node
-    }
-
-    /// Creates a copy of the node, but with an updated key at
-    /// position `i`.
-    fn copy_on_update(&self, i: u16, k: &[u8]) -> Self {
-        // For simplicity, we re-use inplace_update.
-        let mut new_node = self.clone();
-        new_node.inplace_update(i, k);
-        new_node
+        self.set_child_pointer(i, child);
     }
 
     /// Splits a node to stay within the page size limit.
-    fn copy_on_split(&self) -> (Self, Self) {
+    pub(crate) fn copy_on_split(&self) -> (Self, Self) {
         let old_num_keys = self.get_num_keys();
         assert!(old_num_keys > 1);
         // Lookup the largest index at which the right node
@@ -642,13 +631,13 @@ impl InternalNode {
             right_i = i;
         }
 
-        let mut left_node = InternalNode::default();
+        let mut left_node = Internal::default();
         left_node.set_num_keys(right_i);
         for j in 0..right_i {
             left_node.set_child_pointer(j, self.get_child_pointer(j));
             left_node.set_key(j, self.get_key(j));
         }
-        let mut right_node = InternalNode::default();
+        let mut right_node = Internal::default();
         right_node.set_num_keys(old_num_keys - right_i);
         for j in right_i..old_num_keys {
             right_node.set_child_pointer(j - right_i, self.get_child_pointer(j));

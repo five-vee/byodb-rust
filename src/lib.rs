@@ -1,2 +1,3 @@
 pub mod file_util;
-pub mod bplus_node;
+mod bplus_node;
+pub mod bplus_tree;
