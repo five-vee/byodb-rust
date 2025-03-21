@@ -1,3 +1,22 @@
+//! A copy-on-write (COW) B+ tree is a variation of the standard B+ tree that
+//! employs the copy-on-write technique for handling modifications. Instead of
+//! directly updating the existing nodes in the tree when an insertion,
+//! deletion, or update occurs, the COW approach creates a modified copy of the
+//! node (or the path of nodes leading to the change). The original node
+//! remains unchanged. This means that any other readers concurrently accessing
+//! the tree will continue to see the consistent, older version of the data
+//! until they reach a point where they would naturally access the newly
+//! written parts.
+//!
+//! This method offers significant advantages, particularly in concurrent
+//! environments. By not modifying the original structure in place,
+//! COW B+ trees naturally support snapshot isolation and improve concurrency
+//! control, as readers and writers do not contend for the same locks on nodes.
+//! Furthermore, this approach aids in crash recovery, as the original,
+//! consistent state of the tree is preserved until the new changes are fully
+//! committed. It can also facilitate the implementation of features like
+//! versioning and auditing, as previous states of the data structure are
+//! implicitly retained.
 use std::rc::Rc;
 
 use crate::bplus_node as node;
