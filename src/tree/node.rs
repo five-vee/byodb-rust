@@ -93,10 +93,41 @@
 //! The node format is just an implementation detail. The B+tree will work as
 //! long as nodes contain the necessary information.
 
-use std::rc::Rc;
+use leaf_util::LeafBuilder;
+pub use internal_util::{ChildEntry, DeletionDelta};
 
 /// Size of a B+ tree node page.
 pub const PAGE_SIZE: usize = 4096;
+const MAX_KEY_SIZE: usize = 1000;
+const MAX_VALUE_SIZE: usize = 3000;
+
+const _: () = {
+    assert!(PAGE_SIZE <= (1 << 16), "page size is within 16 bits");
+    assert!(
+        (PAGE_SIZE as isize)
+            - 2 // type
+            - 2 // nkeys
+            // 3 keys + overhead
+            - 3 * (8 + 2 + MAX_KEY_SIZE as isize)
+            >= 0,
+        "3 keys of max size cannot fit into a page"
+    );
+    assert!(
+        (PAGE_SIZE as isize)
+            - 2 // type
+            - 2 // nkeys
+            // 1 key-value pair + overhead
+            - 1 * (2 + 2 + 2 + MAX_KEY_SIZE as isize + MAX_VALUE_SIZE as isize)
+            >= 0,
+        "1 key-value pair of max size cannot fit into a page"
+    );
+};
+
+#[repr(u16)]
+enum NodeType {
+    Leaf = 0b01u16,
+    Internal = 0b10u16,
+}
 
 pub type Result<T> = std::result::Result<T, ()>;
 
@@ -111,7 +142,7 @@ pub enum Node {
 
 impl Node {
     /// Gets the key at a specified node index.
-    pub fn get_key(&self, i: u16) -> &[u8] {
+    pub fn get_key(&self, i: usize) -> &[u8] {
         match self {
             Node::Leaf(leaf) => leaf.get_key(i),
             Node::Internal(internal) => internal.get_key(i),
@@ -137,18 +168,18 @@ pub enum Deletion {
     /// This is a special-case of `Underflow` done to avoid unnecessary
     /// page allocations, since empty non-root nodes aren't allowed.
     Empty,
-    /// A node that is sufficiently-sized (i.e. has at least 2 keys) even after
+    /// A node that is sufficiently sized (i.e. has at least 2 keys) even after
     /// a delete was performed on it.
     Sufficient(Node),
     /// A node that was split due to a delete operation. This can happen
     /// because the node had to delete a key and replace it with another key
     /// that was larger, pushing it beyond the page size,
     /// thus triggering a split.
-    /// 
+    ///
     /// Yes, this means the tree can grow in height despite
     /// the deletion operation.
     Split { left: Node, right: Node },
-    /// A node that is NOT sufficiently-sized but is not empty
+    /// A node that is NOT sufficiently sized but is not empty
     /// (i.e. has 1 key).
     Underflow(Node),
 }
@@ -175,126 +206,385 @@ pub fn merge(from: &Node, into: &Node) -> Result<Node> {
     unimplemented!();
 }
 
-/// A delta representation of the effects of a deletion.
-pub type DeletionDelta = Rc<[(u16, Option<u64>)]>;
+fn set_page_header(buf: &mut [u8], node_type: NodeType) {
+    buf[0..2].copy_from_slice(&(node_type as u16).to_be_bytes());
+}
 
-/// A child entry to upsert into an internal node.
-pub struct ChildEntry {
-    /// An optional index into an internal node.
-    /// If `None`, the index does not exist yet, meaning the child entry
-    /// should be inserted into the internal node.
-    /// Otherwise, the child entry should be updated at this index.
-    pub maybe_i: Option<u16>,
-    /// The key of the child entry.
-    pub key: Rc<[u8]>,
-    /// The page number (aka child pointer) of the child entry.
-    pub page_num: u64,
+fn set_num_keys(buf: &mut [u8], n: usize) {
+    buf[2..4].copy_from_slice(&(n as u16).to_be_bytes());
+}
+
+fn get_num_keys(buf: &[u8]) -> usize {
+    u16::from_be_bytes([buf[2], buf[3]]) as usize
+}
+
+mod leaf_util {
+    use super::{Deletion, Leaf, Node, NodeType, Result, Upsert};
+
+    /// Gets the `i`th offset value.
+    pub fn get_offset(buf: &[u8], i: usize) -> usize {
+        if i == 0 {
+            return 0;
+        }
+        u16::from_be_bytes([buf[4 + 2 * (i - 1)], buf[4 + 2 * i]]) as usize
+    }
+
+    /// Gets the number of bytes consumed by a page.
+    pub fn get_num_bytes(buf: &[u8]) -> usize {
+        let n = super::get_num_keys(buf);
+        let offset = get_offset(buf, n);
+        4 + (n * 2) + offset
+    }
+
+    pub fn get_key(buf: &[u8], i: usize) -> &[u8] {
+        let offset = get_offset(buf, i) as usize;
+        let num_keys = super::get_num_keys(buf) as usize;
+        let key_len = u16::from_be_bytes([
+            buf[4 + num_keys * 2 + offset],
+            buf[4 + num_keys * 2 + offset + 1],
+        ]) as usize;
+        &buf[4 + num_keys * 2 + offset + 4..4 + num_keys * 2 + offset + 4 + key_len]
+    }
+
+    pub fn get_value(buf: &[u8], i: usize) -> &[u8] {
+        let offset = get_offset(buf, i) as usize;
+        let num_keys = super::get_num_keys(buf) as usize;
+        let key_len = u16::from_be_bytes([
+            buf[4 + num_keys * 2 + offset],
+            buf[4 + num_keys * 2 + offset + 1],
+        ]) as usize;
+        let val_len = u16::from_be_bytes([
+            buf[4 + num_keys * 2 + offset + 2],
+            buf[4 + num_keys * 2 + offset + 3],
+        ]) as usize;
+        &buf[4 + num_keys * 2 + offset + 4 + key_len
+            ..4 + num_keys * 2 + offset + 4 + key_len + val_len]
+    }
+
+    /// Sets the next (i.e. `i+1`th) offset and returns the current offset.
+    fn set_next_offset(buf: &mut [u8], i: usize, key: &[u8], val: &[u8]) -> usize {
+        let curr_offset = get_offset(buf, i);
+        let next_offset = curr_offset + 4 + (key.len() + val.len());
+        let next_i = i as usize + 1;
+        buf[4 + 2 * (next_i - 1)..4 + 2 * next_i]
+            .copy_from_slice(&(next_offset as u16).to_be_bytes());
+        curr_offset
+    }
+
+    // A builder of a B+ tree leaf node.
+    pub struct LeafBuilder {
+        num_keys: usize,
+        i: usize,
+        buf: Option<Box<[u8]>>,
+    }
+
+    impl LeafBuilder {
+        /// Creates a new leaf builder.
+        pub fn new(num_keys: usize) -> Self {
+            Self {
+                num_keys,
+                i: 0,
+                buf: None,
+            }
+        }
+
+        fn new_buffer() -> Box<[u8]> {
+            let mut buf = [0; super::PAGE_SIZE];
+            super::set_page_header(&mut buf, NodeType::Leaf);
+            buf.into()
+        }
+
+        /// Allows the builder to overflow to two pages.
+        pub fn allow_overflow(mut self) -> Self {
+            assert!(
+                self.buf.is_none(),
+                "allow_overflow() must be called only once and before add_key_value()"
+            );
+            self.buf = Some([0; 2 * super::PAGE_SIZE - 4].into());
+            self
+        }
+
+        /// Adds a key-value pair to the builder.
+        pub fn add_key_value(mut self, key: &[u8], val: &[u8]) -> Result<Self> {
+            if self.i >= self.num_keys {
+                return Err(());
+            }
+            if key.len() > super::MAX_KEY_SIZE {
+                return Err(());
+            }
+            if val.len() > super::MAX_VALUE_SIZE {
+                return Err(());
+            }
+
+            // Make sure buffer is initialized.
+            if self.buf.is_none() {
+                self.buf = Some(Self::new_buffer());
+            }
+            let mut buf = self.buf.take().unwrap();
+
+            assert!(get_num_bytes(&buf) + 6 + key.len() + val.len() <= buf.len(),
+                "builder unexpectedly overflowed; please call allow_overflow(), or don't add too many key-value pairs.");
+
+            let offset = set_next_offset(&mut buf, self.i, key, val);
+            let n = self.num_keys;
+            buf[4 + n * 2 + offset..4 + n * 2 + offset + 2]
+                .copy_from_slice(&(key.len() as u16).to_be_bytes());
+            buf[4 + n * 2 + offset + 2..4 + n * 2 + offset + 4]
+                .copy_from_slice(&(val.len() as u16).to_be_bytes());
+            buf[4 + n * 2 + offset + 4..4 + n * 2 + offset + 4 + key.len()].copy_from_slice(key);
+            buf[4 + n * 2 + offset + 4 + key.len()..4 + n * 2 + offset + 4 + key.len() + val.len()]
+                .copy_from_slice(val);
+
+            self.i += 1;
+            super::set_num_keys(&mut buf, self.i);
+            self.buf = Some(buf);
+            Ok(self)
+        }
+
+        /// Builds an Upsert.
+        pub fn build_upsert(mut self) -> Result<Upsert> {
+            Ok(Self::new_upsert(self.build_single_or_split()?))
+        }
+
+        /// Builds a Deletion.
+        pub fn build_deletion(mut self) -> Result<Deletion> {
+            Ok(Self::new_deletion(self.build_single_or_split()?))
+        }
+
+        /// Creates a new Upsert from at least 1 leaf.
+        fn new_upsert(build_result: (Leaf, Option<Leaf>)) -> Upsert {
+            match build_result {
+                (left, Some(right)) => Upsert::Split {
+                    left: Node::Leaf(left),
+                    right: Node::Leaf(right),
+                },
+                (leaf, None) => Upsert::Intact(Node::Leaf(leaf)),
+            }
+        }
+
+        /// Creates a new Deletion from at least 1 leaf.
+        fn new_deletion(build_result: (Leaf, Option<Leaf>)) -> Deletion {
+            match build_result {
+                (left, Some(right)) => Deletion::Split {
+                    left: Node::Leaf(left),
+                    right: Node::Leaf(right),
+                },
+                (leaf, None) => {
+                    let n = super::get_num_keys(&leaf.buf);
+                    if n == 0 {
+                        Deletion::Empty
+                    } else if n == 1 {
+                        Deletion::Underflow(Node::Leaf(leaf))
+                    } else {
+                        Deletion::Sufficient(Node::Leaf(leaf))
+                    }
+                }
+            }
+        }
+
+        /// Builds one leaf, or two leaves due to splitting.
+        fn build_single_or_split(mut self) -> Result<(Leaf, Option<Leaf>)> {
+            if self.i != self.num_keys {
+                return Err(());
+            }
+            if self.buf.is_none() {
+                return Err(());
+            }
+            let buf = self.buf.take().unwrap();
+            if get_num_bytes(&buf) <= super::PAGE_SIZE {
+                return Ok((self.build_single(), None));
+            }
+            let (left, right) = self.build_split()?;
+            Ok((left, Some(right)))
+        }
+
+        /// Builds two splits of a leaf.
+        fn build_split(mut self) -> Result<(Leaf, Leaf)> {
+            if self.buf.is_none() {
+                return Err(());
+            }
+            let buf = self.buf.take().unwrap();
+            let num_keys = self.num_keys as usize;
+            let mut left_end: usize = 0;
+            for i in 0..num_keys {
+                // include i?
+                let offset = get_offset(&buf, i + 1);
+                if 4 + (i + 1) * 2 + offset <= super::PAGE_SIZE {
+                    left_end = i + 1;
+                }
+            }
+
+            let mut lb = Self::new(left_end);
+            for i in 0..left_end {
+                lb = lb.add_key_value(get_key(&buf, i), get_value(&buf, i))?;
+            }
+            let mut rb = Self::new(num_keys - left_end);
+            for i in left_end..num_keys {
+                rb = rb.add_key_value(get_key(&buf, i), get_value(&buf, i))?;
+            }
+            Ok((lb.build_single(), rb.build_single()))
+        }
+
+        /// Builds a leaf. Errors if the builder built more than one leaf due
+        /// to splitting.
+        fn build_single(mut self) -> Leaf {
+            assert!(self.buf.is_some());
+            let buf = self.buf.take().unwrap();
+            assert!(get_num_bytes(&buf) <= super::PAGE_SIZE);
+            Leaf {
+                buf: buf[0..super::PAGE_SIZE].into(),
+            }
+        }
+    }
 }
 
 /// A B+ tree leaf node.
-#[derive(Debug)]
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Leaf {
     buf: Box<[u8]>,
 }
 
-/// A builder of a B+ tree leaf node.
-struct LeafBuilder {
-    buf: Box<[u8]>,
-}
-
-impl Default for LeafBuilder {
+impl Default for Leaf {
     fn default() -> Self {
-        unimplemented!();
-    }
-}
-
-impl LeafBuilder {
-    /// Creates a leaf builder.
-    fn new(len: usize) -> Self {
-        unimplemented!();
-    }
-
-    /// Adds a key-value pair to the builder.
-    fn add_key_value(mut self, key: &[u8], val: &[u8]) -> Self {
-        unimplemented!();
-    }
-
-    /// Builds a leaf.
-    fn build(self) -> Result<Leaf> {
-        unimplemented!();
+        return Self {
+            buf: Box::new([0; PAGE_SIZE]),
+        };
     }
 }
 
 impl Leaf {
-    /// Create a new leaf node with keys and values.
-    pub fn new(keys: &[&[u8]], vals: &[&[u8]]) -> Result<Self> {
-        // Error if keys.len() != vals.len().
-        // Error if resulting leaf is too large.
-        // Build the leaf from keys + vals.
-        unimplemented!();
-    }
-
     /// Inserts a key-value pair.
     pub fn insert(&self, key: &[u8], val: &[u8]) -> Result<Upsert> {
-        // If the insertion can cause a split, allocate via LeafBuilder::new.
-        // Otherwise, allocate via LeafBuilder::default.
-        // Build the new leaf from self, key, and val.
-        // If overflowed, split into two leaves.
-        unimplemented!();
+        if self.find(key).is_some() {
+            return Err(());
+        }
+        let mut b = LeafBuilder::new(self.get_num_keys() + 1).allow_overflow();
+        let mut added = false;
+        for (k, v) in self.iter() {
+            if !added && key < k {
+                added = true;
+                b = b.add_key_value(key, val)?;
+            }
+            b = b.add_key_value(k, v)?;
+        }
+        b.build_upsert()
     }
 
     /// Updates the value corresponding to a key.
     pub fn update(&self, key: &[u8], val: &[u8]) -> Result<Upsert> {
-        // If the update can cause a split, allocate via LeafBuilder::new.
-        // Otherwise, allocate via LeafBuilder::default.
-        // Build the new leaf from self + key + val.
-        // If overflowed, split into two leaves.
-        unimplemented!();
+        if self.find(key).is_none() {
+            return Err(());
+        }
+        let mut b = LeafBuilder::new(self.get_num_keys()).allow_overflow();
+        let mut added = false;
+        for (k, v) in self.iter() {
+            if !added && key == k {
+                added = true;
+                b = b.add_key_value(key, val)?;
+                continue;
+            }
+            b = b.add_key_value(k, v)?;
+        }
+        b.build_upsert()
     }
 
     /// Deletes a key and its corresponding value.
     pub fn delete(&self, key: &[u8]) -> Result<Deletion> {
-        unimplemented!();
-    }
-
-    fn get_key(&self, i: u16) -> &[u8] {
-        unimplemented!();
+        if self.find(key).is_none() {
+            return Err(());
+        }
+        // Optimization: avoid memory allocation and
+        // just return Deletion::Empty if only 1 key.
+        let n = self.get_num_keys();
+        if n == 1 {
+            return Ok(Deletion::Empty);
+        }
+        let mut b = LeafBuilder::new(n - 1).allow_overflow();
+        let mut added = false;
+        for (k, v) in self.iter() {
+            if !added && key == k {
+                added = true;
+                continue;
+            }
+            b = b.add_key_value(k, v)?;
+        }
+        b.build_deletion()
     }
 
     /// Finds the value corresponding to the queried key.
     pub fn find(&self, key: &[u8]) -> Option<&[u8]> {
         unimplemented!();
     }
+
+    pub fn iter<'a>(&'a self) -> LeafIterator<'a> {
+        LeafIterator {
+            leaf: self,
+            i: 0,
+            n: get_num_keys(&self.buf),
+        }
+    }
+
+    fn get_key(&self, i: usize) -> &[u8] {
+        leaf_util::get_key(&self.buf, i)
+    }
+
+    fn get_value(&self, i: usize) -> &[u8] {
+        leaf_util::get_value(&self.buf, i)
+    }
+
+    fn get_num_keys(&self) -> usize {
+        get_num_keys(&self.buf)
+    }
+}
+
+pub struct LeafIterator<'a> {
+    leaf: &'a Leaf,
+    i: usize,
+    n: usize,
+}
+
+impl<'a> Iterator for LeafIterator<'a> {
+    type Item = (&'a [u8], &'a [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.i >= self.n {
+            return None;
+        }
+        let item = Some((self.leaf.get_key(self.i), self.leaf.get_value(self.i)));
+        self.i += 1;
+        item
+    }
+}
+
+mod internal_util {
+    use std::rc::Rc;
+
+    /// A delta representation of the effects of a deletion.
+    pub type DeletionDelta = Rc<[(usize, Option<u64>)]>;
+
+    /// A child entry to upsert into an internal node.
+    pub struct ChildEntry {
+        /// An optional index into an internal node.
+        /// If `None`, the index does not exist yet, meaning the child entry
+        /// should be inserted into the internal node.
+        /// Otherwise, the child entry should be updated at this index.
+        pub maybe_i: Option<usize>,
+        /// The key of the child entry.
+        pub key: Rc<[u8]>,
+        /// The page number (aka child pointer) of the child entry.
+        pub page_num: u64,
+    }
+
+    /// A builder of a B+ tree internal node.
+    pub struct InternalBuilder {
+        buf: Box<[u8]>,
+    }
 }
 
 /// A B+ tree internal node.
-#[derive(Debug)]
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Internal {
     buf: Box<[u8]>,
-}
-
-/// A builder of a B+ tree internal node.
-struct InternalBuilder {
-    buf: Box<[u8]>,
-}
-
-impl InternalBuilder {
-    /// Creates an internal builder.
-    fn new(len: usize) -> Self {
-        unimplemented!();
-    }
-
-    /// Adds a child entry to the builder.
-    fn add_child(mut self, key: &[u8], pointer: u64) -> Self {
-        unimplemented!();
-    }
-
-    /// Builds an internal node.
-    fn build(self) -> Result<Internal> {
-        unimplemented!();
-    }
 }
 
 impl Internal {
@@ -316,23 +606,23 @@ impl Internal {
     }
 
     /// Finds the index corresponding to the key.
-    pub fn find(&self, key: &[u8]) -> Option<u16> {
+    pub fn find(&self, key: &[u8]) -> Option<usize> {
         unimplemented!();
     }
 
     /// Gets the child pointer at an index.
-    pub fn get_child_pointer(&self, i: u16) -> Result<u64> {
+    pub fn get_child_pointer(&self, i: usize) -> Result<u64> {
         unimplemented!();
     }
 
     /// Deletes the child entry (i.e. key and child pointer) at an index.
-    pub fn delete_child_entry(&self, i: u16) -> Result<Deletion> {
+    pub fn delete_child_entry(&self, i: usize) -> Result<Deletion> {
         // delete child entry @ i
         unimplemented!();
     }
 
     /// Updates the child entry at an index.
-    pub fn update_child_entry(&self, i: u16, key: &[u8], page_num: u64) -> Result<Deletion> {
+    pub fn update_child_entry(&self, i: usize, key: &[u8], page_num: u64) -> Result<Deletion> {
         // INVARIANT: internal is Sufficient.
         // update child page num @ i
         // If the update can cause a split, allocate via InternalBuilder::new.
@@ -353,7 +643,7 @@ impl Internal {
         unimplemented!();
     }
 
-    fn get_key(&self, i: u16) -> &[u8] {
+    fn get_key(&self, i: usize) -> &[u8] {
         unimplemented!();
     }
 }

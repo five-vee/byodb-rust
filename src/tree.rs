@@ -42,7 +42,7 @@ impl<S: Store> Upsert<S> {
     /// entries of an B+ tree internal node.
     ///
     /// `i` is the index of the node that the upsert was performed on.
-    fn child_entries(self, i: u16) -> Rc<[node::ChildEntry]> {
+    fn child_entries(self, i: usize) -> Rc<[node::ChildEntry]> {
         match self {
             Upsert::Intact(tree) => [node::ChildEntry {
                 maybe_i: Some(i),
@@ -74,7 +74,7 @@ pub enum Deletion<S: Store> {
     /// This is a special-case of `Underflow` done to avoid unnecessary
     /// page allocations, since empty non-root nodes aren't allowed.
     Empty,
-    /// A node that is sufficiently-sized (i.e. has at least 2 keys) even after
+    /// A node that is sufficiently sized (i.e. has at least 2 keys) even after
     /// a delete was performed on it.
     Sufficient(Tree<S>),
     /// A node that was split due to a delete operation. This can happen
@@ -85,7 +85,7 @@ pub enum Deletion<S: Store> {
     /// Yes, this means the tree can grow in height despite
     /// the deletion operation.
     Split { left: Tree<S>, right: Tree<S> },
-    /// A node that is NOT sufficiently-sized but is not empty
+    /// A node that is NOT sufficiently sized but is not empty
     /// (i.e. has 1 key).
     Underflow(Tree<S>),
 }
@@ -203,7 +203,7 @@ impl<S: Store> Tree<S> {
     pub fn delete(&self, key: &[u8]) -> Result<Self> {
         match self.delete_helper(key)? {
             Deletion::Empty => {
-                let root = Node::Leaf(Leaf::new(&[], &[])?);
+                let root = Node::Leaf(Leaf::default());
                 let page_num = self.store.write_page(&root)?;
                 Ok(Self { root, page_num, store: self.store.clone() })
             }
@@ -274,7 +274,7 @@ impl<S: Store> Tree<S> {
         &self,
         parent: &Internal,
         child: Self,
-        child_idx: u16,
+        child_idx: usize,
     ) -> Result<node::DeletionDelta> {
         // Try stealing or merging the left sibling.
         if child_idx > 0 {
@@ -308,8 +308,8 @@ impl<S: Store> Tree<S> {
         &self,
         parent: &Internal,
         child: &Node,
-        child_idx: u16,
-        sibling_idx: u16,
+        child_idx: usize,
+        sibling_idx: usize,
     ) -> Result<Option<node::DeletionDelta>> {
         let sibling_num = parent.get_child_pointer(sibling_idx)?;
         let sibling = self.store.read_page(sibling_num)?;
