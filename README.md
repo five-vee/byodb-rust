@@ -12,6 +12,13 @@ https://build-your-own.org/database/, but instead of Go, use Rust. This a person
 * [x] 4.1 B+tree node
 * [x] 4.2 Decode the B+tree nodes
 * [x] 4.3 Create B+tree nodes
-* [ ] 4.4 Insert or update the leaf node
-* [ ] 4.5 Split a node
-* [ ] 4.6 B+tree data structure
+* [X] 4.4 Insert or update the leaf node
+* [X] 4.5 Split a node
+* [X] 4.6 B+tree data structure
+
+## [05. B+Tree Deletion and Testing](https://build-your-own.org/database/05_btree_code_2)
+
+* [x] 5.1 High-level interfaces
+* [x] 5.2 Merge nodes
+* [x] 5.3 B+tree deletion
+* [ ] 5.4 Test the B+tree
