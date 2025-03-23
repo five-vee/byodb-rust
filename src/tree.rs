@@ -19,7 +19,7 @@
 //! implicitly retained.
 use std::rc::Rc;
 
-use crate::node;
+mod node;
 
 pub type Result<T> = std::result::Result<T, ()>;
 

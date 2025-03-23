@@ -1,7 +1,7 @@
 use std::fs;
 use std::process::Command;
 
-mod file_util;
+use byodb_rust::file_util;
 
 fn main() {
     let output = match Command::new("mktemp").output() {
