@@ -95,10 +95,13 @@
 
 use std::rc::Rc;
 
+/// Size of a B+ tree node page.
+pub const PAGE_SIZE: usize = 4096;
+
 pub type Result<T> = std::result::Result<T, ()>;
 
 /// An enum representing the type of B+ tree node.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Node {
     /// A B+ tree leaf node.
     Leaf(Leaf),
@@ -190,6 +193,7 @@ pub struct ChildEntry {
 
 /// A B+ tree leaf node.
 #[derive(Debug)]
+#[derive(Clone)]
 pub struct Leaf {
     buf: Box<[u8]>,
 }
@@ -266,6 +270,7 @@ impl Leaf {
 
 /// A B+ tree internal node.
 #[derive(Debug)]
+#[derive(Clone)]
 pub struct Internal {
     buf: Box<[u8]>,
 }
