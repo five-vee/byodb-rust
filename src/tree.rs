@@ -159,6 +159,23 @@ pub struct Tree {
 }
 
 impl Tree {
+    /// Gets the value corresponding to the key.
+    pub fn get(&self, key: &[u8]) -> Result<Option<Rc<[u8]>>> {
+        match &self.root {
+            node::Node::Internal(root) => {
+                let child_idx = root.find(key).map_or_else(|| Err(()), |i| Ok(i))?;
+                let child_num = root.get_child_pointer(child_idx)?;
+                let child = Self::read_page(child_num)?;
+                let child = Self {
+                    root: child,
+                    page_num: child_num,
+                };
+                child.get(key)
+            },
+            node::Node::Leaf(root) => Ok(root.find(key).map(|v| v.into()))
+        }
+    }
+
     /// Inserts a key-value pair.
     pub fn insert(&self, key: &[u8], val: &[u8]) -> Result<Self> {
         match self.insert_helper(key, val)? {
@@ -178,7 +195,7 @@ impl Tree {
             // Recursive case
             node::Node::Internal(internal) => {
                 // Find which child to recursively insert into.
-                let child_idx = internal.find(key)?;
+                let child_idx = internal.find(key).map_or_else(|| Err(()), |i| Ok(i))?;
                 let child_num = internal.get_child_pointer(child_idx)?;
                 let child = Self::read_page(child_num)?;
                 let child = Self {
@@ -212,7 +229,7 @@ impl Tree {
             // Recursive case
             node::Node::Internal(internal) => {
                 // Find which child to recursively update at.
-                let child_idx = internal.find(key)?;
+                let child_idx = internal.find(key).map_or_else(|| Err(()), |i| Ok(i))?;
                 let child_num = internal.get_child_pointer(child_idx)?;
                 let child = Self::read_page(child_num)?;
                 let child = Self {
@@ -252,7 +269,7 @@ impl Tree {
             // Recursive case
             node::Node::Internal(internal) => {
                 // Find which child to recursively delete from.
-                let child_idx = internal.find(key)?;
+                let child_idx = internal.find(key).map_or_else(|| Err(()), |i| Ok(i))?;
                 let child_num = internal.get_child_pointer(child_idx)?;
                 let child = Self::read_page(child_num)?;
                 let child = Self {

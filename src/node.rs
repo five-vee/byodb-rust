@@ -257,6 +257,11 @@ impl Leaf {
     fn get_key(&self, i: u16) -> &[u8] {
         unimplemented!();
     }
+
+    /// Finds the value corresponding to the queried key.
+    pub fn find(&self, key: &[u8]) -> Option<&[u8]> {
+        unimplemented!();
+    }
 }
 
 /// A B+ tree internal node.
@@ -306,7 +311,7 @@ impl Internal {
     }
 
     /// Finds the index corresponding to the key.
-    pub fn find(&self, key: &[u8]) -> Result<(u16)> {
+    pub fn find(&self, key: &[u8]) -> Option<u16> {
         unimplemented!();
     }
 
