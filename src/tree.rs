@@ -34,6 +34,8 @@ enum Upsert<S: Store> {
     /// after an upsert.
     Intact(Tree<S>),
     /// The left and right splits of a tree that was created after an upsert.
+    ///
+    /// The left and right nodes are the same type.
     Split { left: Tree<S>, right: Tree<S> },
 }
 
@@ -83,6 +85,8 @@ pub enum Deletion<S: Store> {
     ///
     /// Yes, this means the tree can grow in height despite
     /// the deletion operation.
+    ///
+    /// The left and right nodes are the same type.
     Split { left: Tree<S>, right: Tree<S> },
     /// A node that is NOT sufficiently sized but is not empty
     /// (i.e. has 1 key).
@@ -237,9 +241,8 @@ impl<S: Store> Tree<S> {
                 };
                 match child.delete_helper(key)? {
                     Deletion::Empty => {
-                        let d =
-                            parent.merge_as_deletion(&[ChildEntry::Delete { i: child_idx }])?;
-                        return Ok(self.alloc_deletion(d)?);
+                        let d = parent.merge_as_deletion(&[ChildEntry::Delete { i: child_idx }])?;
+                        Ok(self.alloc_deletion(d)?)
                     }
                     Deletion::Sufficient(child) => {
                         let d = parent.merge_as_deletion(&[ChildEntry::Update {
@@ -247,7 +250,7 @@ impl<S: Store> Tree<S> {
                             key: child.root.get_key(0).into(),
                             page_num: child.page_num,
                         }])?;
-                        return Ok(self.alloc_deletion(d)?);
+                        Ok(self.alloc_deletion(d)?)
                     }
                     Deletion::Split {
                         left: left_child,
@@ -264,12 +267,10 @@ impl<S: Store> Tree<S> {
                                 page_num: right_child.page_num,
                             },
                         ])?;
-                        return Ok(self.alloc_deletion(d)?);
+                        Ok(self.alloc_deletion(d)?)
                     }
                     Deletion::Underflow(child) => {
-                        let entries = self.try_fix_underflow(parent, child, child_idx)?;
-                        let d = parent.merge_as_deletion(&entries)?;
-                        return Ok(self.alloc_deletion(d)?);
+                        self.try_fix_underflow(parent, child, child_idx)
                     }
                 }
             }
@@ -287,20 +288,14 @@ impl<S: Store> Tree<S> {
         parent: &Internal,
         child: Self,
         child_idx: usize,
-    ) -> Result<Rc<[ChildEntry]>> {
+    ) -> Result<Deletion<S>> {
         // Try stealing or merging the left sibling.
         if child_idx > 0 {
-            match self.try_steal_or_merge(parent, &child.root, child_idx, child_idx - 1)? {
-                None => {}
-                Some(delta) => return Ok(delta),
-            }
+            return self.steal_or_merge(parent, &child.root, child_idx, child_idx - 1)
         }
         // Try stealing or merging the right sibling.
         if child_idx < parent.get_num_keys() - 1 {
-            match self.try_steal_or_merge(parent, &child.root, child_idx, child_idx + 1)? {
-                None => {}
-                Some(delta) => return Ok(delta),
-            }
+            return self.steal_or_merge(parent, &child.root, child_idx, child_idx + 1)
         }
 
         // 5. Just leave child in underflow.
@@ -313,59 +308,31 @@ impl<S: Store> Tree<S> {
         // with 3 keys, which will not exceed the page size.
         // Leaf nodes, OTOH, can remain underflow due to variable-length
         // keys and values.
-        return Ok([ChildEntry::Update {
+        let d = parent.merge_as_deletion(&[ChildEntry::Update {
             i: child_idx,
             key: child.root.get_key(0).into(),
             page_num: child.page_num,
-        }]
-        .into());
+        }])?;
+        self.alloc_deletion(d)
     }
 
     /// Tries to fix the underflow of `child` by stealing from or merging from
     /// one of its direct siblings.
-    fn try_steal_or_merge(
+    fn steal_or_merge(
         &self,
         parent: &Internal,
         child: &Node,
         child_idx: usize,
         sibling_idx: usize,
-    ) -> Result<Option<Rc<[ChildEntry]>>> {
+    ) -> Result<Deletion<S>> {
         let sibling_num = parent.get_child_pointer(sibling_idx);
         let sibling = self.store.read_page(sibling_num)?;
-        if node::can_steal(&sibling, &child) {
-            let (new_sibling, new_child) = node::steal(&sibling, child)?;
-            let new_sibling_num = self.store.write_page(&new_sibling)?;
-            let new_child_num = self.store.write_page(&new_child)?;
-            let mut first = ChildEntry::Update {
-                i: sibling_idx,
-                key: new_sibling.get_key(0).into(),
-                page_num: new_sibling_num,
-            };
-            let mut second = ChildEntry::Update {
-                i: child_idx,
-                key: new_child.get_key(0).into(),
-                page_num: new_child_num,
-            };
-            if sibling_idx > child_idx {
-                (first, second) = (second, first);
-            }
-            return Ok(Some([first, second].into()));
+        let mut left = &sibling;
+        let mut right = child;
+        if sibling_idx > child_idx {
+            (left, right) = (right, left);
         }
-        if node::can_merge(&child, &sibling) {
-            let new_sibling = node::merge(child, &sibling)?;
-            let new_sibling_num = self.store.write_page(&new_sibling)?;
-            let mut first = ChildEntry::Update {
-                i: sibling_idx,
-                key: new_sibling.get_key(0).into(),
-                page_num: new_sibling_num,
-            };
-            let mut second = ChildEntry::Delete { i: child_idx };
-            if sibling_idx > child_idx {
-                (first, second) = (second, first);
-            }
-            return Ok(Some([first, second].into()));
-        }
-        Ok(None)
+        self.alloc_deletion(node::steal_or_merge(left, right)?)
     }
 
     /// Returns a new internal root node whose children are split nodes

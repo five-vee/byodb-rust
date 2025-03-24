@@ -149,6 +149,13 @@ impl Node {
             Node::Internal(internal) => internal.get_key(i),
         }
     }
+
+    pub fn get_num_keys(&self) -> usize {
+        match self {
+            Node::Leaf(leaf) => leaf.get_num_keys(),
+            Node::Internal(internal) => internal.get_num_keys(),
+        }
+    }
 }
 
 /// An enum representing the node(s) created during an insert or update
@@ -158,6 +165,8 @@ pub enum Upsert {
     /// after an upsert.
     Intact(Node),
     /// The left and right splits of a node that was created after an upsert.
+    ///
+    /// The left and right nodes are the same type.
     Split { left: Node, right: Node },
 }
 
@@ -179,32 +188,43 @@ pub enum Deletion {
     ///
     /// Yes, this means the tree can grow in height despite
     /// the deletion operation.
+    ///
+    /// The left and right nodes are the same type.
     Split { left: Node, right: Node },
     /// A node that is NOT sufficiently sized but is not empty
     /// (i.e. has 1 key).
     Underflow(Node),
 }
 
-/// Checks if after stealing entries,
-/// both `from` and `into` are sufficiently sized.
-pub fn can_steal(from: &Node, into: &Node) -> bool {
-    unimplemented!()
-}
-
-/// Checks if after merging,
-/// both `from` and `into` are sufficiently sized.
-pub fn can_merge(from: &Node, into: &Node) -> bool {
-    unimplemented!()
-}
-
-/// Steals entries from `from` and puts into `into`.
-pub fn steal(from: &Node, into: &Node) -> Result<(Node, Node)> {
-    unimplemented!();
-}
-
-/// Merges `from` into `into` into a merged node.
-pub fn merge(from: &Node, into: &Node) -> Result<Node> {
-    unimplemented!();
+/// Merges `left` and `right` into a possibly-overflowed node and splits if
+/// needed. This is modeled as a Deletion b/c it is (so far) only useful in the
+/// context of deletion.
+pub fn steal_or_merge(left: &Node, right: &Node) -> Result<Deletion> {
+    match (left, right) {
+        (Node::Leaf(left), Node::Leaf(right)) => {
+            let mut b =
+                LeafBuilder::new(left.get_num_keys() + right.get_num_keys()).allow_overflow();
+            for (key, val) in left.iter() {
+                b = b.add_key_value(key, val)?;
+            }
+            for (key, val) in right.iter() {
+                b = b.add_key_value(key, val)?;
+            }
+            b.build_deletion()
+        }
+        (Node::Internal(left), Node::Internal(right)) => {
+            let mut b =
+                InternalBuilder::new(left.get_num_keys() + right.get_num_keys()).allow_overflow();
+            for (key, page_num) in left.iter() {
+                b = b.add_child_entry(key, page_num)?;
+            }
+            for (key, page_num) in right.iter() {
+                b = b.add_child_entry(key, page_num)?;
+            }
+            b.build_deletion()
+        }
+        _ => unreachable!("It is assumed that both are the same node type."),
+    }
 }
 
 fn set_page_header(buf: &mut [u8], node_type: NodeType) {
@@ -256,7 +276,7 @@ mod leaf_util {
     }
 
     /// Gets the number of bytes consumed by a page.
-    fn get_num_bytes(buf: &[u8]) -> usize {
+    pub fn get_num_bytes(buf: &[u8]) -> usize {
         let n = super::get_num_keys(buf);
         let offset = get_offset(buf, n);
         4 + (n * 2) + offset
@@ -336,12 +356,12 @@ mod leaf_util {
         }
 
         /// Builds an Upsert.
-        pub fn build_upsert(mut self) -> Result<Upsert> {
+        pub fn build_upsert(self) -> Result<Upsert> {
             Ok(Self::new_upsert(self.build_single_or_split()?))
         }
 
         /// Builds a Deletion.
-        pub fn build_deletion(mut self) -> Result<Deletion> {
+        pub fn build_deletion(self) -> Result<Deletion> {
             Ok(Self::new_deletion(self.build_single_or_split()?))
         }
 
@@ -512,9 +532,7 @@ impl Leaf {
 
     /// Finds the value corresponding to the queried key.
     pub fn find(&self, key: &[u8]) -> Option<&[u8]> {
-        self.iter()
-            .find(|(k, v)| *k == key)
-            .map(|(_, v)| v)
+        self.iter().find(|(k, _)| *k == key).map(|(_, v)| v)
     }
 
     pub fn iter<'a>(&'a self) -> LeafIterator<'a> {
@@ -625,7 +643,7 @@ mod internal_util {
     }
 
     /// Gets the number of bytes consumed by a page.
-    fn get_num_bytes(buf: &[u8]) -> usize {
+    pub fn get_num_bytes(buf: &[u8]) -> usize {
         let n = super::get_num_keys(buf);
         let offset = get_offset(buf, n);
         4 + (n * 10) + offset
@@ -690,12 +708,12 @@ mod internal_util {
         }
 
         /// Builds an Upsert.
-        pub fn build_upsert(mut self) -> Result<Upsert> {
+        pub fn build_upsert(self) -> Result<Upsert> {
             Ok(Self::new_upsert(self.build_single_or_split()?))
         }
 
         /// Builds a Deletion.
-        pub fn build_deletion(mut self) -> Result<Deletion> {
+        pub fn build_deletion(self) -> Result<Deletion> {
             Ok(Self::new_deletion(self.build_single_or_split()?))
         }
 

@@ -2,7 +2,6 @@ use super::node::Node;
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
-    rc::Rc,
 };
 
 pub type Result<T> = std::result::Result<T, ()>;
