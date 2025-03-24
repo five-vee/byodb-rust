@@ -124,6 +124,7 @@ const _: () = {
     );
 };
 
+/// An enum representing a page's node type.
 #[repr(u16)]
 enum NodeType {
     Leaf = 0b01u16,
@@ -227,21 +228,26 @@ pub fn steal_or_merge(left: &Node, right: &Node) -> Result<Deletion> {
     }
 }
 
+/// Sets the page header of a node's page buffer.
 fn set_page_header(buf: &mut [u8], node_type: NodeType) {
     buf[0..2].copy_from_slice(&(node_type as u16).to_be_bytes());
 }
 
+/// Sets the number of keys in a node's page buffer.
 fn set_num_keys(buf: &mut [u8], n: usize) {
     buf[2..4].copy_from_slice(&(n as u16).to_be_bytes());
 }
 
+/// Gets the number of keys in a node's page buffer.
 fn get_num_keys(buf: &[u8]) -> usize {
     u16::from_be_bytes([buf[2], buf[3]]) as usize
 }
 
+/// Leaf node utilities.
 mod leaf_util {
     use super::{Deletion, Leaf, Node, NodeType, Result, Upsert};
 
+    /// Gets the `i`th key in a leaf page buffer.
     pub fn get_key(buf: &[u8], i: usize) -> &[u8] {
         let offset = get_offset(buf, i) as usize;
         let num_keys = super::get_num_keys(buf) as usize;
@@ -252,6 +258,7 @@ mod leaf_util {
         &buf[4 + num_keys * 2 + offset + 4..4 + num_keys * 2 + offset + 4 + key_len]
     }
 
+    /// Gets the `i`th value in a leaf page buffer.
     pub fn get_value(buf: &[u8], i: usize) -> &[u8] {
         let offset = get_offset(buf, i) as usize;
         let num_keys = super::get_num_keys(buf) as usize;
@@ -365,6 +372,7 @@ mod leaf_util {
             Ok(Self::new_deletion(self.build_single_or_split()?))
         }
 
+        /// Creates a new page-sized in-memory buffer.
         fn new_buffer() -> Box<[u8]> {
             let mut buf = [0; super::PAGE_SIZE];
             super::set_page_header(&mut buf, NodeType::Leaf);
@@ -556,6 +564,7 @@ impl Leaf {
     }
 }
 
+/// An key-value iterator for a leaf node.
 pub struct LeafIterator<'a> {
     node: &'a Leaf,
     i: usize,
@@ -575,6 +584,7 @@ impl<'a> Iterator for LeafIterator<'a> {
     }
 }
 
+/// Internal node utilities.
 mod internal_util {
     use std::rc::Rc;
 
@@ -596,6 +606,7 @@ mod internal_util {
         },
     }
 
+    /// Gets the `i`th key in an internal node's page buffer.
     pub fn get_key(buf: &[u8], i: usize) -> &[u8] {
         let offset = get_offset(buf, i) as usize;
         let num_keys = super::get_num_keys(buf) as usize;
@@ -606,6 +617,7 @@ mod internal_util {
         &buf[4 + num_keys * 10 + offset..4 + num_keys * 10 + offset + key_len]
     }
 
+    /// Gets the `i`th child pointer in an internal node's page buffer.
     pub fn get_child_pointer(buf: &[u8], i: usize) -> u64 {
         u64::from_be_bytes([
             buf[4 + i * 8],
@@ -617,6 +629,11 @@ mod internal_util {
             buf[4 + i * 8 + 6],
             buf[4 + i * 8 + 7],
         ])
+    }
+
+    /// Sets the `i`th child pointer in an internal node's page buffer.
+    fn set_child_pointer(buf: &mut [u8], i: usize, page_num: u64) {
+        buf[4 + i * 8..4 + (i + 1) * 8].copy_from_slice(&page_num.to_be_bytes());
     }
 
     /// Gets the `i`th offset value.
@@ -636,10 +653,6 @@ mod internal_util {
         buf[4 + n * 8 + 2 * (next_i - 1)..4 + n * 8 + 2 * next_i]
             .copy_from_slice(&(next_offset as u16).to_be_bytes());
         curr_offset
-    }
-
-    fn set_child_pointer(buf: &mut [u8], i: usize, page_num: u64) {
-        buf[4 + i * 8..4 + (i + 1) * 8].copy_from_slice(&page_num.to_be_bytes());
     }
 
     /// Gets the number of bytes consumed by a page.
@@ -727,6 +740,22 @@ mod internal_util {
             }
         }
 
+        /// Builds one internal node, or two due to splitting.
+        pub fn build_single_or_split(mut self) -> Result<(Internal, Option<Internal>)> {
+            if self.i != self.num_keys {
+                return Err(());
+            }
+            if self.buf.is_none() {
+                return Err(());
+            }
+            let buf = self.buf.take().unwrap();
+            if get_num_bytes(&buf) <= super::PAGE_SIZE {
+                return Ok((self.build_single(), None));
+            }
+            let (left, right) = self.build_split()?;
+            Ok((left, Some(right)))
+        }
+
         fn new_buffer() -> Box<[u8]> {
             let mut buf = [0; super::PAGE_SIZE];
             super::set_page_header(&mut buf, NodeType::Internal);
@@ -762,22 +791,6 @@ mod internal_util {
                     }
                 }
             }
-        }
-
-        /// Builds one internal node, or two due to splitting.
-        pub fn build_single_or_split(mut self) -> Result<(Internal, Option<Internal>)> {
-            if self.i != self.num_keys {
-                return Err(());
-            }
-            if self.buf.is_none() {
-                return Err(());
-            }
-            let buf = self.buf.take().unwrap();
-            if get_num_bytes(&buf) <= super::PAGE_SIZE {
-                return Ok((self.build_single(), None));
-            }
-            let (left, right) = self.build_split()?;
-            Ok((left, Some(right)))
         }
 
         /// Builds two splits of an internal node.
@@ -852,6 +865,7 @@ impl Internal {
         get_num_keys(&self.buf)
     }
 
+    /// Creates an key-value iterator for the internal node.
     pub fn iter<'a>(&'a self) -> InternalIterator<'a> {
         InternalIterator {
             node: self,
@@ -860,6 +874,9 @@ impl Internal {
         }
     }
 
+    /// Merges child entries into the internal node.
+    /// Returns a builder so the user can decide on building
+    /// an `Upsert` or a `Deletion`.
     fn merge_child_entries(&self, entries: &[ChildEntry]) -> Result<InternalBuilder> {
         let extra = entries
             .iter()
@@ -914,11 +931,13 @@ impl Internal {
         Ok(b)
     }
 
+    /// Gets the `i`th key in the internal buffer.
     fn get_key(&self, i: usize) -> &[u8] {
         internal_util::get_key(&self.buf, i)
     }
 }
 
+/// A key-value iterator of an internal node.
 pub struct InternalIterator<'a> {
     node: &'a Internal,
     i: usize,
