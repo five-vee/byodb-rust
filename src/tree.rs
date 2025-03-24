@@ -21,9 +21,9 @@
 mod node;
 mod page_store;
 
-use std::rc::Rc;
-use node::{Node, Internal, Leaf};
+use node::{ChildEntry, Internal, Leaf, Node};
 use page_store::Store;
+use std::rc::Rc;
 
 pub type Result<T> = std::result::Result<T, ()>;
 
@@ -42,22 +42,21 @@ impl<S: Store> Upsert<S> {
     /// entries of an B+ tree internal node.
     ///
     /// `i` is the index of the node that the upsert was performed on.
-    fn child_entries(self, i: usize) -> Rc<[node::ChildEntry]> {
+    fn child_entries(self, i: usize) -> Rc<[ChildEntry]> {
         match self {
-            Upsert::Intact(tree) => [node::ChildEntry {
-                maybe_i: Some(i),
+            Upsert::Intact(tree) => [ChildEntry::Update {
+                i,
                 key: tree.root.get_key(0).into(),
                 page_num: tree.page_num,
             }]
             .into(),
             Upsert::Split { left, right } => [
-                node::ChildEntry {
-                    maybe_i: Some(i),
+                ChildEntry::Update {
+                    i,
                     key: left.root.get_key(0).into(),
                     page_num: left.page_num,
                 },
-                node::ChildEntry {
-                    maybe_i: None,
+                ChildEntry::Insert {
                     key: right.root.get_key(0).into(),
                     page_num: right.page_num,
                 },
@@ -107,7 +106,7 @@ pub enum Deletion<S: Store> {
 pub struct Tree<S: Store> {
     root: Node,
     page_num: u64,
-    store: Rc<S>
+    store: Rc<S>,
 }
 
 impl<S: Store> Tree<S> {
@@ -116,12 +115,12 @@ impl<S: Store> Tree<S> {
         match &self.root {
             Node::Internal(root) => {
                 let child_idx = root.find(key).map_or_else(|| Err(()), |i| Ok(i))?;
-                let child_num = root.get_child_pointer(child_idx)?;
+                let child_num = root.get_child_pointer(child_idx);
                 let child = self.store.read_page(child_num)?;
                 let child = Self {
                     root: child,
                     page_num: child_num,
-                    store: self.store.clone()
+                    store: self.store.clone(),
                 };
                 child.get(key)
             }
@@ -133,7 +132,7 @@ impl<S: Store> Tree<S> {
     pub fn insert(&self, key: &[u8], val: &[u8]) -> Result<Self> {
         match self.insert_helper(key, val)? {
             Upsert::Intact(tree) => Ok(tree),
-            Upsert::Split { left, right } => self.new_root(left, right),
+            Upsert::Split { left, right } => self.parent_of_split(left, right),
         }
     }
 
@@ -149,7 +148,7 @@ impl<S: Store> Tree<S> {
             Node::Internal(internal) => {
                 // Find which child to recursively insert into.
                 let child_idx = internal.find(key).map_or_else(|| Err(()), |i| Ok(i))?;
-                let child_num = internal.get_child_pointer(child_idx)?;
+                let child_num = internal.get_child_pointer(child_idx);
                 let child = self.store.read_page(child_num)?;
                 let child = Self {
                     root: child,
@@ -158,7 +157,7 @@ impl<S: Store> Tree<S> {
                 };
                 let u = child.insert_helper(key, val)?;
                 let child_entries = u.child_entries(child_idx);
-                let u = node::Upsert::from(internal.upsert_child_entries(child_entries.as_ref())?);
+                let u = node::Upsert::from(internal.merge_as_upsert(child_entries.as_ref())?);
                 Ok(self.alloc_upsert(u)?)
             }
         }
@@ -168,7 +167,7 @@ impl<S: Store> Tree<S> {
     pub fn update(&self, key: &[u8], val: &[u8]) -> Result<Self> {
         match self.update_helper(key, val)? {
             Upsert::Intact(tree) => Ok(tree),
-            Upsert::Split { left, right } => self.new_root(left, right),
+            Upsert::Split { left, right } => self.parent_of_split(left, right),
         }
     }
 
@@ -184,16 +183,16 @@ impl<S: Store> Tree<S> {
             Node::Internal(internal) => {
                 // Find which child to recursively update at.
                 let child_idx = internal.find(key).map_or_else(|| Err(()), |i| Ok(i))?;
-                let child_num = internal.get_child_pointer(child_idx)?;
+                let child_num = internal.get_child_pointer(child_idx);
                 let child = self.store.read_page(child_num)?;
                 let child = Self {
                     root: child,
                     page_num: child_num,
-                    store: self.store.clone()
+                    store: self.store.clone(),
                 };
                 let u = child.update_helper(key, val)?;
                 let child_entries = u.child_entries(child_idx);
-                let u = node::Upsert::from(internal.upsert_child_entries(child_entries.as_ref())?);
+                let u = node::Upsert::from(internal.merge_as_upsert(child_entries.as_ref())?);
                 Ok(self.alloc_upsert(u)?)
             }
         }
@@ -205,9 +204,13 @@ impl<S: Store> Tree<S> {
             Deletion::Empty => {
                 let root = Node::Leaf(Leaf::default());
                 let page_num = self.store.write_page(&root)?;
-                Ok(Self { root, page_num, store: self.store.clone() })
+                Ok(Self {
+                    root,
+                    page_num,
+                    store: self.store.clone(),
+                })
             }
-            Deletion::Split { left, right } => self.new_root(left, right),
+            Deletion::Split { left, right } => self.parent_of_split(left, right),
             Deletion::Sufficient(tree) => Ok(tree),
             Deletion::Underflow(tree) => Ok(tree),
         }
@@ -222,41 +225,50 @@ impl<S: Store> Tree<S> {
             // Base case
             Node::Leaf(leaf) => Ok(self.alloc_deletion(leaf.delete(key)?)?),
             // Recursive case
-            Node::Internal(internal) => {
+            Node::Internal(parent) => {
                 // Find which child to recursively delete from.
-                let child_idx = internal.find(key).map_or_else(|| Err(()), |i| Ok(i))?;
-                let child_num = internal.get_child_pointer(child_idx)?;
+                let child_idx = parent.find(key).map_or_else(|| Err(()), |i| Ok(i))?;
+                let child_num = parent.get_child_pointer(child_idx);
                 let child = self.store.read_page(child_num)?;
                 let child = Self {
                     root: child,
                     page_num: child_num,
-                    store: self.store.clone()
+                    store: self.store.clone(),
                 };
                 match child.delete_helper(key)? {
                     Deletion::Empty => {
-                        // What if nkeys is now 1? Then delete_child_entry will return Underflow.
-                        let d = internal.delete_child_entry(child_idx)?;
+                        let d =
+                            parent.merge_as_deletion(&[ChildEntry::Delete { i: child_idx }])?;
                         return Ok(self.alloc_deletion(d)?);
                     }
                     Deletion::Sufficient(child) => {
-                        let d = internal.update_child_entry(
-                            child_idx,
-                            child.root.get_key(0),
-                            child.page_num,
-                        )?;
+                        let d = parent.merge_as_deletion(&[ChildEntry::Update {
+                            i: child_idx,
+                            key: child.root.get_key(0).into(),
+                            page_num: child.page_num,
+                        }])?;
                         return Ok(self.alloc_deletion(d)?);
                     }
                     Deletion::Split {
-                        left: child_split_left,
-                        right: child_split_right,
+                        left: left_child,
+                        right: right_child,
                     } => {
-                        // Internal is sufficient.
-                        todo!();
+                        let d = parent.merge_as_deletion(&[
+                            ChildEntry::Update {
+                                i: child_idx,
+                                key: left_child.root.get_key(0).into(),
+                                page_num: left_child.page_num,
+                            },
+                            ChildEntry::Insert {
+                                key: right_child.root.get_key(0).into(),
+                                page_num: right_child.page_num,
+                            },
+                        ])?;
+                        return Ok(self.alloc_deletion(d)?);
                     }
                     Deletion::Underflow(child) => {
-                        let delta: node::DeletionDelta =
-                            self.try_fix_underflow(internal, child, child_idx)?;
-                        let d = internal.merge_delta(delta)?;
+                        let entries = self.try_fix_underflow(parent, child, child_idx)?;
+                        let d = parent.merge_as_deletion(&entries)?;
                         return Ok(self.alloc_deletion(d)?);
                     }
                 }
@@ -275,7 +287,7 @@ impl<S: Store> Tree<S> {
         parent: &Internal,
         child: Self,
         child_idx: usize,
-    ) -> Result<node::DeletionDelta> {
+    ) -> Result<Rc<[ChildEntry]>> {
         // Try stealing or merging the left sibling.
         if child_idx > 0 {
             match self.try_steal_or_merge(parent, &child.root, child_idx, child_idx - 1)? {
@@ -284,9 +296,11 @@ impl<S: Store> Tree<S> {
             }
         }
         // Try stealing or merging the right sibling.
-        match self.try_steal_or_merge(parent, &child.root, child_idx, child_idx + 1)? {
-            None => {}
-            Some(delta) => return Ok(delta),
+        if child_idx < parent.get_num_keys() - 1 {
+            match self.try_steal_or_merge(parent, &child.root, child_idx, child_idx + 1)? {
+                None => {}
+                Some(delta) => return Ok(delta),
+            }
         }
 
         // 5. Just leave child in underflow.
@@ -299,7 +313,12 @@ impl<S: Store> Tree<S> {
         // with 3 keys, which will not exceed the page size.
         // Leaf nodes, OTOH, can remain underflow due to variable-length
         // keys and values.
-        return Ok([(child_idx, Some(child.page_num))].into());
+        return Ok([ChildEntry::Update {
+            i: child_idx,
+            key: child.root.get_key(0).into(),
+            page_num: child.page_num,
+        }]
+        .into());
     }
 
     /// Tries to fix the underflow of `child` by stealing from or merging from
@@ -310,40 +329,58 @@ impl<S: Store> Tree<S> {
         child: &Node,
         child_idx: usize,
         sibling_idx: usize,
-    ) -> Result<Option<node::DeletionDelta>> {
-        let sibling_num = parent.get_child_pointer(sibling_idx)?;
+    ) -> Result<Option<Rc<[ChildEntry]>>> {
+        let sibling_num = parent.get_child_pointer(sibling_idx);
         let sibling = self.store.read_page(sibling_num)?;
         if node::can_steal(&sibling, &child) {
             let (new_sibling, new_child) = node::steal(&sibling, child)?;
             let new_sibling_num = self.store.write_page(&new_sibling)?;
             let new_child_num = self.store.write_page(&new_child)?;
-            return Ok(Some(
-                [
-                    (child_idx - 1, Some(new_sibling_num)),
-                    (child_idx, Some(new_child_num)),
-                ]
-                .into(),
-            ));
+            let mut first = ChildEntry::Update {
+                i: sibling_idx,
+                key: new_sibling.get_key(0).into(),
+                page_num: new_sibling_num,
+            };
+            let mut second = ChildEntry::Update {
+                i: child_idx,
+                key: new_child.get_key(0).into(),
+                page_num: new_child_num,
+            };
+            if sibling_idx > child_idx {
+                (first, second) = (second, first);
+            }
+            return Ok(Some([first, second].into()));
         }
         if node::can_merge(&child, &sibling) {
             let new_sibling = node::merge(child, &sibling)?;
             let new_sibling_num = self.store.write_page(&new_sibling)?;
-            return Ok(Some(
-                [(child_idx - 1, Some(new_sibling_num)), (child_idx, None)].into(),
-            ));
+            let mut first = ChildEntry::Update {
+                i: sibling_idx,
+                key: new_sibling.get_key(0).into(),
+                page_num: new_sibling_num,
+            };
+            let mut second = ChildEntry::Delete { i: child_idx };
+            if sibling_idx > child_idx {
+                (first, second) = (second, first);
+            }
+            return Ok(Some([first, second].into()));
         }
         Ok(None)
     }
 
     /// Returns a new internal root node whose children are split nodes
     /// newly-created due to an operation on the tree.
-    fn new_root(&self, left: Self, right: Self) -> Result<Self> {
-        let keys = &[left.root.get_key(0), right.root.get_key(0)];
-        let child_pointers = &[left.page_num, right.page_num];
-        let root = Internal::new(keys, child_pointers);
+    fn parent_of_split(&self, left: Self, right: Self) -> Result<Self> {
+        let keys = [left.root.get_key(0), right.root.get_key(0)];
+        let child_pointers = [left.page_num, right.page_num];
+        let root = Internal::parent_of_split(keys, child_pointers)?;
         let root = Node::Internal(root);
         let page_num = self.store.write_page(&root)?;
-        Ok(Self { root, page_num, store: self.store.clone() })
+        Ok(Self {
+            root,
+            page_num,
+            store: self.store.clone(),
+        })
     }
 
     /// Allocates pages for the in-memory nodes created during an upsert.
@@ -351,7 +388,11 @@ impl<S: Store> Tree<S> {
         match u {
             node::Upsert::Intact(root) => {
                 let page_num = self.store.write_page(&root)?;
-                Ok(Upsert::Intact(Self { root, page_num, store: self.store.clone() }))
+                Ok(Upsert::Intact(Self {
+                    root,
+                    page_num,
+                    store: self.store.clone(),
+                }))
             }
             node::Upsert::Split { left, right } => {
                 let left_page_num = self.store.write_page(&left)?;
@@ -359,12 +400,12 @@ impl<S: Store> Tree<S> {
                 let left = Self {
                     root: left,
                     page_num: left_page_num,
-                    store: self.store.clone()
+                    store: self.store.clone(),
                 };
                 let right = Self {
                     root: right,
                     page_num: right_page_num,
-                    store: self.store.clone()
+                    store: self.store.clone(),
                 };
                 Ok(Upsert::Split { left, right })
             }
@@ -377,7 +418,11 @@ impl<S: Store> Tree<S> {
             node::Deletion::Empty => Ok(Deletion::Empty),
             node::Deletion::Sufficient(root) => {
                 let page_num = self.store.write_page(&root)?;
-                Ok(Deletion::Sufficient(Self { root, page_num, store: self.store.clone() }))
+                Ok(Deletion::Sufficient(Self {
+                    root,
+                    page_num,
+                    store: self.store.clone(),
+                }))
             }
             node::Deletion::Split { left, right } => {
                 let left_page_num = self.store.write_page(&left)?;
@@ -385,18 +430,22 @@ impl<S: Store> Tree<S> {
                 let left = Self {
                     root: left,
                     page_num: left_page_num,
-                    store: self.store.clone()
+                    store: self.store.clone(),
                 };
                 let right = Self {
                     root: right,
                     page_num: right_page_num,
-                    store: self.store.clone()
+                    store: self.store.clone(),
                 };
                 Ok(Deletion::Split { left, right })
             }
             node::Deletion::Underflow(root) => {
                 let page_num = self.store.write_page(&root)?;
-                Ok(Deletion::Underflow(Self { root, page_num, store: self.store.clone() }))
+                Ok(Deletion::Underflow(Self {
+                    root,
+                    page_num,
+                    store: self.store.clone(),
+                }))
             }
         }
     }
