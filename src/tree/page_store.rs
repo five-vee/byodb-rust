@@ -1,10 +1,11 @@
-use super::node::Node;
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
 };
+use super::error::PageStoreError;
+use super::node::Node;
 
-pub type Result<T> = std::result::Result<T, ()>;
+type Result<T> = std::result::Result<T, PageStoreError>;
 
 /// A store of pages that backs a COW B+ Tree.
 pub trait Store {
@@ -36,14 +37,12 @@ impl Store for InMemory {
         self.pages
             .borrow()
             .get(&page_num)
-            .map_or(Err(()), |n| Ok(n.clone()))
+            .map_or(Err(PageStoreError::Read(format!("page_num {page_num} does not exist").into())), |n| Ok(n.clone()))
     }
 
     fn write_page(&self, node: &Node) -> Result<u64> {
         let curr = self.counter.get();
-        if self.pages.borrow_mut().insert(curr, node.clone()).is_some() {
-            return Err(())
-        }
+        assert!(self.pages.borrow_mut().insert(curr, node.clone()).is_none());
         self.counter.set(curr + 1);
         Ok(curr)
     }

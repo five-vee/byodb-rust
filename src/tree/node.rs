@@ -94,8 +94,11 @@
 //! long as nodes contain the necessary information.
 
 pub use internal_util::ChildEntry;
+use super::error::NodeError;
 use internal_util::InternalBuilder;
 use leaf_util::LeafBuilder;
+
+type Result<T> = std::result::Result<T, NodeError>;
 
 /// Size of a B+ tree node page.
 pub const PAGE_SIZE: usize = 4096;
@@ -131,7 +134,16 @@ enum NodeType {
     Internal = 0b10u16,
 }
 
-pub type Result<T> = std::result::Result<T, ()>;
+impl TryFrom<u16> for NodeType {
+    type Error = NodeError;
+    fn try_from(value: u16) -> Result<Self> {
+        match value {
+            0b01u16 => Ok(NodeType::Leaf),
+            0b10u16 => Ok(NodeType::Internal),
+            _ => Err(NodeError::UnexpectedNodeType(value)),
+        }
+    }
+}
 
 /// An enum representing the type of B+ tree node.
 #[derive(Debug, Clone)]
@@ -245,7 +257,7 @@ fn get_num_keys(buf: &[u8]) -> usize {
 
 /// Leaf node utilities.
 mod leaf_util {
-    use super::{Deletion, Leaf, Node, NodeType, Result, Upsert};
+    use super::{Deletion, Leaf, Node, NodeError, NodeType, Result, Upsert};
 
     /// Gets the `i`th key in a leaf page buffer.
     pub fn get_key(buf: &[u8], i: usize) -> &[u8] {
@@ -328,14 +340,17 @@ mod leaf_util {
 
         /// Adds a key-value pair to the builder.
         pub fn add_key_value(mut self, key: &[u8], val: &[u8]) -> Result<Self> {
-            if self.i >= self.num_keys {
-                return Err(());
-            }
+            assert!(
+                self.i < self.num_keys,
+                "add_key_value() called {} times, cannot be called more times than num_keys = {}",
+                self.i,
+                self.num_keys
+            );
             if key.len() > super::MAX_KEY_SIZE {
-                return Err(());
+                return Err(NodeError::MaxKeySize(key.len()));
             }
             if val.len() > super::MAX_VALUE_SIZE {
-                return Err(());
+                return Err(NodeError::MaxValueSize(val.len()));
             }
 
             // Make sure buffer is initialized.
@@ -364,11 +379,21 @@ mod leaf_util {
 
         /// Builds an Upsert.
         pub fn build_upsert(self) -> Result<Upsert> {
+            assert!(
+                self.i != self.num_keys,
+                "build_upsert() must be called after calling add_key_value() num_keys = {} times",
+                self.num_keys
+            );
             Ok(Self::new_upsert(self.build_single_or_split()?))
         }
 
         /// Builds a Deletion.
         pub fn build_deletion(self) -> Result<Deletion> {
+            assert!(
+                self.i != self.num_keys,
+                "build_deletion() must be called after calling add_key_value() num_keys = {} times",
+                self.num_keys
+            );
             Ok(Self::new_deletion(self.build_single_or_split()?))
         }
 
@@ -412,25 +437,21 @@ mod leaf_util {
 
         /// Builds one leaf, or two due to splitting.
         fn build_single_or_split(mut self) -> Result<(Leaf, Option<Leaf>)> {
-            if self.i != self.num_keys {
-                return Err(());
-            }
             if self.buf.is_none() {
-                return Err(());
+                // Technically, an empty leaf is allowed.
+                return Ok((Leaf::default(), None));
             }
             let buf = self.buf.take().unwrap();
             if get_num_bytes(&buf) <= super::PAGE_SIZE {
                 return Ok((self.build_single(), None));
             }
+            self.buf = Some(buf);
             let (left, right) = self.build_split()?;
             Ok((left, Some(right)))
         }
 
         /// Builds two splits of a leaf.
         fn build_split(mut self) -> Result<(Leaf, Leaf)> {
-            if self.buf.is_none() {
-                return Err(());
-            }
             let buf = self.buf.take().unwrap();
             let num_keys = self.num_keys as usize;
             let mut left_end: usize = 0;
@@ -455,7 +476,6 @@ mod leaf_util {
 
         /// Builds a leaf.
         fn build_single(mut self) -> Leaf {
-            assert!(self.buf.is_some());
             let buf = self.buf.take().unwrap();
             assert!(get_num_bytes(&buf) <= super::PAGE_SIZE);
             Leaf {
@@ -473,9 +493,9 @@ pub struct Leaf {
 
 impl Default for Leaf {
     fn default() -> Self {
-        return Self {
-            buf: Box::new([0; PAGE_SIZE]),
-        };
+        let mut buf = Box::new([0; PAGE_SIZE]);
+        set_page_header(buf.as_mut(), NodeType::Leaf);
+        return Self { buf };
     }
 }
 
@@ -483,7 +503,7 @@ impl Leaf {
     /// Inserts a key-value pair.
     pub fn insert(&self, key: &[u8], val: &[u8]) -> Result<Upsert> {
         if self.find(key).is_some() {
-            return Err(());
+            return Err(NodeError::AlreadyExists);
         }
         let mut b = LeafBuilder::new(self.get_num_keys() + 1).allow_overflow();
         let mut added = false;
@@ -500,7 +520,7 @@ impl Leaf {
     /// Updates the value corresponding to a key.
     pub fn update(&self, key: &[u8], val: &[u8]) -> Result<Upsert> {
         if self.find(key).is_none() {
-            return Err(());
+            return Err(NodeError::KeyNotFound);
         }
         let mut b = LeafBuilder::new(self.get_num_keys()).allow_overflow();
         let mut added = false;
@@ -518,7 +538,7 @@ impl Leaf {
     /// Deletes a key and its corresponding value.
     pub fn delete(&self, key: &[u8]) -> Result<Deletion> {
         if self.find(key).is_none() {
-            return Err(());
+            return Err(NodeError::KeyNotFound);
         }
         // Optimization: avoid memory allocation and
         // just return Deletion::Empty if only 1 key.
@@ -588,6 +608,7 @@ impl<'a> Iterator for LeafIterator<'a> {
 mod internal_util {
     use std::rc::Rc;
 
+    use super::super::error::NodeError;
     use super::{Deletion, Internal, Node, NodeType, Result, Upsert};
 
     /// A child entry to insert, update, or delete in an internal node.
@@ -672,6 +693,7 @@ mod internal_util {
     impl InternalBuilder {
         /// Creates a new internal builder.
         pub fn new(num_keys: usize) -> Self {
+            assert!(num_keys >= 2, "An internal node must have at least 2 keys.");
             Self {
                 num_keys,
                 i: 0,
@@ -691,11 +713,14 @@ mod internal_util {
 
         /// Adds a child entry to the builder.
         pub fn add_child_entry(mut self, key: &[u8], page_num: u64) -> Result<Self> {
-            if self.i >= self.num_keys {
-                return Err(());
-            }
+            assert!(
+                self.i < self.num_keys,
+                "add_child_entry() called {} times, cannot be called more times than num_keys = {}",
+                self.i,
+                self.num_keys
+            );
             if key.len() > super::MAX_KEY_SIZE {
-                return Err(());
+                return Err(NodeError::MaxKeySize(key.len()));
             }
 
             // Make sure buffer is initialized.
@@ -708,8 +733,9 @@ mod internal_util {
             let offset = set_next_offset(&mut buf, self.i, n, key);
             set_child_pointer(&mut buf, self.i, page_num);
             let simulated_bytes = 4 + self.i * 10 + offset;
-            assert!(simulated_bytes + key.len() <= buf.len(),
-            "builder unexpectedly overflowed; please call allow_overflow(), or don't add too many key-value pairs.");
+            assert!(
+                simulated_bytes + key.len() <= buf.len(),
+                "builder unexpectedly overflowed; please call allow_overflow(), or don't add too many key-value pairs.");
 
             let pos = 4 + n * 10 + offset;
             buf[pos..pos + key.len()].copy_from_slice(key);
@@ -722,17 +748,31 @@ mod internal_util {
 
         /// Builds an Upsert.
         pub fn build_upsert(self) -> Result<Upsert> {
+            assert!(
+                self.i == self.num_keys,
+                "build_upsert() must be called after calling add_child_entry() num_keys = {} times",
+                self.num_keys
+            );
             Ok(Self::new_upsert(self.build_single_or_split()?))
         }
 
         /// Builds a Deletion.
         pub fn build_deletion(self) -> Result<Deletion> {
+            assert!(
+                self.i == self.num_keys,
+                "build_deletion() must be called after calling add_child_entry() num_keys = {} times",
+                self.num_keys
+            );
             Ok(Self::new_deletion(self.build_single_or_split()?))
         }
 
         /// Builds an internal node.
         pub fn build_single(mut self) -> Internal {
-            assert!(self.buf.is_some());
+            assert!(
+                self.i == self.num_keys,
+                "build_single() must be called after calling add_child_entry() num_keys = {} times",
+                self.num_keys
+            );
             let buf = self.buf.take().unwrap();
             assert!(get_num_bytes(&buf) <= super::PAGE_SIZE);
             Internal {
@@ -742,12 +782,11 @@ mod internal_util {
 
         /// Builds one internal node, or two due to splitting.
         pub fn build_single_or_split(mut self) -> Result<(Internal, Option<Internal>)> {
-            if self.i != self.num_keys {
-                return Err(());
-            }
-            if self.buf.is_none() {
-                return Err(());
-            }
+            assert!(
+                self.i == self.num_keys,
+                "build_single_or_split() must be called after calling add_child_entry() num_keys = {} times",
+                self.num_keys
+            );
             let buf = self.buf.take().unwrap();
             if get_num_bytes(&buf) <= super::PAGE_SIZE {
                 return Ok((self.build_single(), None));
@@ -795,9 +834,6 @@ mod internal_util {
 
         /// Builds two splits of an internal node.
         fn build_split(mut self) -> Result<(Internal, Internal)> {
-            if self.buf.is_none() {
-                return Err(());
-            }
             let buf = self.buf.take().unwrap();
             let num_keys = self.num_keys as usize;
             let mut left_end: usize = 0;

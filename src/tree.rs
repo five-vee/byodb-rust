@@ -18,14 +18,16 @@
 //! versioning and auditing, as previous states of the data structure are
 //! implicitly retained.
 
+mod error;
 mod node;
 mod page_store;
 
+pub use error::TreeError;
+use std::rc::Rc;
 use node::{ChildEntry, Internal, Leaf, Node};
 use page_store::Store;
-use std::rc::Rc;
 
-pub type Result<T> = std::result::Result<T, ()>;
+type Result<T> = std::result::Result<T, TreeError>;
 
 /// An enum representing the node(s) created during an insert or update
 /// (aka an "upsert") operation on a tree.
@@ -118,7 +120,9 @@ impl<S: Store> Tree<S> {
     pub fn get(&self, key: &[u8]) -> Result<Option<Rc<[u8]>>> {
         match &self.root {
             Node::Internal(root) => {
-                let child_idx = root.find(key).map_or_else(|| Err(()), |i| Ok(i))?;
+                let child_idx = root
+                    .find(key)
+                    .map_or_else(|| Err(TreeError::KeyNotFound), |i| Ok(i))?;
                 let child_num = root.get_child_pointer(child_idx);
                 let child = self.store.read_page(child_num)?;
                 let child = Self {
@@ -151,7 +155,9 @@ impl<S: Store> Tree<S> {
             // Recursive case
             Node::Internal(internal) => {
                 // Find which child to recursively insert into.
-                let child_idx = internal.find(key).map_or_else(|| Err(()), |i| Ok(i))?;
+                let child_idx = internal
+                    .find(key)
+                    .map_or_else(|| Err(TreeError::KeyNotFound), |i| Ok(i))?;
                 let child_num = internal.get_child_pointer(child_idx);
                 let child = self.store.read_page(child_num)?;
                 let child = Self {
@@ -186,7 +192,9 @@ impl<S: Store> Tree<S> {
             // Recursive case
             Node::Internal(internal) => {
                 // Find which child to recursively update at.
-                let child_idx = internal.find(key).map_or_else(|| Err(()), |i| Ok(i))?;
+                let child_idx = internal
+                    .find(key)
+                    .map_or_else(|| Err(TreeError::KeyNotFound), |i| Ok(i))?;
                 let child_num = internal.get_child_pointer(child_idx);
                 let child = self.store.read_page(child_num)?;
                 let child = Self {
@@ -231,7 +239,9 @@ impl<S: Store> Tree<S> {
             // Recursive case
             Node::Internal(parent) => {
                 // Find which child to recursively delete from.
-                let child_idx = parent.find(key).map_or_else(|| Err(()), |i| Ok(i))?;
+                let child_idx = parent
+                    .find(key)
+                    .map_or_else(|| Err(TreeError::KeyNotFound), |i| Ok(i))?;
                 let child_num = parent.get_child_pointer(child_idx);
                 let child = self.store.read_page(child_num)?;
                 let child = Self {
@@ -269,9 +279,7 @@ impl<S: Store> Tree<S> {
                         ])?;
                         Ok(self.alloc_deletion(d)?)
                     }
-                    Deletion::Underflow(child) => {
-                        self.try_fix_underflow(parent, child, child_idx)
-                    }
+                    Deletion::Underflow(child) => self.try_fix_underflow(parent, child, child_idx),
                 }
             }
         }
@@ -291,11 +299,11 @@ impl<S: Store> Tree<S> {
     ) -> Result<Deletion<S>> {
         // Try stealing or merging the left sibling.
         if child_idx > 0 {
-            return self.steal_or_merge(parent, &child.root, child_idx, child_idx - 1)
+            return self.steal_or_merge(parent, &child.root, child_idx, child_idx - 1);
         }
         // Try stealing or merging the right sibling.
         if child_idx < parent.get_num_keys() - 1 {
-            return self.steal_or_merge(parent, &child.root, child_idx, child_idx + 1)
+            return self.steal_or_merge(parent, &child.root, child_idx, child_idx + 1);
         }
 
         // 5. Just leave child in underflow.
