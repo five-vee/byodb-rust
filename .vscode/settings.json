@@ -1,8 +1,0 @@
-{
-  "terminal.integrated.profiles.osx": {
-    "floxShellProfile": {
-      "path": "/bin/zsh"
-    }
-  },
-  "terminal.integrated.defaultProfile.osx": "floxShellProfile"
-}
