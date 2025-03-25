@@ -147,7 +147,8 @@ mod util {
         pub fn build_upsert(self) -> Result<Upsert> {
             assert!(
                 self.i == self.num_keys,
-                "build_upsert() must be called after calling add_child_entry() num_keys = {} times",
+                "build_upsert() called after calling add_child_entry() {} times < num_keys = {}",
+                self.i,
                 self.num_keys
             );
             Ok(Self::new_upsert(self.build_single_or_split()?))
@@ -157,7 +158,8 @@ mod util {
         pub fn build_deletion(self) -> Result<Deletion> {
             assert!(
                 self.i == self.num_keys,
-                "build_deletion() must be called after calling add_child_entry() num_keys = {} times",
+                "build_deletion() called after calling add_child_entry() {} times < num_keys = {}",
+                self.i,
                 self.num_keys
             );
             Ok(Self::new_deletion(self.build_single_or_split()?))
@@ -167,7 +169,8 @@ mod util {
         pub fn build_single(mut self) -> Internal {
             assert!(
                 self.i == self.num_keys,
-                "build_single() must be called after calling add_child_entry() num_keys = {} times",
+                "build_single() called after calling add_child_entry() {} times < num_keys = {}",
+                self.i,
                 self.num_keys
             );
             let buf = self.buf.take().unwrap();
@@ -181,13 +184,16 @@ mod util {
         pub fn build_single_or_split(mut self) -> Result<(Internal, Option<Internal>)> {
             assert!(
                 self.i == self.num_keys,
-                "build_single_or_split() must be called after calling add_child_entry() num_keys = {} times",
+                "build_single_or_split() called after calling add_child_entry() {} times < num_keys = {}",
+                self.i,
                 self.num_keys
             );
             let buf = self.buf.take().unwrap();
             if get_num_bytes(&buf) <= super::PAGE_SIZE {
+                self.buf = Some(buf);
                 return Ok((self.build_single(), None));
             }
+            self.buf = Some(buf);
             let (left, right) = self.build_split()?;
             Ok((left, Some(right)))
         }

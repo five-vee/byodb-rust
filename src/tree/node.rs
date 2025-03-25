@@ -176,6 +176,7 @@ impl Node {
 
 /// An enum representing the node(s) created during an insert or update
 /// (aka an "upsert") operation on a tree.
+#[derive(Debug)]
 pub enum Upsert {
     /// A newly created node that remained  "intact", i.e. it did not split
     /// after an upsert.

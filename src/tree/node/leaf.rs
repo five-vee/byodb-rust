@@ -127,8 +127,9 @@ mod util {
         /// Builds an Upsert.
         pub fn build_upsert(self) -> Result<Upsert> {
             assert!(
-                self.i != self.num_keys,
-                "build_upsert() must be called after calling add_key_value() num_keys = {} times",
+                self.i == self.num_keys,
+                "build_upsert() called after calling add_key_value() {} times < num_keys = {}",
+                self.i,
                 self.num_keys
             );
             Ok(Self::new_upsert(self.build_single_or_split()?))
@@ -137,8 +138,9 @@ mod util {
         /// Builds a Deletion.
         pub fn build_deletion(self) -> Result<Deletion> {
             assert!(
-                self.i != self.num_keys,
-                "build_deletion() must be called after calling add_key_value() num_keys = {} times",
+                self.i == self.num_keys,
+                "build_deletion() called after calling add_key_value() {} times < num_keys = {}",
+                self.i,
                 self.num_keys
             );
             Ok(Self::new_deletion(self.build_single_or_split()?))
@@ -190,6 +192,7 @@ mod util {
             }
             let buf = self.buf.take().unwrap();
             if get_num_bytes(&buf) <= super::PAGE_SIZE {
+                self.buf = Some(buf);
                 return Ok((self.build_single(), None));
             }
             self.buf = Some(buf);
@@ -260,6 +263,9 @@ impl Leaf {
                 b = b.add_key_value(key, val)?;
             }
             b = b.add_key_value(k, v)?;
+        }
+        if !added {
+            b = b.add_key_value(key, val)?;
         }
         b.build_upsert()
     }
@@ -359,5 +365,43 @@ impl<'a> Iterator for LeafIterator<'a> {
         let item = Some((self.node.get_key(self.i), self.node.get_value(self.i)));
         self.i += 1;
         item
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_upsert_intact(u: Upsert, f: impl FnOnce(Leaf)) {
+        match u {
+            Upsert::Intact(Node::Leaf(leaf)) => { f(leaf) },
+            _ => { panic!("{u:?} is not an Upsert::Intact(Node::Leaf(_))") }
+        }
+    }
+
+    #[test]
+    fn leaf_insert_intact() {
+        let u = Leaf::default()
+            .insert("hello".as_bytes(), "world".as_bytes())
+            .unwrap();
+        test_upsert_intact(u, |leaf| {
+            assert_eq!(leaf.find("hello".as_bytes()).unwrap(), "world".as_bytes());
+        })
+    }
+
+    #[test]
+    fn leaf_insert_max_key_size() {
+        let key = &[0u8; super::PAGE_SIZE + 1];
+        let result = Leaf::default()
+            .insert(key, "val".as_bytes());
+        assert!(matches!(result, Err(NodeError::MaxKeySize(x)) if x == 4097));
+    }
+
+    #[test]
+    fn leaf_insert_max_value_size() {
+        let val = &[0u8; super::PAGE_SIZE + 1];
+        let result = Leaf::default()
+            .insert("key".as_bytes(), val);
+        assert!(matches!(result, Err(NodeError::MaxValueSize(x)) if x == 4097));
     }
 }
