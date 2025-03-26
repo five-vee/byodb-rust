@@ -2,9 +2,38 @@ use super::*;
 
 use util::LeafBuilder;
 
+/// An enum representing the effect of a leaf node operation.
+#[derive(Debug)]
+pub enum LeafEffect {
+    /// A leaf with 0 keys after a delete was performed on it.
+    /// This is a special-case of `Underflow` done to avoid unnecessary
+    /// page allocations, since empty non-root nodes aren't allowed.
+    Empty,
+    /// A newly created leaf that remained  "intact", i.e. it did not split.
+    Intact(Leaf),
+    /// The left and right splits of a leaf that was created.
+    Split { left: Leaf, right: Leaf },
+}
+
+impl LeafEffect {
+    fn take_intact(self) -> Leaf {
+        match self {
+            LeafEffect::Intact(leaf) => leaf,
+            _ => panic!("{self:?} is not LeafEffect::Intact")
+        }
+    }
+
+    fn take_split(self) -> (Leaf, Leaf) {
+        match self {
+            LeafEffect::Split { left, right } => (left, right),
+            _ => panic!("{self:?} is not LeafEffect::Split")
+        }
+    }
+}
+
 /// Leaf node utilities.
 mod util {
-    use super::{Deletion, Leaf, Node, NodeError, NodeType, Result, Upsert};
+    use super::{Leaf, LeafEffect, NodeError, NodeType, Result};
 
     /// Gets the `i`th key in a leaf page buffer.
     pub fn get_key(buf: &[u8], i: usize) -> &[u8] {
@@ -62,7 +91,7 @@ mod util {
     pub struct LeafBuilder {
         num_keys: usize,
         i: usize,
-        buf: Option<Box<[u8]>>,
+        buf: Box<[u8]>,
     }
 
     impl LeafBuilder {
@@ -71,17 +100,17 @@ mod util {
             Self {
                 num_keys,
                 i: 0,
-                buf: None,
+                buf: Box::new([]),
             }
         }
 
         /// Allows the builder to overflow to two pages.
         pub fn allow_overflow(mut self) -> Self {
             assert!(
-                self.buf.is_none(),
+                self.buf.len() == 0,
                 "allow_overflow() must be called only once and before add_key_value()"
             );
-            self.buf = Some([0; 2 * super::PAGE_SIZE - 4].into());
+            self.buf = Box::new([0; 2 * super::PAGE_SIZE - 4]);
             self
         }
 
@@ -101,113 +130,54 @@ mod util {
             }
 
             // Make sure buffer is initialized.
-            if self.buf.is_none() {
-                self.buf = Some(Self::new_buffer());
+            if self.buf.len() == 0 {
+                self.buf = Box::new([0; super::PAGE_SIZE]);
+                super::set_page_header(&mut *self.buf, NodeType::Leaf);
             }
-            let mut buf = self.buf.take().unwrap();
 
             let n = self.num_keys;
-            let offset = set_next_offset(&mut buf, self.i, key, val);
+            let offset = set_next_offset(&mut self.buf, self.i, key, val);
             let simulated_bytes = 4 + self.i * 2 + offset;
-            assert!(simulated_bytes + 4 + key.len() + val.len() <= buf.len(),
+            assert!(simulated_bytes + 4 + key.len() + val.len() <= self.buf.len(),
             "builder unexpectedly overflowed; please call allow_overflow(), or don't add too many key-value pairs.");
 
             let pos = 4 + n * 2 + offset;
-            buf[pos..pos + 2].copy_from_slice(&(key.len() as u16).to_be_bytes());
-            buf[pos + 2..pos + 4].copy_from_slice(&(val.len() as u16).to_be_bytes());
-            buf[pos + 4..pos + 4 + key.len()].copy_from_slice(key);
-            buf[pos + 4 + key.len()..pos + 4 + key.len() + val.len()].copy_from_slice(val);
+            self.buf[pos..pos + 2].copy_from_slice(&(key.len() as u16).to_be_bytes());
+            self.buf[pos + 2..pos + 4].copy_from_slice(&(val.len() as u16).to_be_bytes());
+            self.buf[pos + 4..pos + 4 + key.len()].copy_from_slice(key);
+            self.buf[pos + 4 + key.len()..pos + 4 + key.len() + val.len()].copy_from_slice(val);
 
             self.i += 1;
-            super::set_num_keys(&mut buf, self.i);
-            self.buf = Some(buf);
+            super::set_num_keys(&mut self.buf, self.i);
             Ok(self)
         }
 
-        /// Builds an Upsert.
-        pub fn build_upsert(self) -> Result<Upsert> {
+        /// Builds a leaf and optionally splits it if overflowed.
+        pub fn build(self) -> Result<LeafEffect> {
             assert!(
                 self.i == self.num_keys,
-                "build_upsert() called after calling add_key_value() {} times < num_keys = {}",
+                "build() called after calling add_key_value() {} times < num_keys = {}",
                 self.i,
                 self.num_keys
             );
-            Ok(Self::new_upsert(self.build_single_or_split()?))
-        }
-
-        /// Builds a Deletion.
-        pub fn build_deletion(self) -> Result<Deletion> {
-            assert!(
-                self.i == self.num_keys,
-                "build_deletion() called after calling add_key_value() {} times < num_keys = {}",
-                self.i,
-                self.num_keys
-            );
-            Ok(Self::new_deletion(self.build_single_or_split()?))
-        }
-
-        /// Creates a new page-sized in-memory buffer.
-        fn new_buffer() -> Box<[u8]> {
-            let mut buf = [0; super::PAGE_SIZE];
-            super::set_page_header(&mut buf, NodeType::Leaf);
-            buf.into()
-        }
-
-        /// Creates a new Upsert from at least 1 leaf.
-        fn new_upsert(build_result: (Leaf, Option<Leaf>)) -> Upsert {
-            match build_result {
-                (left, Some(right)) => Upsert::Split {
-                    left: Node::Leaf(left),
-                    right: Node::Leaf(right),
-                },
-                (leaf, None) => Upsert::Intact(Node::Leaf(leaf)),
-            }
-        }
-
-        /// Creates a new Deletion from at least 1 leaf.
-        fn new_deletion(build_result: (Leaf, Option<Leaf>)) -> Deletion {
-            match build_result {
-                (left, Some(right)) => Deletion::Split {
-                    left: Node::Leaf(left),
-                    right: Node::Leaf(right),
-                },
-                (leaf, None) => {
-                    let n = super::get_num_keys(&leaf.buf);
-                    if n == 0 {
-                        Deletion::Empty
-                    } else if n == 1 {
-                        Deletion::Underflow(Node::Leaf(leaf))
-                    } else {
-                        Deletion::Sufficient(Node::Leaf(leaf))
-                    }
-                }
-            }
-        }
-
-        /// Builds one leaf, or two due to splitting.
-        fn build_single_or_split(mut self) -> Result<(Leaf, Option<Leaf>)> {
-            if self.buf.is_none() {
+            if self.buf.len() == 0 {
                 // Technically, an empty leaf is allowed.
-                return Ok((Leaf::default(), None));
+                return Ok(LeafEffect::Empty)
             }
-            let buf = self.buf.take().unwrap();
-            if get_num_bytes(&buf) <= super::PAGE_SIZE {
-                self.buf = Some(buf);
-                return Ok((self.build_single(), None));
+            if get_num_bytes(&self.buf) <= super::PAGE_SIZE {
+                return Ok(LeafEffect::Intact(self.build_single()))
             }
-            self.buf = Some(buf);
             let (left, right) = self.build_split()?;
-            Ok((left, Some(right)))
+            Ok(LeafEffect::Split { left: left, right: right })
         }
 
         /// Builds two splits of a leaf.
-        fn build_split(mut self) -> Result<(Leaf, Leaf)> {
-            let buf = self.buf.take().unwrap();
+        fn build_split(self) -> Result<(Leaf, Leaf)> {
             let num_keys = self.num_keys as usize;
             let mut left_end: usize = 0;
             for i in 0..num_keys {
                 // include i?
-                let offset = get_offset(&buf, i + 1);
+                let offset = get_offset(&self.buf, i + 1);
                 if 4 + (i + 1) * 2 + offset <= super::PAGE_SIZE {
                     left_end = i + 1;
                 }
@@ -215,21 +185,20 @@ mod util {
 
             let mut lb = Self::new(left_end);
             for i in 0..left_end {
-                lb = lb.add_key_value(get_key(&buf, i), get_value(&buf, i))?;
+                lb = lb.add_key_value(get_key(&self.buf, i), get_value(&self.buf, i))?;
             }
             let mut rb = Self::new(num_keys - left_end);
             for i in left_end..num_keys {
-                rb = rb.add_key_value(get_key(&buf, i), get_value(&buf, i))?;
+                rb = rb.add_key_value(get_key(&self.buf, i), get_value(&self.buf, i))?;
             }
             Ok((lb.build_single(), rb.build_single()))
         }
 
         /// Builds a leaf.
-        fn build_single(mut self) -> Leaf {
-            let buf = self.buf.take().unwrap();
-            assert!(get_num_bytes(&buf) <= super::PAGE_SIZE);
+        fn build_single(self) -> Leaf {
+            assert!(get_num_bytes(&self.buf) <= super::PAGE_SIZE);
             Leaf {
-                buf: buf[0..super::PAGE_SIZE].into(),
+                buf: self.buf[0..super::PAGE_SIZE].into(),
             }
         }
     }
@@ -251,7 +220,7 @@ impl Default for Leaf {
 
 impl Leaf {
     /// Inserts a key-value pair.
-    pub fn insert(&self, key: &[u8], val: &[u8]) -> Result<Upsert> {
+    pub fn insert(&self, key: &[u8], val: &[u8]) -> Result<LeafEffect> {
         if self.find(key).is_some() {
             return Err(NodeError::AlreadyExists);
         }
@@ -267,11 +236,11 @@ impl Leaf {
         if !added {
             b = b.add_key_value(key, val)?;
         }
-        b.build_upsert()
+        b.build()
     }
 
     /// Updates the value corresponding to a key.
-    pub fn update(&self, key: &[u8], val: &[u8]) -> Result<Upsert> {
+    pub fn update(&self, key: &[u8], val: &[u8]) -> Result<LeafEffect> {
         if self.find(key).is_none() {
             return Err(NodeError::KeyNotFound);
         }
@@ -285,11 +254,11 @@ impl Leaf {
             }
             b = b.add_key_value(k, v)?;
         }
-        b.build_upsert()
+        b.build()
     }
 
     /// Deletes a key and its corresponding value.
-    pub fn delete(&self, key: &[u8]) -> Result<Deletion> {
+    pub fn delete(&self, key: &[u8]) -> Result<LeafEffect> {
         if self.find(key).is_none() {
             return Err(NodeError::KeyNotFound);
         }
@@ -297,7 +266,7 @@ impl Leaf {
         // just return Deletion::Empty if only 1 key.
         let n = self.get_num_keys();
         if n == 1 {
-            return Ok(Deletion::Empty);
+            return Ok(LeafEffect::Empty);
         }
         let mut b = LeafBuilder::new(n - 1).allow_overflow();
         let mut added = false;
@@ -308,7 +277,7 @@ impl Leaf {
             }
             b = b.add_key_value(k, v)?;
         }
-        b.build_deletion()
+        b.build()
     }
 
     /// Finds the value corresponding to the queried key.
@@ -316,7 +285,7 @@ impl Leaf {
         self.iter().find(|(k, _)| *k == key).map(|(_, v)| v)
     }
 
-    pub fn steal_or_merge(left: &Leaf, right: &Leaf) -> Result<Deletion> {
+    pub fn steal_or_merge(left: &Leaf, right: &Leaf) -> Result<LeafEffect> {
         let mut b = LeafBuilder::new(left.get_num_keys() + right.get_num_keys()).allow_overflow();
         for (key, val) in left.iter() {
             b = b.add_key_value(key, val)?;
@@ -324,7 +293,7 @@ impl Leaf {
         for (key, val) in right.iter() {
             b = b.add_key_value(key, val)?;
         }
-        b.build_deletion()
+        b.build()
     }
 
     pub fn get_key(&self, i: usize) -> &[u8] {
@@ -372,21 +341,13 @@ impl<'a> Iterator for LeafIterator<'a> {
 mod tests {
     use super::*;
 
-    fn test_upsert_intact(u: Upsert, f: impl FnOnce(Leaf)) {
-        match u {
-            Upsert::Intact(Node::Leaf(leaf)) => { f(leaf) },
-            _ => { panic!("{u:?} is not an Upsert::Intact(Node::Leaf(_))") }
-        }
-    }
-
     #[test]
     fn leaf_insert_intact() {
-        let u = Leaf::default()
+        let leaf = Leaf::default()
             .insert("hello".as_bytes(), "world".as_bytes())
-            .unwrap();
-        test_upsert_intact(u, |leaf| {
-            assert_eq!(leaf.find("hello".as_bytes()).unwrap(), "world".as_bytes());
-        })
+            .unwrap()
+            .take_intact();
+        assert_eq!(leaf.find("hello".as_bytes()).unwrap(), "world".as_bytes());
     }
 
     #[test]

@@ -24,37 +24,40 @@ mod page_store;
 
 pub use error::TreeError;
 use std::rc::Rc;
-use node::{ChildEntry, Internal, Leaf, Node};
+use node::{ChildEntry, Internal, Leaf, Node, NodeEffect, Sufficiency};
 use page_store::Store;
 
 type Result<T> = std::result::Result<T, TreeError>;
 
-/// An enum representing the node(s) created during an insert or update
-/// (aka an "upsert") operation on a tree.
-enum Upsert<S: Store> {
-    /// A newly created tree that remained  "intact", i.e. it did not split
-    /// after an upsert.
+/// An enum representing the effect of a tree operation.
+enum TreeEffect<S: Store> {
+    /// A tree with 0 keys after a delete was performed on it.
+    /// This is a special-case of `Underflow` done to avoid unnecessary
+    /// page allocations, since empty non-root nodes aren't allowed.
+    Empty,
+    /// A newly created tree that remained  "intact", i.e. it did not split.
     Intact(Tree<S>),
-    /// The left and right splits of a tree that was created after an upsert.
+    /// The left and right splits of a tree that was created.
     ///
-    /// The left and right nodes are the same type.
+    /// The left and right trees are the same type.
     Split { left: Tree<S>, right: Tree<S> },
 }
 
-impl<S: Store> Upsert<S> {
-    /// Converts the in-memory nodes (created during an upsert) into child
-    /// entries of an B+ tree internal node.
+impl<S: Store> TreeEffect<S> {
+    /// Converts the tree(s) created during an operation into child
+    /// entries of a B+ tree internal node.
     ///
-    /// `i` is the index of the node that the upsert was performed on.
+    /// `i` is the index in the internal that the operation was performed on.
     fn child_entries(self, i: usize) -> Rc<[ChildEntry]> {
         match self {
-            Upsert::Intact(tree) => [ChildEntry::Update {
+            TreeEffect::Empty => Rc::new([]),
+            TreeEffect::Intact(tree) => [ChildEntry::Update {
                 i,
                 key: tree.root.get_key(0).into(),
                 page_num: tree.page_num,
             }]
             .into(),
-            Upsert::Split { left, right } => [
+            TreeEffect::Split { left, right } => [
                 ChildEntry::Update {
                     i,
                     key: left.root.get_key(0).into(),
@@ -68,31 +71,6 @@ impl<S: Store> Upsert<S> {
             .into(),
         }
     }
-}
-
-/// An enum representing the tree(s), if any, created or destroyed during a
-/// deletion operation on a tree.
-pub enum Deletion<S: Store> {
-    /// A node without 0 keys after a delete was performed on it.
-    /// This is a special-case of `Underflow` done to avoid unnecessary
-    /// page allocations, since empty non-root nodes aren't allowed.
-    Empty,
-    /// A node that is sufficiently sized (i.e. has at least 2 keys) even after
-    /// a delete was performed on it.
-    Sufficient(Tree<S>),
-    /// A node that was split due to a delete operation. This can happen
-    /// because the node had to delete a key and replace it with another key
-    /// that was larger, pushing it beyond the page size,
-    /// thus triggering a split.
-    ///
-    /// Yes, this means the tree can grow in height despite
-    /// the deletion operation.
-    ///
-    /// The left and right nodes are the same type.
-    Split { left: Tree<S>, right: Tree<S> },
-    /// A node that is NOT sufficiently sized but is not empty
-    /// (i.e. has 1 key).
-    Underflow(Tree<S>),
 }
 
 /// A copy-on-write (COW) B+ Tree data structure that stores data in disk.
@@ -139,8 +117,9 @@ impl<S: Store> Tree<S> {
     /// Inserts a key-value pair.
     pub fn insert(&self, key: &[u8], val: &[u8]) -> Result<Self> {
         match self.insert_helper(key, val)? {
-            Upsert::Intact(tree) => Ok(tree),
-            Upsert::Split { left, right } => self.parent_of_split(left, right),
+            TreeEffect::Intact(tree) => Ok(tree),
+            TreeEffect::Split { left, right } => self.parent_of_split(left, right),
+            _ => unreachable!()
         }
     }
 
@@ -148,10 +127,10 @@ impl<S: Store> Tree<S> {
     /// the resulting tree.
     ///
     /// This is a recursive implementation of `insert`.
-    fn insert_helper(&self, key: &[u8], val: &[u8]) -> Result<Upsert<S>> {
+    fn insert_helper(&self, key: &[u8], val: &[u8]) -> Result<TreeEffect<S>> {
         match &self.root {
             // Base case
-            Node::Leaf(leaf) => Ok(self.alloc_upsert(leaf.insert(key, val)?)?),
+            Node::Leaf(leaf) => Ok(self.alloc(leaf.insert(key, val)?.into())?),
             // Recursive case
             Node::Internal(internal) => {
                 // Find which child to recursively insert into.
@@ -165,10 +144,9 @@ impl<S: Store> Tree<S> {
                     page_num: child_num,
                     store: self.store.clone(),
                 };
-                let u = child.insert_helper(key, val)?;
-                let child_entries = u.child_entries(child_idx);
-                let u = node::Upsert::from(internal.merge_as_upsert(child_entries.as_ref())?);
-                Ok(self.alloc_upsert(u)?)
+                let child_entries = child.insert_helper(key, val)?.child_entries(child_idx);
+                let effect = internal.merge_child_entries(child_entries.as_ref())?;
+                Ok(self.alloc(effect.into())?)
             }
         }
     }
@@ -176,8 +154,9 @@ impl<S: Store> Tree<S> {
     /// Updates the value corresponding to a key.
     pub fn update(&self, key: &[u8], val: &[u8]) -> Result<Self> {
         match self.update_helper(key, val)? {
-            Upsert::Intact(tree) => Ok(tree),
-            Upsert::Split { left, right } => self.parent_of_split(left, right),
+            TreeEffect::Intact(tree) => Ok(tree),
+            TreeEffect::Split { left, right } => self.parent_of_split(left, right),
+            _ => unreachable!()
         }
     }
 
@@ -185,10 +164,10 @@ impl<S: Store> Tree<S> {
     /// the resulting tree.
     ///
     /// This is a recursive implementation of `update`.
-    fn update_helper(&self, key: &[u8], val: &[u8]) -> Result<Upsert<S>> {
+    fn update_helper(&self, key: &[u8], val: &[u8]) -> Result<TreeEffect<S>> {
         match &self.root {
             // Base case
-            Node::Leaf(leaf) => Ok(self.alloc_upsert(leaf.update(key, val)?)?),
+            Node::Leaf(leaf) => self.alloc(leaf.update(key, val)?.into()),
             // Recursive case
             Node::Internal(internal) => {
                 // Find which child to recursively update at.
@@ -202,10 +181,9 @@ impl<S: Store> Tree<S> {
                     page_num: child_num,
                     store: self.store.clone(),
                 };
-                let u = child.update_helper(key, val)?;
-                let child_entries = u.child_entries(child_idx);
-                let u = node::Upsert::from(internal.merge_as_upsert(child_entries.as_ref())?);
-                Ok(self.alloc_upsert(u)?)
+                let child_entries = child.update_helper(key, val)?.child_entries(child_idx);
+                let effect = internal.merge_child_entries(child_entries.as_ref())?;
+                self.alloc(effect.into())
             }
         }
     }
@@ -213,7 +191,7 @@ impl<S: Store> Tree<S> {
     /// Deletes a key and its corresponding value.
     pub fn delete(&self, key: &[u8]) -> Result<Self> {
         match self.delete_helper(key)? {
-            Deletion::Empty => {
+            TreeEffect::Empty => {
                 let root = Node::Leaf(Leaf::default());
                 let page_num = self.store.write_page(&root)?;
                 Ok(Self {
@@ -222,9 +200,8 @@ impl<S: Store> Tree<S> {
                     store: self.store.clone(),
                 })
             }
-            Deletion::Split { left, right } => self.parent_of_split(left, right),
-            Deletion::Sufficient(tree) => Ok(tree),
-            Deletion::Underflow(tree) => Ok(tree),
+            TreeEffect::Intact(tree) => Ok(tree),
+            TreeEffect::Split { left, right } => self.parent_of_split(left, right)
         }
     }
 
@@ -232,10 +209,10 @@ impl<S: Store> Tree<S> {
     /// the resulting tree.
     ///
     /// This is a recursive implementation of `delete`.
-    fn delete_helper(&self, key: &[u8]) -> Result<Deletion<S>> {
+    fn delete_helper(&self, key: &[u8]) -> Result<TreeEffect<S>> {
         match &self.root {
             // Base case
-            Node::Leaf(leaf) => Ok(self.alloc_deletion(leaf.delete(key)?)?),
+            Node::Leaf(leaf) => self.alloc(leaf.delete(key)?.into()),
             // Recursive case
             Node::Internal(parent) => {
                 // Find which child to recursively delete from.
@@ -250,36 +227,38 @@ impl<S: Store> Tree<S> {
                     store: self.store.clone(),
                 };
                 match child.delete_helper(key)? {
-                    Deletion::Empty => {
-                        let d = parent.merge_as_deletion(&[ChildEntry::Delete { i: child_idx }])?;
-                        Ok(self.alloc_deletion(d)?)
-                    }
-                    Deletion::Sufficient(child) => {
-                        let d = parent.merge_as_deletion(&[ChildEntry::Update {
-                            i: child_idx,
-                            key: child.root.get_key(0).into(),
-                            page_num: child.page_num,
-                        }])?;
-                        Ok(self.alloc_deletion(d)?)
-                    }
-                    Deletion::Split {
-                        left: left_child,
-                        right: right_child,
-                    } => {
-                        let d = parent.merge_as_deletion(&[
+                    TreeEffect::Empty => {
+                        let effect = parent.merge_child_entries(&[ChildEntry::Delete { i: child_idx }])?;
+                        self.alloc(effect.into())
+                    },
+                    TreeEffect::Intact(child) => {
+                        match node::sufficiency(&child.root) {
+                            Sufficiency::Empty => unreachable!(),
+                            Sufficiency::Underflow => self.try_fix_underflow(parent, child, child_idx),
+                            Sufficiency::Sufficient => {
+                                let effect = parent.merge_child_entries(&[ChildEntry::Update {
+                                    i: child_idx,
+                                    key: child.root.get_key(0).into(),
+                                    page_num: child.page_num,
+                                }])?;
+                                self.alloc(effect.into())
+                            },
+                        }
+                    },
+                    TreeEffect::Split { left, right } => {
+                        let effect = parent.merge_child_entries(&[
                             ChildEntry::Update {
                                 i: child_idx,
-                                key: left_child.root.get_key(0).into(),
-                                page_num: left_child.page_num,
+                                key: left.root.get_key(0).into(),
+                                page_num: left.page_num,
                             },
                             ChildEntry::Insert {
-                                key: right_child.root.get_key(0).into(),
-                                page_num: right_child.page_num,
+                                key: right.root.get_key(0).into(),
+                                page_num: right.page_num,
                             },
                         ])?;
-                        Ok(self.alloc_deletion(d)?)
+                        self.alloc(effect.into())
                     }
-                    Deletion::Underflow(child) => self.try_fix_underflow(parent, child, child_idx),
                 }
             }
         }
@@ -296,7 +275,7 @@ impl<S: Store> Tree<S> {
         parent: &Internal,
         child: Self,
         child_idx: usize,
-    ) -> Result<Deletion<S>> {
+    ) -> Result<TreeEffect<S>> {
         // Try stealing or merging the left sibling.
         if child_idx > 0 {
             return self.steal_or_merge(parent, &child.root, child_idx, child_idx - 1);
@@ -316,12 +295,12 @@ impl<S: Store> Tree<S> {
         // with 3 keys, which will not exceed the page size.
         // Leaf nodes, OTOH, can remain underflow due to variable-length
         // keys and values.
-        let d = parent.merge_as_deletion(&[ChildEntry::Update {
+        let effect = parent.merge_child_entries(&[ChildEntry::Update {
             i: child_idx,
             key: child.root.get_key(0).into(),
             page_num: child.page_num,
         }])?;
-        self.alloc_deletion(d)
+        self.alloc(effect.into())
     }
 
     /// Tries to fix the underflow of `child` by stealing from or merging from
@@ -332,7 +311,7 @@ impl<S: Store> Tree<S> {
         child: &Node,
         child_idx: usize,
         sibling_idx: usize,
-    ) -> Result<Deletion<S>> {
+    ) -> Result<TreeEffect<S>> {
         let sibling_num = parent.get_child_pointer(sibling_idx);
         let sibling = self.store.read_page(sibling_num)?;
         let mut left = &sibling;
@@ -340,7 +319,7 @@ impl<S: Store> Tree<S> {
         if sibling_idx > child_idx {
             (left, right) = (right, left);
         }
-        self.alloc_deletion(node::steal_or_merge(left, right)?)
+        self.alloc(node::steal_or_merge(left, right)?)
     }
 
     /// Returns a new internal root node whose children are split nodes
@@ -359,17 +338,14 @@ impl<S: Store> Tree<S> {
     }
 
     /// Allocates pages for the in-memory nodes created during an upsert.
-    fn alloc_upsert(&self, u: node::Upsert) -> Result<Upsert<S>> {
-        match u {
-            node::Upsert::Intact(root) => {
+    fn alloc(&self, effect: NodeEffect) -> Result<TreeEffect<S>> {
+        match effect {
+            NodeEffect::Empty => Ok(TreeEffect::Empty),
+            NodeEffect::Intact(root) => {
                 let page_num = self.store.write_page(&root)?;
-                Ok(Upsert::Intact(Self {
-                    root,
-                    page_num,
-                    store: self.store.clone(),
-                }))
-            }
-            node::Upsert::Split { left, right } => {
+                Ok(TreeEffect::Intact(Self{root, page_num, store: self.store.clone() }))
+            },
+            NodeEffect::Split { left, right } => {
                 let left_page_num = self.store.write_page(&left)?;
                 let right_page_num = self.store.write_page(&right)?;
                 let left = Self {
@@ -382,46 +358,8 @@ impl<S: Store> Tree<S> {
                     page_num: right_page_num,
                     store: self.store.clone(),
                 };
-                Ok(Upsert::Split { left, right })
-            }
-        }
-    }
-
-    /// Allocates pages for the in-memory nodes created during a deletion.
-    fn alloc_deletion(&self, d: node::Deletion) -> Result<Deletion<S>> {
-        match d {
-            node::Deletion::Empty => Ok(Deletion::Empty),
-            node::Deletion::Sufficient(root) => {
-                let page_num = self.store.write_page(&root)?;
-                Ok(Deletion::Sufficient(Self {
-                    root,
-                    page_num,
-                    store: self.store.clone(),
-                }))
-            }
-            node::Deletion::Split { left, right } => {
-                let left_page_num = self.store.write_page(&left)?;
-                let right_page_num = self.store.write_page(&right)?;
-                let left = Self {
-                    root: left,
-                    page_num: left_page_num,
-                    store: self.store.clone(),
-                };
-                let right = Self {
-                    root: right,
-                    page_num: right_page_num,
-                    store: self.store.clone(),
-                };
-                Ok(Deletion::Split { left, right })
-            }
-            node::Deletion::Underflow(root) => {
-                let page_num = self.store.write_page(&root)?;
-                Ok(Deletion::Underflow(Self {
-                    root,
-                    page_num,
-                    store: self.store.clone(),
-                }))
-            }
+                Ok(TreeEffect::Split { left, right })
+            },
         }
     }
 }

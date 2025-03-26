@@ -2,11 +2,41 @@ use super::*;
 
 pub use util::{ChildEntry, InternalBuilder};
 
+/// An enum representing the effect of an internal node operation.
+#[derive(Debug)]
+pub enum InternalEffect {
+    /// An internal node with 0 keys after a delete was performed on it.
+    /// This is a special-case of `Underflow` done to avoid unnecessary
+    /// page allocations, since empty non-root nodes aren't allowed.
+    Empty,
+    /// A newly created internal node that remained  "intact",
+    /// i.e. it did not split.
+    Intact(Internal),
+    /// The left and right splits of an internal node that was created.
+    Split { left: Internal, right: Internal },
+}
+
+impl InternalEffect {
+    fn take_intact(self) -> Internal {
+        match self {
+            InternalEffect::Intact(internal) => internal,
+            _ => panic!("{self:?} is not InternalEffect::Intact")
+        }
+    }
+
+    fn take_split(self) -> (Internal, Internal) {
+        match self {
+            InternalEffect::Split { left, right } => (left, right),
+            _ => panic!("{self:?} is not InternalEffect::Split")
+        }
+    }
+}
+
 /// Internal node utilities.
 mod util {
     use std::rc::Rc;
 
-    use super::{Deletion, Internal, Node, NodeError, NodeType, Result, Upsert};
+    use super::{Internal, InternalEffect, NodeError, NodeType, Result};
 
     /// A child entry to insert, update, or delete in an internal node.
     pub enum ChildEntry {
@@ -84,7 +114,7 @@ mod util {
     pub struct InternalBuilder {
         num_keys: usize,
         i: usize,
-        buf: Option<Box<[u8]>>,
+        buf: Box<[u8]>,
     }
 
     impl InternalBuilder {
@@ -94,17 +124,17 @@ mod util {
             Self {
                 num_keys,
                 i: 0,
-                buf: None,
+                buf: Box::new([]),
             }
         }
 
         /// Allows the builder to overflow to two pages.
         pub fn allow_overflow(mut self) -> Self {
             assert!(
-                self.buf.is_none(),
+                self.buf.len() == 0,
                 "allow_overflow() must be called only once and before add_child_entry()"
             );
-            self.buf = Some([0; 2 * super::PAGE_SIZE - 4].into());
+            self.buf = Box::new([0; 2 * super::PAGE_SIZE - 4]);
             self
         }
 
@@ -121,128 +151,63 @@ mod util {
             }
 
             // Make sure buffer is initialized.
-            if self.buf.is_none() {
-                self.buf = Some(Self::new_buffer());
+            if self.buf.len() == 0 {
+                self.buf = Box::new([0; super::PAGE_SIZE]);
+                super::set_page_header(&mut self.buf, NodeType::Internal);
             }
-            let mut buf = self.buf.take().unwrap();
 
             let n = self.num_keys;
-            let offset = set_next_offset(&mut buf, self.i, n, key);
-            set_child_pointer(&mut buf, self.i, page_num);
+            let offset = set_next_offset(&mut self.buf, self.i, n, key);
+            set_child_pointer(&mut self.buf, self.i, page_num);
             let simulated_bytes = 4 + self.i * 10 + offset;
             assert!(
-                simulated_bytes + key.len() <= buf.len(),
+                simulated_bytes + key.len() <= self.buf.len(),
                 "builder unexpectedly overflowed; please call allow_overflow(), or don't add too many key-value pairs.");
 
             let pos = 4 + n * 10 + offset;
-            buf[pos..pos + key.len()].copy_from_slice(key);
+            self.buf[pos..pos + key.len()].copy_from_slice(key);
 
             self.i += 1;
-            super::set_num_keys(&mut buf, self.i);
-            self.buf = Some(buf);
+            super::set_num_keys(&mut self.buf, self.i);
             Ok(self)
         }
 
-        /// Builds an Upsert.
-        pub fn build_upsert(self) -> Result<Upsert> {
+        /// Builds an internal node and optionally splits it if overflowed.
+        pub fn build(self) -> Result<InternalEffect> {
             assert!(
                 self.i == self.num_keys,
-                "build_upsert() called after calling add_child_entry() {} times < num_keys = {}",
+                "build() called after calling add_child_entry() {} times < num_keys = {}",
                 self.i,
                 self.num_keys
             );
-            Ok(Self::new_upsert(self.build_single_or_split()?))
-        }
-
-        /// Builds a Deletion.
-        pub fn build_deletion(self) -> Result<Deletion> {
-            assert!(
-                self.i == self.num_keys,
-                "build_deletion() called after calling add_child_entry() {} times < num_keys = {}",
-                self.i,
-                self.num_keys
-            );
-            Ok(Self::new_deletion(self.build_single_or_split()?))
+            if get_num_bytes(&self.buf) <= super::PAGE_SIZE {
+                return Ok(InternalEffect::Intact(self.build_single()))
+            }
+            let (left, right) = self.build_split()?;
+            Ok(InternalEffect::Split { left, right })
         }
 
         /// Builds an internal node.
-        pub fn build_single(mut self) -> Internal {
+        fn build_single(self) -> Internal {
             assert!(
                 self.i == self.num_keys,
                 "build_single() called after calling add_child_entry() {} times < num_keys = {}",
                 self.i,
                 self.num_keys
             );
-            let buf = self.buf.take().unwrap();
-            assert!(get_num_bytes(&buf) <= super::PAGE_SIZE);
+            assert!(get_num_bytes(&self.buf) <= super::PAGE_SIZE);
             Internal {
-                buf: buf[0..super::PAGE_SIZE].into(),
-            }
-        }
-
-        /// Builds one internal node, or two due to splitting.
-        pub fn build_single_or_split(mut self) -> Result<(Internal, Option<Internal>)> {
-            assert!(
-                self.i == self.num_keys,
-                "build_single_or_split() called after calling add_child_entry() {} times < num_keys = {}",
-                self.i,
-                self.num_keys
-            );
-            let buf = self.buf.take().unwrap();
-            if get_num_bytes(&buf) <= super::PAGE_SIZE {
-                self.buf = Some(buf);
-                return Ok((self.build_single(), None));
-            }
-            self.buf = Some(buf);
-            let (left, right) = self.build_split()?;
-            Ok((left, Some(right)))
-        }
-
-        fn new_buffer() -> Box<[u8]> {
-            let mut buf = [0; super::PAGE_SIZE];
-            super::set_page_header(&mut buf, NodeType::Internal);
-            buf.into()
-        }
-
-        /// Creates a new Upsert from at least 1 internal node.
-        fn new_upsert(build_result: (Internal, Option<Internal>)) -> Upsert {
-            match build_result {
-                (left, Some(right)) => Upsert::Split {
-                    left: Node::Internal(left),
-                    right: Node::Internal(right),
-                },
-                (internal, None) => Upsert::Intact(Node::Internal(internal)),
-            }
-        }
-
-        /// Creates a new Deletion from at least 1 leaf.
-        fn new_deletion(build_result: (Internal, Option<Internal>)) -> Deletion {
-            match build_result {
-                (left, Some(right)) => Deletion::Split {
-                    left: Node::Internal(left),
-                    right: Node::Internal(right),
-                },
-                (internal, None) => {
-                    let n = super::get_num_keys(&internal.buf);
-                    if n == 0 {
-                        Deletion::Empty
-                    } else if n == 1 {
-                        Deletion::Underflow(Node::Internal(internal))
-                    } else {
-                        Deletion::Sufficient(Node::Internal(internal))
-                    }
-                }
+                buf: self.buf[0..super::PAGE_SIZE].into(),
             }
         }
 
         /// Builds two splits of an internal node.
-        fn build_split(mut self) -> Result<(Internal, Internal)> {
-            let buf = self.buf.take().unwrap();
+        fn build_split(self) -> Result<(Internal, Internal)> {
             let num_keys = self.num_keys as usize;
             let mut left_end: usize = 0;
             for i in 0..num_keys {
                 // include i?
-                let offset = get_offset(&buf, i + 1);
+                let offset = get_offset(&self.buf, i + 1);
                 if 4 + (i + 1) * 2 + offset <= super::PAGE_SIZE {
                     left_end = i + 1;
                 }
@@ -250,11 +215,11 @@ mod util {
 
             let mut lb = Self::new(left_end);
             for i in 0..left_end {
-                lb = lb.add_child_entry(get_key(&buf, i), get_child_pointer(&buf, i))?;
+                lb = lb.add_child_entry(get_key(&self.buf, i), get_child_pointer(&self.buf, i))?;
             }
             let mut rb = Self::new(num_keys - left_end);
             for i in left_end..num_keys {
-                rb = rb.add_child_entry(get_key(&buf, i), get_child_pointer(&buf, i))?;
+                rb = rb.add_child_entry(get_key(&self.buf, i), get_child_pointer(&self.buf, i))?;
             }
             Ok((lb.build_single(), rb.build_single()))
         }
@@ -273,67 +238,13 @@ impl Internal {
         let parent = InternalBuilder::new(2)
             .add_child_entry(keys[0], child_pointers[0])?
             .add_child_entry(keys[1], child_pointers[1])?
-            .build_single();
+            .build()?
+            .take_intact();
         Ok(parent)
     }
 
-    /// Inserts or updates child entries.
-    pub fn merge_as_upsert(&self, entries: &[ChildEntry]) -> Result<Upsert> {
-        let b = self.merge_child_entries(entries)?;
-        b.build_upsert()
-    }
-
-    /// Updates or deletes child entries.
-    pub fn merge_as_deletion(&self, entries: &[ChildEntry]) -> Result<Deletion> {
-        let b = self.merge_child_entries(entries)?;
-        b.build_deletion()
-    }
-
-    /// Finds the index of the child that contains the key.
-    pub fn find(&self, key: &[u8]) -> Option<usize> {
-        (self.get_num_keys() - 1..=0).find(|i| self.get_key(*i) <= key)
-    }
-
-    /// Gets the child pointer at an index.
-    pub fn get_child_pointer(&self, i: usize) -> u64 {
-        util::get_child_pointer(&self.buf, i)
-    }
-
-    /// Gets the number of keys.
-    pub fn get_num_keys(&self) -> usize {
-        get_num_keys(&self.buf)
-    }
-
-    /// Gets the `i`th key in the internal buffer.
-    pub fn get_key(&self, i: usize) -> &[u8] {
-        util::get_key(&self.buf, i)
-    }
-
-    pub fn steal_or_merge(left: &Internal, right: &Internal) -> Result<Deletion> {
-        let mut b =
-            InternalBuilder::new(left.get_num_keys() + right.get_num_keys()).allow_overflow();
-        for (key, page_num) in left.iter() {
-            b = b.add_child_entry(key, page_num)?;
-        }
-        for (key, page_num) in right.iter() {
-            b = b.add_child_entry(key, page_num)?;
-        }
-        b.build_deletion()
-    }
-
-    /// Creates an key-value iterator for the internal node.
-    pub fn iter<'a>(&'a self) -> InternalIterator<'a> {
-        InternalIterator {
-            node: self,
-            i: 0,
-            n: self.get_num_keys(),
-        }
-    }
-
     /// Merges child entries into the internal node.
-    /// Returns a builder so the user can decide on building
-    /// an `Upsert` or a `Deletion`.
-    fn merge_child_entries(&self, entries: &[ChildEntry]) -> Result<InternalBuilder> {
+    pub fn merge_child_entries(&self, entries: &[ChildEntry]) -> Result<InternalEffect> {
         let extra = entries
             .iter()
             .filter(|ce| {
@@ -384,7 +295,48 @@ impl Internal {
         if let Some(ChildEntry::Insert { key, page_num }) = next {
             b = b.add_child_entry(key, *page_num)?;
         }
-        Ok(b)
+        b.build()
+    }
+
+    pub fn steal_or_merge(left: &Internal, right: &Internal) -> Result<InternalEffect> {
+        let mut b =
+            InternalBuilder::new(left.get_num_keys() + right.get_num_keys()).allow_overflow();
+        for (key, page_num) in left.iter() {
+            b = b.add_child_entry(key, page_num)?;
+        }
+        for (key, page_num) in right.iter() {
+            b = b.add_child_entry(key, page_num)?;
+        }
+        b.build()
+    }
+
+    /// Finds the index of the child that contains the key.
+    pub fn find(&self, key: &[u8]) -> Option<usize> {
+        (self.get_num_keys() - 1..=0).find(|i| self.get_key(*i) <= key)
+    }
+
+    /// Gets the child pointer at an index.
+    pub fn get_child_pointer(&self, i: usize) -> u64 {
+        util::get_child_pointer(&self.buf, i)
+    }
+
+    /// Gets the number of keys.
+    pub fn get_num_keys(&self) -> usize {
+        get_num_keys(&self.buf)
+    }
+
+    /// Gets the `i`th key in the internal buffer.
+    pub fn get_key(&self, i: usize) -> &[u8] {
+        util::get_key(&self.buf, i)
+    }
+
+    /// Creates an key-value iterator for the internal node.
+    pub fn iter<'a>(&'a self) -> InternalIterator<'a> {
+        InternalIterator {
+            node: self,
+            i: 0,
+            n: self.get_num_keys(),
+        }
     }
 }
 

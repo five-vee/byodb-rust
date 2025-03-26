@@ -97,8 +97,10 @@ mod leaf;
 mod internal;
 
 pub use internal::ChildEntry;
-pub use leaf::Leaf;
 pub use internal::Internal;
+pub use leaf::Leaf;
+use internal::InternalEffect;
+use leaf::LeafEffect;
 use super::error::NodeError;
 
 type Result<T> = std::result::Result<T, NodeError>;
@@ -174,52 +176,72 @@ impl Node {
     }
 }
 
-/// An enum representing the node(s) created during an insert or update
-/// (aka an "upsert") operation on a tree.
+/// An enum representing the effect of a node operation.
 #[derive(Debug)]
-pub enum Upsert {
-    /// A newly created node that remained  "intact", i.e. it did not split
-    /// after an upsert.
+pub enum NodeEffect {
+    /// A node without 0 keys after a delete was performed on it.
+    /// This is a special-case of `Underflow` done to avoid unnecessary
+    /// page allocations, since empty non-root nodes aren't allowed.
+    Empty,
+    /// A newly created node that remained  "intact", i.e. it did not split.
     Intact(Node),
-    /// The left and right splits of a node that was created after an upsert.
+    /// The left and right splits of a node that was created.
     ///
     /// The left and right nodes are the same type.
     Split { left: Node, right: Node },
 }
 
-/// An enum representing the node(s), if any, created or destroyed during a
-/// deletion operation on a tree.
-#[derive(Debug)]
-pub enum Deletion {
+impl From<LeafEffect> for NodeEffect {
+    fn from(value: LeafEffect) -> Self {
+        match value {
+            LeafEffect::Empty => NodeEffect::Empty,
+            LeafEffect::Intact(leaf) => NodeEffect::Intact(Node::Leaf(leaf)),
+            LeafEffect::Split{left, right} => NodeEffect::Split { left: Node::Leaf(left), right: Node::Leaf(right) }
+        }
+    }
+}
+
+impl From<InternalEffect> for NodeEffect {
+    fn from(value: InternalEffect) -> Self {
+        match value {
+            InternalEffect::Empty => NodeEffect::Empty,
+            InternalEffect::Intact(internal) => NodeEffect::Intact(Node::Internal(internal)),
+            InternalEffect::Split{left, right} => NodeEffect::Split { left: Node::Internal(left), right: Node::Internal(right) }
+        }
+    }
+}
+
+/// An enum representing the sufficiency of a node created or destroyed during a
+/// deletion operation on a node.
+pub enum Sufficiency {
     /// A node without 0 keys after a delete was performed on it.
     /// This is a special-case of `Underflow` done to avoid unnecessary
     /// page allocations, since empty non-root nodes aren't allowed.
     Empty,
-    /// A node that is sufficiently sized (i.e. has at least 2 keys) even after
-    /// a delete was performed on it.
-    Sufficient(Node),
-    /// A node that was split due to a delete operation. This can happen
-    /// because the node had to delete a key and replace it with another key
-    /// that was larger, pushing it beyond the page size,
-    /// thus triggering a split.
-    ///
-    /// Yes, this means the tree can grow in height despite
-    /// the deletion operation.
-    ///
-    /// The left and right nodes are the same type.
-    Split { left: Node, right: Node },
     /// A node that is NOT sufficiently sized but is not empty
     /// (i.e. has 1 key).
-    Underflow(Node),
+    Underflow,
+    /// A node that is sufficiently sized (i.e. has at least 2 keys) even after
+    /// a delete was performed on it.
+    Sufficient,
+}
+
+// Returns how sufficient a node is.
+pub fn sufficiency(n: &Node) -> Sufficiency {
+    match n.get_num_keys() {
+        0 => Sufficiency::Empty,
+        1 => Sufficiency::Underflow,
+        _ => Sufficiency::Sufficient
+    }
 }
 
 /// Merges `left` and `right` into a possibly-overflowed node and splits if
 /// needed. This is modeled as a Deletion b/c it is (so far) only useful in the
 /// context of deletion.
-pub fn steal_or_merge(left: &Node, right: &Node) -> Result<Deletion> {
+pub fn steal_or_merge(left: &Node, right: &Node) -> Result<NodeEffect> {
     match (left, right) {
-        (Node::Leaf(left), Node::Leaf(right)) => Leaf::steal_or_merge(left, right),
-        (Node::Internal(left), Node::Internal(right)) => Internal::steal_or_merge(left, right),
+        (Node::Leaf(left), Node::Leaf(right)) => Ok(Leaf::steal_or_merge(left, right)?.into()),
+        (Node::Internal(left), Node::Internal(right)) => Ok(Internal::steal_or_merge(left, right)?.into()),
         _ => unreachable!("It is assumed that both are the same node type."),
     }
 }
