@@ -20,30 +20,32 @@
 
 mod error;
 mod node;
+mod buffer_store;
 mod page_store;
 
+use buffer_store::BufferStore;
 pub use error::TreeError;
 use std::rc::Rc;
 use node::{ChildEntry, Internal, Leaf, Node, NodeEffect, Sufficiency};
-use page_store::Store;
+use page_store::PageStore;
 
 type Result<T> = std::result::Result<T, TreeError>;
 
 /// An enum representing the effect of a tree operation.
-enum TreeEffect<S: Store> {
+enum TreeEffect<B: BufferStore, P: PageStore> {
     /// A tree with 0 keys after a delete was performed on it.
     /// This is a special-case of `Underflow` done to avoid unnecessary
     /// page allocations, since empty non-root nodes aren't allowed.
     Empty,
     /// A newly created tree that remained  "intact", i.e. it did not split.
-    Intact(Tree<S>),
+    Intact(Tree<B, P>),
     /// The left and right splits of a tree that was created.
     ///
     /// The left and right trees are the same type.
-    Split { left: Tree<S>, right: Tree<S> },
+    Split { left: Tree<B, P>, right: Tree<B, P> },
 }
 
-impl<S: Store> TreeEffect<S> {
+impl<B: BufferStore, P: PageStore> TreeEffect<B, P> {
     /// Converts the tree(s) created during an operation into child
     /// entries of a B+ tree internal node.
     ///
@@ -87,13 +89,14 @@ impl<S: Store> TreeEffect<S> {
 /// accessing the tree will continue to see the consistent, older version of
 /// the data until they reach a point where they would naturally access the
 /// newly written parts.
-pub struct Tree<S: Store> {
+pub struct Tree<B: BufferStore, P: PageStore> {
     root: Node,
     page_num: u64,
-    store: Rc<S>,
+    buffer_store: B,
+    page_store: P,
 }
 
-impl<S: Store> Tree<S> {
+impl<B: BufferStore, P: PageStore> Tree<B, P> {
     /// Gets the value corresponding to the key.
     pub fn get(&self, key: &[u8]) -> Result<Option<Rc<[u8]>>> {
         match &self.root {
@@ -102,11 +105,12 @@ impl<S: Store> Tree<S> {
                     .find(key)
                     .map_or_else(|| Err(TreeError::KeyNotFound), |i| Ok(i))?;
                 let child_num = root.get_child_pointer(child_idx);
-                let child = self.store.read_page(child_num)?;
+                let child = self.page_store.read_page(child_num)?;
                 let child = Self {
                     root: child,
                     page_num: child_num,
-                    store: self.store.clone(),
+                    buffer_store: self.buffer_store.clone(),
+                    page_store: self.page_store.clone(),
                 };
                 child.get(key)
             }
@@ -127,7 +131,7 @@ impl<S: Store> Tree<S> {
     /// the resulting tree.
     ///
     /// This is a recursive implementation of `insert`.
-    fn insert_helper(&self, key: &[u8], val: &[u8]) -> Result<TreeEffect<S>> {
+    fn insert_helper(&self, key: &[u8], val: &[u8]) -> Result<TreeEffect<B, P>> {
         match &self.root {
             // Base case
             Node::Leaf(leaf) => Ok(self.alloc(leaf.insert(key, val)?.into())?),
@@ -138,11 +142,12 @@ impl<S: Store> Tree<S> {
                     .find(key)
                     .map_or_else(|| Err(TreeError::KeyNotFound), |i| Ok(i))?;
                 let child_num = internal.get_child_pointer(child_idx);
-                let child = self.store.read_page(child_num)?;
+                let child = self.page_store.read_page(child_num)?;
                 let child = Self {
                     root: child,
                     page_num: child_num,
-                    store: self.store.clone(),
+                    buffer_store: self.buffer_store.clone(),
+                    page_store: self.page_store.clone()
                 };
                 let child_entries = child.insert_helper(key, val)?.child_entries(child_idx);
                 let effect = internal.merge_child_entries(child_entries.as_ref())?;
@@ -164,7 +169,7 @@ impl<S: Store> Tree<S> {
     /// the resulting tree.
     ///
     /// This is a recursive implementation of `update`.
-    fn update_helper(&self, key: &[u8], val: &[u8]) -> Result<TreeEffect<S>> {
+    fn update_helper(&self, key: &[u8], val: &[u8]) -> Result<TreeEffect<B, P>> {
         match &self.root {
             // Base case
             Node::Leaf(leaf) => self.alloc(leaf.update(key, val)?.into()),
@@ -175,11 +180,12 @@ impl<S: Store> Tree<S> {
                     .find(key)
                     .map_or_else(|| Err(TreeError::KeyNotFound), |i| Ok(i))?;
                 let child_num = internal.get_child_pointer(child_idx);
-                let child = self.store.read_page(child_num)?;
+                let child = self.page_store.read_page(child_num)?;
                 let child = Self {
                     root: child,
                     page_num: child_num,
-                    store: self.store.clone(),
+                    buffer_store: self.buffer_store.clone(),
+                    page_store: self.page_store.clone(),
                 };
                 let child_entries = child.update_helper(key, val)?.child_entries(child_idx);
                 let effect = internal.merge_child_entries(child_entries.as_ref())?;
@@ -192,12 +198,13 @@ impl<S: Store> Tree<S> {
     pub fn delete(&self, key: &[u8]) -> Result<Self> {
         match self.delete_helper(key)? {
             TreeEffect::Empty => {
-                let root = Node::Leaf(Leaf::default());
-                let page_num = self.store.write_page(&root)?;
+                let root = Node::Leaf(Leaf::new(&self.buffer_store));
+                let page_num = self.page_store.write_page(&root)?;
                 Ok(Self {
                     root,
                     page_num,
-                    store: self.store.clone(),
+                    buffer_store: self.buffer_store.clone(),
+                    page_store: self.page_store.clone(),
                 })
             }
             TreeEffect::Intact(tree) => Ok(tree),
@@ -209,7 +216,7 @@ impl<S: Store> Tree<S> {
     /// the resulting tree.
     ///
     /// This is a recursive implementation of `delete`.
-    fn delete_helper(&self, key: &[u8]) -> Result<TreeEffect<S>> {
+    fn delete_helper(&self, key: &[u8]) -> Result<TreeEffect<B, P>> {
         match &self.root {
             // Base case
             Node::Leaf(leaf) => self.alloc(leaf.delete(key)?.into()),
@@ -220,11 +227,12 @@ impl<S: Store> Tree<S> {
                     .find(key)
                     .map_or_else(|| Err(TreeError::KeyNotFound), |i| Ok(i))?;
                 let child_num = parent.get_child_pointer(child_idx);
-                let child = self.store.read_page(child_num)?;
+                let child = self.page_store.read_page(child_num)?;
                 let child = Self {
                     root: child,
                     page_num: child_num,
-                    store: self.store.clone(),
+                    buffer_store: self.buffer_store.clone(),
+                    page_store: self.page_store.clone(),
                 };
                 match child.delete_helper(key)? {
                     TreeEffect::Empty => {
@@ -275,7 +283,7 @@ impl<S: Store> Tree<S> {
         parent: &Internal,
         child: Self,
         child_idx: usize,
-    ) -> Result<TreeEffect<S>> {
+    ) -> Result<TreeEffect<B, P>> {
         // Try stealing or merging the left sibling.
         if child_idx > 0 {
             return self.steal_or_merge(parent, &child.root, child_idx, child_idx - 1);
@@ -311,9 +319,9 @@ impl<S: Store> Tree<S> {
         child: &Node,
         child_idx: usize,
         sibling_idx: usize,
-    ) -> Result<TreeEffect<S>> {
+    ) -> Result<TreeEffect<B, P>> {
         let sibling_num = parent.get_child_pointer(sibling_idx);
-        let sibling = self.store.read_page(sibling_num)?;
+        let sibling = self.page_store.read_page(sibling_num)?;
         let mut left = &sibling;
         let mut right = child;
         if sibling_idx > child_idx {
@@ -327,36 +335,39 @@ impl<S: Store> Tree<S> {
     fn parent_of_split(&self, left: Self, right: Self) -> Result<Self> {
         let keys = [left.root.get_key(0), right.root.get_key(0)];
         let child_pointers = [left.page_num, right.page_num];
-        let root = Internal::parent_of_split(keys, child_pointers)?;
+        let root = Internal::parent_of_split(keys, child_pointers, &self.buffer_store)?;
         let root = Node::Internal(root);
-        let page_num = self.store.write_page(&root)?;
+        let page_num = self.page_store.write_page(&root)?;
         Ok(Self {
             root,
             page_num,
-            store: self.store.clone(),
+            buffer_store: self.buffer_store.clone(),
+            page_store: self.page_store.clone(),
         })
     }
 
     /// Allocates pages for the in-memory nodes created during an upsert.
-    fn alloc(&self, effect: NodeEffect) -> Result<TreeEffect<S>> {
+    fn alloc(&self, effect: NodeEffect) -> Result<TreeEffect<B, P>> {
         match effect {
             NodeEffect::Empty => Ok(TreeEffect::Empty),
             NodeEffect::Intact(root) => {
-                let page_num = self.store.write_page(&root)?;
-                Ok(TreeEffect::Intact(Self{root, page_num, store: self.store.clone() }))
+                let page_num = self.page_store.write_page(&root)?;
+                Ok(TreeEffect::Intact(Self{root, page_num, buffer_store: self.buffer_store.clone(), page_store: self.page_store.clone() }))
             },
             NodeEffect::Split { left, right } => {
-                let left_page_num = self.store.write_page(&left)?;
-                let right_page_num = self.store.write_page(&right)?;
+                let left_page_num = self.page_store.write_page(&left)?;
+                let right_page_num = self.page_store.write_page(&right)?;
                 let left = Self {
                     root: left,
                     page_num: left_page_num,
-                    store: self.store.clone(),
+                    buffer_store: self.buffer_store.clone(),
+                    page_store: self.page_store.clone(),
                 };
                 let right = Self {
                     root: right,
                     page_num: right_page_num,
-                    store: self.store.clone(),
+                    buffer_store: self.buffer_store.clone(),
+                    page_store: self.page_store.clone(),
                 };
                 Ok(TreeEffect::Split { left, right })
             },

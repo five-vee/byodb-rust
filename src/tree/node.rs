@@ -151,7 +151,7 @@ impl TryFrom<u16> for NodeType {
 }
 
 /// An enum representing the type of B+ tree node.
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub enum Node {
     /// A B+ tree leaf node.
     Leaf(Leaf),
