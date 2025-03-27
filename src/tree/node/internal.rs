@@ -85,7 +85,7 @@ fn get_offset(buf: &[u8], i: usize) -> usize {
         return 0;
     }
     let n = node::get_num_keys(buf);
-    u16::from_be_bytes([buf[4 + n * 8 + 2 * (i - 1)], buf[4 + n * 8 + 2 * i]]) as usize
+    u16::from_be_bytes([buf[4 + n * 8 + 2 * (i - 1)], buf[4 + n * 8 + 2 * i - 1]]) as usize
 }
 
 /// Sets the next (i.e. `i+1`th) offset and returns the current offset.
@@ -119,7 +119,7 @@ impl<'a, S: BufferStore> InternalBuilder<'a, S> {
     pub fn new(num_keys: usize, store: &'a S, allow_overflow: bool) -> Self {
         assert!(num_keys >= 2, "An internal node must have at least 2 keys.");
         let (mut buf, cap) = if allow_overflow {
-            (store.get_buf(node::PAGE_SIZE * 2), node::PAGE_SIZE - 4)
+            (store.get_buf(node::PAGE_SIZE * 2), 2 * node::PAGE_SIZE - 4)
         } else {
             (store.get_buf(node::PAGE_SIZE), node::PAGE_SIZE)
         };

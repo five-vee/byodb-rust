@@ -67,9 +67,9 @@ enum BufferOrigin {
 struct ArenaState {
     /// Owns the contiguous memory block for the arena.
     arena_storage: Box<[u8]>,
-    /// Bitmap tracking allocation status of each PAGE_SIZE chunk.
-    /// `false` = free, `true` = allocated.
-    bitmap: Vec<bool>,
+    /// Packed bitmap tracking allocation status of each PAGE_SIZE chunk.
+    /// A `0` bit means free, `1` means allocated. Each u64 holds 64 page statuses.
+    bitmap: Vec<u64>,
     /// Total number of PAGE_SIZE pages in the arena.
     num_pages: usize,
     /// Allocation statistics.
@@ -83,12 +83,12 @@ impl ArenaState {
 
         let size_in_bytes = num_pages * PAGE_SIZE;
         let arena_storage = vec![0u8; size_in_bytes].into_boxed_slice();
-        // Initialize bitmap with all pages marked as free.
-        let bitmap = vec![false; num_pages];
+        // Initialize packed bitmap with all pages marked as free (0).
+        // Calculate the number of u64 words needed.
+        let bitmap_len = (num_pages + 63) / 64;
+        let bitmap = vec![0u64; bitmap_len];
 
         println!(
-            "Arena initialized: {} Pages ({} bytes), All pages free.",
-            num_pages, size_in_bytes,
         );
 
         ArenaState {

@@ -63,7 +63,7 @@ impl LeafEffect {
         if i == 0 {
             return 0;
         }
-        u16::from_be_bytes([buf[4 + 2 * (i - 1)], buf[4 + 2 * i]]) as usize
+        u16::from_be_bytes([buf[4 + 2 * (i - 1)], buf[4 + 2 * i - 1]]) as usize
     }
 
     /// Gets the number of bytes consumed by a page.
@@ -96,7 +96,7 @@ impl LeafEffect {
         /// Creates a new leaf builder.
         pub fn new(num_keys: usize, store: &'a S, allow_overflow: bool) -> Self {
             let (mut buf, cap) = if allow_overflow {
-                (store.get_buf(node::PAGE_SIZE * 2), node::PAGE_SIZE - 4)
+                (store.get_buf(node::PAGE_SIZE * 2), 2 * node::PAGE_SIZE - 4)
             } else {
                 (store.get_buf(node::PAGE_SIZE), node::PAGE_SIZE)
             };
@@ -123,11 +123,10 @@ impl LeafEffect {
 
             let n = self.num_keys;
             let offset = set_next_offset(&mut self.buf, self.i, key, val);
-            let simulated_bytes = 4 + self.i * 2 + offset;
-            assert!(simulated_bytes + 4 + key.len() + val.len() <= self.cap,
-            "builder unexpectedly overflowed; please call allow_overflow(), or don't add too many key-value pairs.");
-
             let pos = 4 + n * 2 + offset;
+            assert!(pos + 4 + key.len() + val.len() <= self.cap,
+                "builder unexpectedly overflowed; please call allow_overflow(), or don't add too many key-value pairs.");
+
             self.buf[pos..pos + 2].copy_from_slice(&(key.len() as u16).to_be_bytes());
             self.buf[pos + 2..pos + 4].copy_from_slice(&(val.len() as u16).to_be_bytes());
             self.buf[pos + 4..pos + 4 + key.len()].copy_from_slice(key);
@@ -150,7 +149,7 @@ impl LeafEffect {
                 // Technically, an empty leaf is allowed.
                 return Ok(LeafEffect::Empty);
             }
-            if self.cap == node::PAGE_SIZE {
+            if get_num_bytes(&self.buf) <= node::PAGE_SIZE {
                 return Ok(LeafEffect::Intact(self.build_single()));
             }
             let (left, right) = self.build_split()?;
@@ -365,11 +364,11 @@ mod tests {
     static TEST_ARENA_POOL: OnceLock<ArenaPool> = OnceLock::new();
 
     fn pool() -> ArenaPool {
-        TEST_ARENA_POOL.get_or_init(|| ArenaPool::new(4)).clone()
+        TEST_ARENA_POOL.get_or_init(|| ArenaPool::new(8)).clone()
     }
 
     #[test]
-    fn leaf_insert_intact() {
+    fn insert_intact() {
         let leaf = Leaf::new(&pool())
             .insert("hello".as_bytes(), "world".as_bytes())
             .unwrap()
@@ -378,16 +377,38 @@ mod tests {
     }
 
     #[test]
-    fn leaf_insert_max_key_size() {
+    fn insert_max_key_size() {
         let key = &[0u8; node::MAX_KEY_SIZE + 1];
         let result = Leaf::new(&pool()).insert(key, "val".as_bytes());
         assert!(matches!(result, Err(NodeError::MaxKeySize(x)) if x == node::MAX_KEY_SIZE + 1));
     }
 
     #[test]
-    fn leaf_insert_max_value_size() {
+    fn insert_max_value_size() {
         let val = &[0u8; node::MAX_VALUE_SIZE + 1];
         let result = Leaf::new(&pool()).insert("key".as_bytes(), val);
         assert!(matches!(result, Err(NodeError::MaxValueSize(x)) if x == node::MAX_VALUE_SIZE + 1));
+    }
+
+    #[test]
+    fn insert_split() {
+        // Insert 1 huge key-value.
+        let key1 = &[0u8; node::MAX_KEY_SIZE];
+        let val1 = &[0u8; node::MAX_VALUE_SIZE];
+        let result = Leaf::new(&pool()).insert(key1, val1);
+        assert!(matches!(result, Ok(LeafEffect::Intact(_))), "1st insert result: {result:?}");
+        let leaf = result.unwrap().take_intact();
+
+        // Insert another huge key-value to trigger splitting.
+        let key2 = &[1u8; node::MAX_KEY_SIZE];
+        let val2 = &[1u8; node::MAX_VALUE_SIZE];
+        let result = leaf.insert(key2, val2);
+        assert!(matches!(result, Ok(LeafEffect::Split{..})), "2nd insert result: {result:?}");
+        let (left, right) = result.unwrap().take_split();
+        drop(leaf);
+        assert_eq!(left.get_num_keys(), 1);
+        assert_eq!(right.get_num_keys(), 1);
+        assert_eq!(left.find(key1).unwrap(), val1);
+        assert_eq!(right.find(key2).unwrap(), val2);
     }
 }
