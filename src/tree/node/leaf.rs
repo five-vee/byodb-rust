@@ -411,4 +411,121 @@ mod tests {
         assert_eq!(left.find(key1).unwrap(), val1);
         assert_eq!(right.find(key2).unwrap(), val2);
     }
+
+    #[test]
+    fn find_some() {
+        let leaf = LeafBuilder::new(1, &store(), false)
+            .add_key_value("key".as_bytes(), "val".as_bytes())
+            .unwrap()
+            .build()
+            .unwrap()
+            .take_intact();
+        assert!(matches!(leaf.find("key".as_bytes()), Some(v) if v == "val".as_bytes()));
+    }
+
+    #[test]
+    fn find_none() {
+        let leaf = Leaf::new(&store());
+        assert!(matches!(leaf.find("key".as_bytes()), None))
+    }
+
+    #[test]
+    fn iter() {
+        let leaf = LeafBuilder::new(2, &store(), false)
+            .add_key_value("key1".as_bytes(), "val1".as_bytes())
+            .unwrap()
+            .add_key_value("key2".as_bytes(), "val2".as_bytes())
+            .unwrap()
+            .build()
+            .unwrap()
+            .take_intact();
+        let got = leaf.iter().collect::<Vec<_>>();
+        assert_eq!(got, vec![("key1".as_bytes(), "val1".as_bytes()), ("key2".as_bytes(), "val2".as_bytes())]);
+    }
+
+    #[test]
+    fn iter_empty() {
+        let leaf = Leaf::new(&store());
+        assert_eq!(leaf.iter().count(), 0);
+    }
+
+    #[test]
+    fn update_intact() {
+        let leaf = LeafBuilder::new(2, &store(), false)
+            .add_key_value("key1".as_bytes(), "val1".as_bytes())
+            .unwrap()
+            .add_key_value("key2".as_bytes(), "val2".as_bytes())
+            .unwrap()
+            .build()
+            .unwrap()
+            .take_intact();
+
+        let leaf = leaf.update("key1".as_bytes(), "val1_new".as_bytes())
+            .unwrap()
+            .take_intact();
+
+        assert_eq!(leaf.find("key1".as_bytes()).unwrap(), "val1_new".as_bytes());
+    }
+
+    #[test]
+    fn update_max_key_size() {
+        let key = &[0u8; node::MAX_KEY_SIZE + 1];
+        let result = Leaf::new(&store()).update(key, "val".as_bytes());
+        assert!(matches!(result, Err(NodeError::MaxKeySize(x)) if x == node::MAX_KEY_SIZE + 1));
+    }
+
+    #[test]
+    fn update_max_value_size() {
+        let leaf = LeafBuilder::new(1, &store(), false)
+            .add_key_value("key".as_bytes(), "val".as_bytes())
+            .unwrap()
+            .build()
+            .unwrap()
+            .take_intact();
+        let val = &[0u8; node::MAX_VALUE_SIZE + 1];
+        let result = leaf.update("key".as_bytes(), val);
+        assert!(matches!(result, Err(NodeError::MaxValueSize(x)) if x == node::MAX_VALUE_SIZE + 1));
+    }
+
+    #[test]
+    fn update_non_existent() {
+        let result = Leaf::new(&store()).update("key".as_bytes(), "val".as_bytes());
+        assert!(matches!(result, Err(NodeError::KeyNotFound)));
+    }
+
+    #[test]
+    fn delete_intact() {
+        let leaf = LeafBuilder::new(2, &store(), false)
+            .add_key_value("key1".as_bytes(), "val1".as_bytes())
+            .unwrap()
+            .add_key_value("key2".as_bytes(), "val2".as_bytes())
+            .unwrap()
+            .build()
+            .unwrap()
+            .take_intact();
+
+        let leaf = leaf.delete("key1".as_bytes())
+            .unwrap()
+            .take_intact();
+
+        assert!(leaf.find("key1".as_bytes()).is_none());
+    }
+
+    #[test]
+    fn delete_empty() {
+        let leaf = LeafBuilder::new(1, &store(), false)
+            .add_key_value("key".as_bytes(), "val".as_bytes())
+            .unwrap()
+            .build()
+            .unwrap()
+            .take_intact();
+        let effect = leaf.delete("key".as_bytes()).unwrap();
+        assert!(matches!(effect, LeafEffect::Empty));
+    }
+
+    #[test]
+    fn delete_non_existent() {
+        let result = Leaf::new(&store()).delete("key".as_bytes());
+        assert!(matches!(result, Err(NodeError::KeyNotFound)));
+    }
 }
