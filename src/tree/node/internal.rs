@@ -1,7 +1,6 @@
-use std::rc::Rc;
-
 use crate::tree::buffer_store::BufferStore;
 use crate::tree::node::{self, NodeType, Result};
+use std::rc::Rc;
 
 /// An enum representing the effect of an internal node operation.
 #[derive(Debug)]
@@ -14,7 +13,10 @@ pub enum InternalEffect<B: BufferStore> {
     /// i.e. it did not split.
     Intact(Internal<B>),
     /// The left and right splits of an internal node that was created.
-    Split { left: Internal<B>, right: Internal<B> },
+    Split {
+        left: Internal<B>,
+        right: Internal<B>,
+    },
 }
 
 impl<B: BufferStore> InternalEffect<B> {
@@ -34,6 +36,7 @@ impl<B: BufferStore> InternalEffect<B> {
 }
 
 /// A child entry to insert, update, or delete in an internal node.
+#[derive(Debug)]
 pub enum ChildEntry {
     Insert {
         key: Rc<[u8]>,
@@ -51,13 +54,10 @@ pub enum ChildEntry {
 
 /// Gets the `i`th key in an internal node's page buffer.
 pub fn get_key(buf: &[u8], i: usize) -> &[u8] {
-    let offset = get_offset(buf, i) as usize;
-    let num_keys = node::get_num_keys(buf) as usize;
-    let key_len = u16::from_be_bytes([
-        buf[4 + num_keys * 10 + offset],
-        buf[4 + num_keys * 10 + offset + 1],
-    ]) as usize;
-    &buf[4 + num_keys * 10 + offset..4 + num_keys * 10 + offset + key_len]
+    let n = node::get_num_keys(buf);
+    let offset = get_offset(buf, i);
+    let key_len = get_offset(buf, i + 1) - offset;
+    &buf[4 + n * 10 + offset..4 + n * 10 + offset + key_len]
 }
 
 /// Gets the `i`th child pointer in an internal node's page buffer.
@@ -107,7 +107,6 @@ pub fn get_num_bytes(buf: &[u8]) -> usize {
 
 /// A builder of a B+ tree internal node.
 pub struct InternalBuilder<'a, B: BufferStore> {
-    num_keys: usize,
     i: usize,
     cap: usize,
     store: &'a B,
@@ -124,8 +123,8 @@ impl<'a, B: BufferStore> InternalBuilder<'a, B> {
             (store.get_buf(node::PAGE_SIZE), node::PAGE_SIZE)
         };
         node::set_page_header(&mut buf, NodeType::Internal);
+        node::set_num_keys(&mut buf, num_keys);
         Self {
-            num_keys,
             i: 0,
             cap,
             store,
@@ -135,37 +134,36 @@ impl<'a, B: BufferStore> InternalBuilder<'a, B> {
 
     /// Adds a child entry to the builder.
     pub fn add_child_entry(mut self, key: &[u8], page_num: u64) -> Result<Self> {
+        let n = node::get_num_keys(&self.buf);
         assert!(
-            self.i < self.num_keys,
+            self.i < n,
             "add_child_entry() called {} times, cannot be called more times than num_keys = {}",
             self.i,
-            self.num_keys
+            n
         );
         assert!(key.len() <= node::MAX_KEY_SIZE);
 
-        let n = self.num_keys;
         let offset = set_next_offset(&mut self.buf, self.i, n, key);
         set_child_pointer(&mut self.buf, self.i, page_num);
-        let simulated_bytes = 4 + self.i * 10 + offset;
-        assert!(
-                simulated_bytes + key.len() <= self.cap,
-                "builder unexpectedly overflowed; please call allow_overflow(), or don't add too many key-value pairs.");
-
         let pos = 4 + n * 10 + offset;
+        assert!(
+            pos + key.len() <= self.cap,
+            "builder unexpectedly overflowed; please call allow_overflow(), or don't add too many key-value pairs.");
+
         self.buf[pos..pos + key.len()].copy_from_slice(key);
 
         self.i += 1;
-        node::set_num_keys(&mut self.buf, self.i);
         Ok(self)
     }
 
     /// Builds an internal node and optionally splits it if overflowed.
     pub fn build(self) -> Result<InternalEffect<B>> {
+        let n = node::get_num_keys(&self.buf);
         assert!(
-            self.i == self.num_keys,
+            self.i == n,
             "build() called after calling add_child_entry() {} times < num_keys = {}",
             self.i,
-            self.num_keys
+            n
         );
         if get_num_bytes(&self.buf) <= node::PAGE_SIZE {
             return Ok(InternalEffect::Intact(self.build_single()));
@@ -176,34 +174,39 @@ impl<'a, B: BufferStore> InternalBuilder<'a, B> {
 
     /// Builds an internal node.
     fn build_single(self) -> Internal<B> {
+        let n = node::get_num_keys(&self.buf);
         assert!(
-            self.i == self.num_keys,
+            self.i == n,
             "build_single() called after calling add_child_entry() {} times < num_keys = {}",
             self.i,
-            self.num_keys
+            n
         );
         assert!(get_num_bytes(&self.buf) <= node::PAGE_SIZE);
-        Internal { buf: self.buf, store: self.store.clone() }
+        Internal {
+            buf: self.buf,
+            store: self.store.clone(),
+        }
     }
 
     /// Builds two splits of an internal node.
     fn build_split(self) -> Result<(Internal<B>, Internal<B>)> {
-        let num_keys = self.num_keys as usize;
-        let mut left_end: usize = 0;
-        for i in 0..num_keys {
-            // include i?
-            let offset = get_offset(&self.buf, i + 1);
-            if 4 + (i + 1) * 2 + offset <= node::PAGE_SIZE {
-                left_end = i + 1;
-            }
-        }
+        let n = node::get_num_keys(&self.buf);
+        // There should be at least 2 keys to be sufficient
+        // in each of left and right.
+        let left_end = (2..=n-2)
+            .rev()
+            .find(|i| {
+                let next_offset = get_offset(&self.buf, *i);
+                4 + *i * 10 + next_offset <= node::PAGE_SIZE
+            })
+            .unwrap();
 
         let mut lb = Self::new(left_end, self.store, false);
         for i in 0..left_end {
             lb = lb.add_child_entry(get_key(&self.buf, i), get_child_pointer(&self.buf, i))?;
         }
-        let mut rb = Self::new(num_keys - left_end, self.store, false);
-        for i in left_end..num_keys {
+        let mut rb = Self::new(n - left_end, self.store, false);
+        for i in left_end..n {
             rb = rb.add_child_entry(get_key(&self.buf, i), get_child_pointer(&self.buf, i))?;
         }
         Ok((lb.build_single(), rb.build_single()))
@@ -219,11 +222,7 @@ pub struct Internal<B: BufferStore> {
 
 impl<B: BufferStore> Internal<B> {
     /// Creates an internal node that is the parent of two splits.
-    pub fn parent_of_split(
-        keys: [&[u8]; 2],
-        child_pointers: [u64; 2],
-        store: &B,
-    ) -> Result<Self> {
+    pub fn parent_of_split(keys: [&[u8]; 2], child_pointers: [u64; 2], store: &B) -> Result<Self> {
         let parent = InternalBuilder::new(2, store, false)
             .add_child_entry(keys[0], child_pointers[0])?
             .add_child_entry(keys[1], child_pointers[1])?
@@ -234,52 +233,73 @@ impl<B: BufferStore> Internal<B> {
 
     /// Merges child entries into the internal node.
     pub fn merge_child_entries(&self, entries: &[ChildEntry]) -> Result<InternalEffect<B>> {
-        let extra = entries
-            .iter()
-            .filter(|ce| {
-                if let ChildEntry::Insert { .. } = *ce {
-                    true
-                } else {
-                    false
+        let delta_keys = entries.iter()
+            .map(|ce| match ce {
+                ChildEntry::Insert { .. } => 1,
+                ChildEntry::Delete { .. } => -1,
+                _ => 0,
+            })
+            .sum::<isize>();
+        let delta_size = entries.iter()
+            .map(|ce| {
+                match ce {
+                    ChildEntry::Insert { key, page_num } => {
+                        key.len() as isize
+                    },
+                    ChildEntry::Update { i, key, page_num } => {
+                        key.len() as isize - self.get_key(*i).len() as isize
+                    },
+                    ChildEntry::Delete { i } => {
+                        -(self.get_key(*i).len() as isize)
+                    }
                 }
             })
-            .count();
+            .sum::<isize>();
         let mut b = InternalBuilder::new(
-            self.get_num_keys() + extra,
+            (self.get_num_keys() as isize + delta_keys) as usize,
             &self.store,
-            extra > 0,
+            (self.get_num_bytes() as isize + delta_size) as usize > node::PAGE_SIZE,
         );
-        let mut entries_iter = entries.iter();
-        let mut next = entries_iter.next();
-        for i in 0..self.get_num_keys() {
-            if next.is_none() {
-                b = b.add_child_entry(self.get_key(i), self.get_child_pointer(i))?;
-                continue;
+        let mut self_iter = self.iter().enumerate().peekable();
+        let mut entries_iter = entries.iter().peekable();
+        loop {
+            match (self_iter.peek(), entries_iter.peek()) {
+                (None, None) => break,
+                (Some((_, (k, pn))), None) => {
+                    b = b.add_child_entry(k, *pn)?;
+                    self_iter.next();
+                }
+                (None, Some(ce)) => match ce {
+                    ChildEntry::Insert { key, page_num } => {
+                        b = b.add_child_entry(key, *page_num)?;
+                        entries_iter.next();
+                    }
+                    _ => panic!("ChildEntry {ce:?} cannot be applied without corresponding index"),
+                },
+                (Some((i, (k, pn))), Some(ce)) => match ce {
+                    ChildEntry::Update {
+                        i: j,
+                        key,
+                        page_num,
+                    } if *i == *j => {
+                        b = b.add_child_entry(key, *page_num)?;
+                        self_iter.next();
+                        entries_iter.next();
+                    }
+                    ChildEntry::Delete { i: j } if *i == *j => {
+                        self_iter.next();
+                        entries_iter.next();
+                    }
+                    ChildEntry::Insert { key, page_num } if (*key).as_ref() < *k => {
+                        b = b.add_child_entry(key, *page_num)?;
+                        entries_iter.next();
+                    }
+                    _ => {
+                        b = b.add_child_entry(k, *pn)?;
+                        self_iter.next();
+                    }
+                },
             }
-            match next.unwrap() {
-                ChildEntry::Insert { key, page_num } => {
-                    b = b.add_child_entry(key, *page_num)?;
-                    b = b.add_child_entry(self.get_key(i), self.get_child_pointer(i))?;
-                    next = entries_iter.next();
-                }
-                ChildEntry::Update {
-                    i: j,
-                    key,
-                    page_num,
-                } if i == *j => {
-                    b = b.add_child_entry(key, *page_num)?;
-                    next = entries_iter.next();
-                }
-                ChildEntry::Delete { i: j } if i == *j => {
-                    next = entries_iter.next();
-                }
-                _ => {
-                    b = b.add_child_entry(self.get_key(i), self.get_child_pointer(i))?;
-                }
-            }
-        }
-        if let Some(ChildEntry::Insert { key, page_num }) = next {
-            b = b.add_child_entry(key, *page_num)?;
         }
         b.build()
     }
@@ -329,12 +349,19 @@ impl<B: BufferStore> Internal<B> {
             n: self.get_num_keys(),
         }
     }
+    
+    fn get_num_bytes<>(&self) -> usize {
+        get_num_bytes(&self.buf)
+    }
 }
 
 impl<B: BufferStore> Clone for Internal<B> {
     fn clone(&self) -> Self {
         let buf = self.store.get_buf(self.buf.len());
-        Self { buf, store: self.store.clone() }
+        Self {
+            buf,
+            store: self.store.clone(),
+        }
     }
 }
 
@@ -358,5 +385,144 @@ impl<'a, B: BufferStore> Iterator for InternalIterator<'a, B> {
         ));
         self.i += 1;
         item
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::tree::{buffer_store::Heap, node};
+
+    use super::{ChildEntry, Internal, InternalBuilder};
+
+    static TEST_HEAP_STORE: Heap = Heap {};
+
+    #[test]
+    fn parent_of_slit() {
+        let parent = Internal::parent_of_split(
+            ["key1".as_bytes(), "key2".as_bytes()],
+            [111, 222],
+            &TEST_HEAP_STORE,
+        )
+        .unwrap();
+        assert_eq!(
+            parent.iter().collect::<Vec<_>>(),
+            vec![("key1".as_bytes(), 111), ("key2".as_bytes(), 222)]
+        );
+    }
+
+    #[test]
+    fn merge_child_entries_intact() {
+        let node = Internal::parent_of_split(
+            ["key1".as_bytes(), "key2".as_bytes()],
+            [111, 222],
+            &TEST_HEAP_STORE,
+        )
+        .unwrap();
+        let node = node
+            .merge_child_entries(&[
+                ChildEntry::Insert {
+                    key: "key0".as_bytes().into(),
+                    page_num: 0,
+                },
+                ChildEntry::Update {
+                    i: 0,
+                    key: "key1_new".as_bytes().into(),
+                    page_num: 1111,
+                },
+                ChildEntry::Delete { i: 1 },
+                ChildEntry::Insert {
+                    key: "key3".as_bytes().into(),
+                    page_num: 333,
+                },
+            ])
+            .unwrap()
+            .take_intact();
+        assert_eq!(
+            node.iter().collect::<Vec<_>>(),
+            vec![
+                ("key0".as_bytes(), 0),
+                ("key1_new".as_bytes(), 1111),
+                ("key3".as_bytes(), 333)
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_child_entries_insert_split() {
+        let node = InternalBuilder::new(4, &TEST_HEAP_STORE, false)
+            .add_child_entry(&[0; node::MAX_KEY_SIZE], 0)
+            .unwrap()
+            .add_child_entry(&[1; node::MAX_KEY_SIZE], 1)
+            .unwrap()
+            .add_child_entry(&[2; node::MAX_KEY_SIZE], 2)
+            .unwrap()
+            .add_child_entry(&[4; node::MAX_KEY_SIZE], 4)
+            .unwrap()
+            .build()
+            .unwrap()
+            .take_intact();
+        let (left, right) = node
+            .merge_child_entries(&[
+                ChildEntry::Insert {
+                    key: [3; node::MAX_KEY_SIZE].into(),
+                    page_num: 3,
+                },
+            ])
+            .unwrap()
+            .take_split();
+        assert!(left.get_num_keys() >= 2);
+        assert!(right.get_num_keys() >= 2);
+        let chained = left.iter().chain(right.iter()).collect::<Vec<_>>();
+        assert_eq!(
+            chained,
+            vec![
+                (&[0; node::MAX_KEY_SIZE][..], 0),
+                (&[1; node::MAX_KEY_SIZE][..], 1),
+                (&[2; node::MAX_KEY_SIZE][..], 2),
+                (&[3; node::MAX_KEY_SIZE][..], 3),
+                (&[4; node::MAX_KEY_SIZE][..], 4),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_child_entries_udate_split() {
+        let node = InternalBuilder::new(5, &TEST_HEAP_STORE, false)
+            .add_child_entry(&[0; node::MAX_KEY_SIZE], 0)
+            .unwrap()
+            .add_child_entry(&[1; node::MAX_KEY_SIZE], 1)
+            .unwrap()
+            .add_child_entry(&[2; node::MAX_KEY_SIZE], 2)
+            .unwrap()
+            .add_child_entry(&[3; 1], 3)
+            .unwrap()
+            .add_child_entry(&[4; node::MAX_KEY_SIZE], 4)
+            .unwrap()
+            .build()
+            .unwrap()
+            .take_intact();
+        let (left, right) = node
+            .merge_child_entries(&[
+                ChildEntry::Update {
+                    i: 3,
+                    key: [3; node::MAX_KEY_SIZE].into(),
+                    page_num: 3,
+                },
+            ])
+            .unwrap()
+            .take_split();
+        assert!(left.get_num_keys() >= 2);
+        assert!(right.get_num_keys() >= 2);
+        let chained = left.iter().chain(right.iter()).collect::<Vec<_>>();
+        assert_eq!(
+            chained,
+            vec![
+                (&[0; node::MAX_KEY_SIZE][..], 0),
+                (&[1; node::MAX_KEY_SIZE][..], 1),
+                (&[2; node::MAX_KEY_SIZE][..], 2),
+                (&[3; node::MAX_KEY_SIZE][..], 3),
+                (&[4; node::MAX_KEY_SIZE][..], 4),
+            ]
+        );
     }
 }
