@@ -86,9 +86,22 @@ impl ArenaState {
         // Initialize packed bitmap with all pages marked as free (0).
         // Calculate the number of u64 words needed.
         let bitmap_len = (num_pages + 63) / 64;
-        let bitmap = vec![0u64; bitmap_len];
+        let mut bitmap = vec![0u64; bitmap_len];
+
+        // Pre-mark padding bits in the last word as allocated (1)
+        // This avoids needing boundary checks during allocation scans.
+        let remainder = num_pages % 64;
+        if remainder != 0 && bitmap_len > 0 {
+            // Create a mask with 1s for the unused bits at the end.
+            // e.g., if num_pages=65 (remainder=1), we need bits 1..63 set.
+            // mask = u64::MAX << 1;
+            let padding_mask = u64::MAX << remainder;
+            bitmap[bitmap_len - 1] |= padding_mask;
+        }
 
         println!(
+            "Arena initialized: {} Pages ({} bytes) in {} u64 words, padding applied.",
+            num_pages, size_in_bytes, bitmap_len
         );
 
         ArenaState {
@@ -106,63 +119,84 @@ impl ArenaState {
         NonNull::new(self.arena_storage.as_ptr() as *mut u8) // Cast const to mut for NonNull<u8>
    }
 
-    /// Scans the bitmap to find a free chunk, marks it allocated, and updates stats.
+    /// Scans the packed bitmap to find and allocate a free chunk of the appropriate size.
     fn get_arena_chunk(&mut self, requested_size: usize) -> Option<(usize, usize)> {
-        // Determine number of contiguous pages needed
-        let pages_needed = if requested_size <= PAGE_SIZE {
-            1
+        if requested_size <= PAGE_SIZE {
+            self.find_and_alloc_4k()
         } else {
             // requested_size must be <= LARGE_PAGE_SIZE asserted in get_buf
-            2
-        };
-
-        // --- Scan Bitmap ---
-        let mut found_idx: Option<usize> = None;
-        // Iterate checking for `pages_needed` contiguous free slots
-        for i in 0..=(self.num_pages.saturating_sub(pages_needed)) {
-            let mut contiguous_free = true;
-            for j in 0..pages_needed {
-                if self.bitmap[i + j] {
-                    // Found an allocated page, this sequence won't work
-                    contiguous_free = false;
-                    break; // Break inner loop, continue outer scan
-                }
-            }
-
-            if contiguous_free {
-                // Found a suitable sequence starting at index i
-                found_idx = Some(i);
-                break; // Stop scanning
-            }
-            // If contiguous_free is false, the outer loop continues scanning
-        }
-        // --- End Scan ---
-
-
-        if let Some(start_page_idx) = found_idx {
-            // --- Mark pages as allocated ---
-            for j in 0..pages_needed {
-                self.bitmap[start_page_idx + j] = true;
-            }
-
-            // --- Update Stats ---
-            let allocated_size = pages_needed * PAGE_SIZE;
-            if allocated_size == PAGE_SIZE {
-                self.stats.arena_allocs_4k += 1;
-            } else {
-                self.stats.arena_allocs_8k += 1;
-            }
-
-            // --- Return byte index and allocated size ---
-            let byte_index = start_page_idx * PAGE_SIZE;
-            Some((byte_index, allocated_size))
-        } else {
-            // No suitable chunk found in the arena
-            None
+            self.find_and_alloc_8k()
         }
     }
 
-    /// Marks the corresponding pages in the bitmap as free.
+    /// Helper: Finds and allocates a single 4KB page.
+    fn find_and_alloc_4k(&mut self) -> Option<(usize, usize)> {
+        for word_idx in 0..self.bitmap.len() {
+            let word = self.bitmap[word_idx];
+            if word == u64::MAX { continue; } // Skip full words
+
+            // `trailing_ones` gives the index of the first 0 bit.
+            // If word != u64::MAX, there must be a 0 bit, so bit_idx < 64.
+            let bit_idx = word.trailing_ones();
+            let page_idx = word_idx * 64 + bit_idx as usize;
+
+            // Boundary check (page_idx >= self.num_pages) is not needed
+            // because padding bits are pre-set to 1, so trailing_ones will
+            // never return an index pointing into the padding area.
+
+            // Found a valid free page. Mark and return.
+            self.bitmap[word_idx] |= 1 << bit_idx;
+            self.stats.arena_allocs_4k += 1;
+            return Some((page_idx * PAGE_SIZE, PAGE_SIZE));
+        }
+        None // Not found after checking all words
+    }
+
+    /// Helper: Finds and allocates two contiguous 4KB pages (8KB total).
+    fn find_and_alloc_8k(&mut self) -> Option<(usize, usize)> {
+        for word_idx in 0..self.bitmap.len() {
+            let word = self.bitmap[word_idx];
+            if word == u64::MAX { continue; } // Skip full words
+
+            let available_pairs = !word & (!word >> 1);
+            if available_pairs == 0 {
+                // No pairs found in this word.
+                continue;
+            }
+
+            // `trailing_zeros` gives the index of the *first* bit (`idx`)
+            // in the first `00` pair `(idx, idx + 1)`.
+            let first_bit_idx_u32 = available_pairs.trailing_zeros();
+            let first_bit_idx = first_bit_idx_u32 as usize;
+            let second_bit_idx = first_bit_idx + 1;
+
+            // Check if the pair is fully within the word boundary.
+            // If first_bit_idx is 63, second_bit_idx will be 64.
+            if second_bit_idx >= 64 {
+                // The first found pair crosses the word boundary.
+                // Since we don't handle cross-word pairs, continue to the next word.
+                // Note: A more complex loop could check *other* pairs within this word
+                // by masking `available_pairs &= available_pairs - 1`, but we keep it simple.
+                continue;
+            }
+
+            let page_idx = word_idx * 64 + first_bit_idx;
+
+            // Boundary check (page_idx + 1 >= self.num_pages) is not needed
+            // because padding bits are pre-set to 1. If the pair included a
+            // padding bit, `available_pairs` would not have included it, or
+            // `second_bit_idx >= 64` would have caught it earlier.
+
+            // Found a valid pair. Mark and return.
+            self.bitmap[word_idx] |= (1 << first_bit_idx) | (1 << second_bit_idx);
+            self.stats.arena_allocs_8k += 1;
+            return Some((page_idx * PAGE_SIZE, LARGE_PAGE_SIZE));
+        }
+        None // Not found after checking all words
+    }
+
+
+    /// Marks the corresponding pages in the packed bitmap as free (sets bits to 0).
     fn return_arena_chunk(&mut self, byte_index: usize, size: usize) {
         // Validate inputs (basic checks)
         assert!(byte_index % PAGE_SIZE == 0, "Returned index not page aligned");
@@ -180,15 +214,29 @@ impl ArenaState {
 
         for j in 0..pages_to_free {
             let current_page_idx = start_page_idx + j;
-            if !self.bitmap[current_page_idx] {
-                // This indicates a double-free or logic error
-                eprintln!(
-                    "WARNING: Attempting to free already free page at index {}",
+            // Ensure we don't try to free beyond the actual number of pages
+            if current_page_idx >= self.num_pages {
+                panic!(
+                    "Attempting to free page {} which is out of bounds ({})",
+                    current_page_idx, self.num_pages
+                );
+            }
+
+            let word_idx = current_page_idx / 64;
+            let bit_idx = current_page_idx % 64;
+            let mask = 1 << bit_idx;
+
+            // Check for double-free *before* clearing the bit
+            if (self.bitmap[word_idx] & mask) == 0 {
+                // This indicates a double-free or logic error (bit is already 0)
+                panic!(
+                    "Attempting to free already free page at index {}",
                     current_page_idx
                 );
-                // Optionally panic here, or just log and continue
+            } else {
+                 // Mark as free (clear the bit)
+                self.bitmap[word_idx] &= !mask;
             }
-            self.bitmap[current_page_idx] = false; // Mark as free
         }
     }
 
