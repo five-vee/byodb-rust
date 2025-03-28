@@ -33,7 +33,7 @@ use page_store::PageStore;
 type Result<T> = std::result::Result<T, TreeError>;
 
 /// An enum representing the effect of a tree operation.
-enum TreeEffect<B: BufferStore, P: PageStore> {
+enum TreeEffect<B: BufferStore, P: PageStore<B>> {
     /// A tree with 0 keys after a delete was performed on it.
     /// This is a special-case of `Underflow` done to avoid unnecessary
     /// page allocations, since empty non-root nodes aren't allowed.
@@ -46,7 +46,7 @@ enum TreeEffect<B: BufferStore, P: PageStore> {
     Split { left: Tree<B, P>, right: Tree<B, P> },
 }
 
-impl<B: BufferStore, P: PageStore> TreeEffect<B, P> {
+impl<B: BufferStore, P: PageStore<B>> TreeEffect<B, P> {
     /// Converts the tree(s) created during an operation into child
     /// entries of a B+ tree internal node.
     ///
@@ -90,14 +90,14 @@ impl<B: BufferStore, P: PageStore> TreeEffect<B, P> {
 /// accessing the tree will continue to see the consistent, older version of
 /// the data until they reach a point where they would naturally access the
 /// newly written parts.
-pub struct Tree<B: BufferStore, P: PageStore> {
-    root: Node,
+pub struct Tree<B: BufferStore, P: PageStore<B>> {
+    root: Node<B>,
     page_num: u64,
     buffer_store: B,
     page_store: P,
 }
 
-impl<B: BufferStore, P: PageStore> Tree<B, P> {
+impl<B: BufferStore, P: PageStore<B>> Tree<B, P> {
     /// Gets the value corresponding to the key.
     pub fn get(&self, key: &[u8]) -> Result<Option<Rc<[u8]>>> {
         match &self.root {
@@ -281,7 +281,7 @@ impl<B: BufferStore, P: PageStore> Tree<B, P> {
     /// If the fix failed, just leaves the child in an underflow state.
     fn try_fix_underflow(
         &self,
-        parent: &Internal,
+        parent: &Internal<B>,
         child: Self,
         child_idx: usize,
     ) -> Result<TreeEffect<B, P>> {
@@ -316,8 +316,8 @@ impl<B: BufferStore, P: PageStore> Tree<B, P> {
     /// one of its direct siblings.
     fn steal_or_merge(
         &self,
-        parent: &Internal,
-        child: &Node,
+        parent: &Internal<B>,
+        child: &Node<B>,
         child_idx: usize,
         sibling_idx: usize,
     ) -> Result<TreeEffect<B, P>> {
@@ -348,7 +348,7 @@ impl<B: BufferStore, P: PageStore> Tree<B, P> {
     }
 
     /// Allocates pages for the in-memory nodes created during an upsert.
-    fn alloc(&self, effect: NodeEffect) -> Result<TreeEffect<B, P>> {
+    fn alloc(&self, effect: NodeEffect<B>) -> Result<TreeEffect<B, P>> {
         match effect {
             NodeEffect::Empty => Ok(TreeEffect::Empty),
             NodeEffect::Intact(root) => {

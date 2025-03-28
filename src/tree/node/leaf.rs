@@ -4,26 +4,26 @@ use crate::tree::node::{self, NodeType, Result};
 
 /// An enum representing the effect of a leaf node operation.
 #[derive(Debug)]
-pub enum LeafEffect {
+pub enum LeafEffect<S: BufferStore> {
     /// A leaf with 0 keys after a delete was performed on it.
     /// This is a special-case of `Underflow` done to avoid unnecessary
     /// page allocations, since empty non-root nodes aren't allowed.
     Empty,
     /// A newly created leaf that remained  "intact", i.e. it did not split.
-    Intact(Leaf),
+    Intact(Leaf<S>),
     /// The left and right splits of a leaf that was created.
-    Split { left: Leaf, right: Leaf },
+    Split { left: Leaf<S>, right: Leaf<S> },
 }
 
-impl LeafEffect {
-    fn take_intact(self) -> Leaf {
+impl<S: BufferStore> LeafEffect<S> {
+    fn take_intact(self) -> Leaf<S> {
         match self {
             LeafEffect::Intact(leaf) => leaf,
             _ => panic!("{self:?} is not LeafEffect::Intact"),
         }
     }
 
-    fn take_split(self) -> (Leaf, Leaf) {
+    fn take_split(self) -> (Leaf<S>, Leaf<S>) {
         match self {
             LeafEffect::Split { left, right } => (left, right),
             _ => panic!("{self:?} is not LeafEffect::Split"),
@@ -89,7 +89,7 @@ impl LeafEffect {
         i: usize,
         cap: usize,
         store: &'a S,
-        buf: PooledBuf,
+        buf: PooledBuf<S>,
     }
 
     impl<'a, S: BufferStore> LeafBuilder<'a, S> {
@@ -138,7 +138,7 @@ impl LeafEffect {
         }
 
         /// Builds a leaf and optionally splits it if overflowed.
-        pub fn build(self) -> Result<LeafEffect> {
+        pub fn build(self) -> Result<LeafEffect<S>> {
             assert!(
                 self.i == self.num_keys,
                 "build() called after calling add_key_value() {} times < num_keys = {}",
@@ -160,7 +160,7 @@ impl LeafEffect {
         }
 
         /// Builds two splits of a leaf.
-        fn build_split(self) -> Result<(Leaf, Leaf)> {
+        fn build_split(self) -> Result<(Leaf<S>, Leaf<S>)> {
             let num_keys = self.num_keys as usize;
             let mut left_end: usize = 0;
             for i in 0..num_keys {
@@ -183,7 +183,7 @@ impl LeafEffect {
         }
 
         /// Builds a leaf.
-        fn build_single(self) -> Leaf {
+        fn build_single(self) -> Leaf<S> {
             assert!(get_num_bytes(&self.buf) <= node::PAGE_SIZE);
             Leaf { buf: self.buf }
         }
@@ -191,19 +191,19 @@ impl LeafEffect {
 
 /// A B+ tree leaf node.
 #[derive(Debug)]
-pub struct Leaf {
-    buf: PooledBuf,
+pub struct Leaf<S: BufferStore> {
+    buf: PooledBuf<S>,
 }
 
-impl Leaf {
-    pub fn new<S: BufferStore>(store: &S) -> Self {
+impl<S: BufferStore> Leaf<S> {
+    pub fn new(store: &S) -> Self {
         let mut buf = store.get_buf(node::PAGE_SIZE);
         node::set_page_header(&mut buf, NodeType::Leaf);
         Self { buf }
     }
 
     /// Inserts a key-value pair.
-    pub fn insert(&self, key: &[u8], val: &[u8]) -> Result<LeafEffect> {
+    pub fn insert(&self, key: &[u8], val: &[u8]) -> Result<LeafEffect<S>> {
         if key.len() > node::MAX_KEY_SIZE {
             return Err(NodeError::MaxKeySize(key.len()));
         }
@@ -215,7 +215,7 @@ impl Leaf {
         }
         let mut b = LeafBuilder::new(
             self.get_num_keys() + 1,
-            &self.buf.pool,
+            &self.buf.store,
             self.get_num_bytes() + 6 + key.len() + val.len() > node::PAGE_SIZE,
         );
         let mut added = false;
@@ -233,7 +233,7 @@ impl Leaf {
     }
 
     /// Updates the value corresponding to a key.
-    pub fn update(&self, key: &[u8], val: &[u8]) -> Result<LeafEffect> {
+    pub fn update(&self, key: &[u8], val: &[u8]) -> Result<LeafEffect<S>> {
         if key.len() > node::MAX_KEY_SIZE {
             return Err(NodeError::MaxKeySize(key.len()));
         }
@@ -245,7 +245,7 @@ impl Leaf {
             return Err(NodeError::KeyNotFound);
         }
         let old_val = old_val.unwrap();
-        let mut b = LeafBuilder::new(self.get_num_keys(), &self.buf.pool, self.get_num_bytes() - old_val.len() + val.len() > node::PAGE_SIZE);
+        let mut b = LeafBuilder::new(self.get_num_keys(), &self.buf.store, self.get_num_bytes() - old_val.len() + val.len() > node::PAGE_SIZE);
         let mut added = false;
         for (k, v) in self.iter() {
             if !added && key == k {
@@ -259,7 +259,7 @@ impl Leaf {
     }
 
     /// Deletes a key and its corresponding value.
-    pub fn delete(&self, key: &[u8]) -> Result<LeafEffect> {
+    pub fn delete(&self, key: &[u8]) -> Result<LeafEffect<S>> {
         if key.len() > node::MAX_KEY_SIZE {
             return Err(NodeError::MaxKeySize(key.len()));
         }
@@ -272,7 +272,7 @@ impl Leaf {
         if n == 1 {
             return Ok(LeafEffect::Empty);
         }
-        let mut b = LeafBuilder::new(n - 1, &self.buf.pool, false);
+        let mut b = LeafBuilder::new(n - 1, &self.buf.store, false);
         let mut added = false;
         for (k, v) in self.iter() {
             if !added && key == k {
@@ -289,10 +289,10 @@ impl Leaf {
         self.iter().find(|(k, _)| *k == key).map(|(_, v)| v)
     }
 
-    pub fn steal_or_merge(left: &Leaf, right: &Leaf) -> Result<LeafEffect> {
+    pub fn steal_or_merge(left: &Leaf<S>, right: &Leaf<S>) -> Result<LeafEffect<S>> {
         // TODO: Actually determine if it really needs overflow.
         let allow_overflow = true;
-        let mut b = LeafBuilder::new(left.get_num_keys() + right.get_num_keys(), &left.buf.pool, allow_overflow);
+        let mut b = LeafBuilder::new(left.get_num_keys() + right.get_num_keys(), &left.buf.store, allow_overflow);
         for (key, val) in left.iter() {
             b = b.add_key_value(key, val)?;
         }
@@ -310,7 +310,7 @@ impl Leaf {
         node::get_num_keys(&self.buf)
     }
 
-    pub fn iter<'a>(&'a self) -> LeafIterator<'a> {
+    pub fn iter<'a>(&'a self) -> LeafIterator<'a, S> {
         LeafIterator {
             node: self,
             i: 0,
@@ -327,21 +327,21 @@ impl Leaf {
     }
 }
 
-impl Clone for Leaf {
+impl<S: BufferStore> Clone for Leaf<S> {
     fn clone(&self) -> Self {
-        let buf = self.buf.pool.get_buf(self.buf.len());
+        let buf = self.buf.store.get_buf(self.buf.len());
         Self { buf }
     }
 }
 
 /// An key-value iterator for a leaf node.
-pub struct LeafIterator<'a> {
-    node: &'a Leaf,
+pub struct LeafIterator<'a, S: BufferStore> {
+    node: &'a Leaf<S>,
     i: usize,
     n: usize,
 }
 
-impl<'a> Iterator for LeafIterator<'a> {
+impl<'a, S: BufferStore> Iterator for LeafIterator<'a, S> {
     type Item = (&'a [u8], &'a [u8]);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -357,19 +357,19 @@ impl<'a> Iterator for LeafIterator<'a> {
 #[cfg(test)]
 mod tests {
     use std::sync::OnceLock;
-    use crate::tree::buffer_store::BufferPool;
+    use crate::tree::buffer_store::HeapStore;
     use crate::tree::node;
     use super::*;
 
-    static TEST_ARENA_POOL: OnceLock<BufferPool> = OnceLock::new();
+    static TEST_HEAP_STORE: OnceLock<HeapStore> = OnceLock::new();
 
-    fn pool() -> BufferPool {
-        TEST_ARENA_POOL.get_or_init(|| BufferPool::new(8)).clone()
+    fn store() -> HeapStore {
+        TEST_HEAP_STORE.get_or_init(|| HeapStore{}).clone()
     }
 
     #[test]
     fn insert_intact() {
-        let leaf = Leaf::new(&pool())
+        let leaf = Leaf::new(&store())
             .insert("hello".as_bytes(), "world".as_bytes())
             .unwrap()
             .take_intact();
@@ -379,14 +379,14 @@ mod tests {
     #[test]
     fn insert_max_key_size() {
         let key = &[0u8; node::MAX_KEY_SIZE + 1];
-        let result = Leaf::new(&pool()).insert(key, "val".as_bytes());
+        let result = Leaf::new(&store()).insert(key, "val".as_bytes());
         assert!(matches!(result, Err(NodeError::MaxKeySize(x)) if x == node::MAX_KEY_SIZE + 1));
     }
 
     #[test]
     fn insert_max_value_size() {
         let val = &[0u8; node::MAX_VALUE_SIZE + 1];
-        let result = Leaf::new(&pool()).insert("key".as_bytes(), val);
+        let result = Leaf::new(&store()).insert("key".as_bytes(), val);
         assert!(matches!(result, Err(NodeError::MaxValueSize(x)) if x == node::MAX_VALUE_SIZE + 1));
     }
 
@@ -395,7 +395,7 @@ mod tests {
         // Insert 1 huge key-value.
         let key1 = &[0u8; node::MAX_KEY_SIZE];
         let val1 = &[0u8; node::MAX_VALUE_SIZE];
-        let result = Leaf::new(&pool()).insert(key1, val1);
+        let result = Leaf::new(&store()).insert(key1, val1);
         assert!(matches!(result, Ok(LeafEffect::Intact(_))), "1st insert result: {result:?}");
         let leaf = result.unwrap().take_intact();
 

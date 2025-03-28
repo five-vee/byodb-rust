@@ -3,11 +3,12 @@
 //! Uses a bitmap to track free pages, allowing for dynamic allocation and
 //! implicit merging of freed blocks. Dereferencing pooled buffers does not lock the pool mutex.
 
+use crate::tree::node;
+use core::fmt;
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 use std::slice;
 use std::sync::{Arc, Mutex};
-use crate::tree::node;
 
 // --- Constants ---
 
@@ -117,7 +118,7 @@ impl PoolState {
     // but getting it under lock is simplest during initialization/allocation.
     fn get_base_ptr(&self) -> Option<NonNull<u8>> {
         NonNull::new(self.storage.as_ptr() as *mut u8)
-   }
+    }
 
     /// Scans the packed bitmap to find and allocate a free chunk of the appropriate size.
     fn get_chunk(&mut self, requested_size: usize) -> Option<(usize, usize)> {
@@ -133,7 +134,9 @@ impl PoolState {
     fn find_and_alloc_4k(&mut self) -> Option<(usize, usize)> {
         for word_idx in 0..self.bitmap.len() {
             let word = self.bitmap[word_idx];
-            if word == u64::MAX { continue; } // Skip full words
+            if word == u64::MAX {
+                continue;
+            } // Skip full words
 
             // `trailing_ones` gives the index of the first 0 bit.
             // If word != u64::MAX, there must be a 0 bit, so bit_idx < 64.
@@ -156,7 +159,9 @@ impl PoolState {
     fn find_and_alloc_8k(&mut self) -> Option<(usize, usize)> {
         for word_idx in 0..self.bitmap.len() {
             let word = self.bitmap[word_idx];
-            if word == u64::MAX { continue; } // Skip full words
+            if word == u64::MAX {
+                continue;
+            } // Skip full words
 
             let available_pairs = !word & (!word >> 1);
             if available_pairs == 0 {
@@ -195,11 +200,13 @@ impl PoolState {
         None // Not found after checking all words
     }
 
-
     /// Marks the corresponding pages in the packed bitmap as free (sets bits to 0).
     fn return_chunk(&mut self, byte_index: usize, size: usize) {
         // Validate inputs (basic checks)
-        assert!(byte_index % PAGE_SIZE == 0, "Returned index not page aligned");
+        assert!(
+            byte_index % PAGE_SIZE == 0,
+            "Returned index not page aligned"
+        );
         assert!(
             size == PAGE_SIZE || size == LARGE_PAGE_SIZE,
             "Invalid size returned"
@@ -234,7 +241,7 @@ impl PoolState {
                     current_page_idx
                 );
             } else {
-                 // Mark as free (clear the bit)
+                // Mark as free (clear the bit)
                 self.bitmap[word_idx] &= !mask;
             }
         }
@@ -252,8 +259,9 @@ impl PoolState {
 }
 
 // --- Public Pool Structure ---
-pub trait BufferStore : Clone {
-    fn get_buf(&self, requested_size: usize) -> PooledBuf;
+pub trait BufferStore: Clone + fmt::Debug {
+    fn get_buf(&self, requested: usize) -> PooledBuf<Self>;
+    fn return_chunk(&self, index: usize, size: usize);
 }
 
 /// A thread-safe memory pool managing fixed-size buffers (`4KB` or `8KB`).
@@ -279,6 +287,61 @@ impl BufferPool {
         let state = self.state.lock().unwrap();
         state.get_stats()
     }
+}
+
+impl BufferStore for BufferPool {
+    /// Gets a buffer from the pool, preferring the pool, falling back to the heap.
+    fn get_buf(&self, requested: usize) -> PooledBuf<Self> {
+        assert!(
+            requested > 0 && requested <= LARGE_PAGE_SIZE,
+            "Requested buffer size ({}) invalid or exceeds maximum ({})",
+            requested,
+            LARGE_PAGE_SIZE
+        );
+
+        {
+            // Lock scope for allocation attempt
+            let mut state = self.state.lock().unwrap();
+            if let Some((index, actual_size)) = state.get_chunk(requested) {
+                // Get base pointer *once* under lock
+                if let Some(base_ptr) = state.get_base_ptr() {
+                    let origin = BufferOrigin::Pool {
+                        index,
+                        size: actual_size,
+                        base_ptr: PoolBasePtr(base_ptr), // Store wrapped NonNull ptr
+                    };
+                    return PooledBuf {
+                        store: self.clone(),
+                        origin,
+                    };
+                } else {
+                    // This should ideally not happen if storage exists
+                    eprintln!("Error: Failed to get base pointer from storage!");
+                    // Fall through to heap allocation as a safe fallback
+                    state.record_heap_alloc(); // Record even if base_ptr failed
+                }
+            } else {
+                state.record_heap_alloc(); // Record heap fallback if chunk not found
+            }
+        } // Lock released
+
+        // --- Heap Fallback ---
+        let alloc_size = if requested <= PAGE_SIZE {
+            PAGE_SIZE
+        } else {
+            LARGE_PAGE_SIZE
+        };
+        println!(
+            "Buffer pool falling back to HEAP allocation for size {} (requested {})",
+            alloc_size, requested
+        );
+        let heap_data = vec![0u8; alloc_size].into_boxed_slice();
+        let origin = BufferOrigin::Heap { data: heap_data };
+        PooledBuf {
+            store: self.clone(),
+            origin,
+        }
+    }
 
     /// Used internally by PooledBuf Drop for Pool buffers.
     fn return_chunk(&self, index: usize, size: usize) {
@@ -287,48 +350,27 @@ impl BufferPool {
     }
 }
 
-impl BufferStore for BufferPool {
-     /// Gets a buffer from the pool, preferring the pool, falling back to the heap.
-     fn get_buf(&self, requested_size: usize) -> PooledBuf {
-        assert!(
-            requested_size > 0 && requested_size <= LARGE_PAGE_SIZE,
-            "Requested buffer size ({}) invalid or exceeds maximum ({})",
-            requested_size,
+#[derive(Clone, Debug)]
+pub struct HeapStore {}
+
+impl BufferStore for HeapStore {
+    fn get_buf(&self, requested: usize) -> PooledBuf<Self> {
+        let alloc_size = if requested <= PAGE_SIZE {
+            PAGE_SIZE
+        } else if requested <= LARGE_PAGE_SIZE {
             LARGE_PAGE_SIZE
-        );
-
-        { // Lock scope for allocation attempt
-            let mut state = self.state.lock().unwrap();
-            if let Some((index, actual_size)) = state.get_chunk(requested_size) {
-                // Get base pointer *once* under lock
-                if let Some(base_ptr) = state.get_base_ptr() {
-                     let origin = BufferOrigin::Pool {
-                        index,
-                        size: actual_size,
-                        base_ptr: PoolBasePtr(base_ptr), // Store wrapped NonNull ptr
-                    };
-                    return PooledBuf { pool: self.clone(), origin };
-                } else {
-                    // This should ideally not happen if storage exists
-                    eprintln!("Error: Failed to get base pointer from storage!");
-                    // Fall through to heap allocation as a safe fallback
-                     state.record_heap_alloc(); // Record even if base_ptr failed
-                }
-            } else {
-                 state.record_heap_alloc(); // Record heap fallback if chunk not found
-            }
-        } // Lock released
-
-        // --- Heap Fallback ---
-        let alloc_size = if requested_size <= PAGE_SIZE { PAGE_SIZE } else { LARGE_PAGE_SIZE };
-        println!(
-            "Buffer pool falling back to HEAP allocation for size {} (requested {})",
-            alloc_size, requested_size
-        );
+        } else {
+            panic!("HeapStore doesn't support buffer size > {LARGE_PAGE_SIZE}");
+        };
         let heap_data = vec![0u8; alloc_size].into_boxed_slice();
         let origin = BufferOrigin::Heap { data: heap_data };
-        PooledBuf { pool: self.clone(), origin }
+        PooledBuf {
+            store: self.clone(),
+            origin,
+        }
     }
+
+    fn return_chunk(&self, _index: usize, _size: usize) {}
 }
 
 // --- Public Buffer Handle ---
@@ -342,19 +384,20 @@ impl BufferStore for BufferPool {
 /// When `PooledBuf` is dropped, it automatically returns the memory to the
 /// pool's free list or lets the heap allocation be freed, respectively.
 #[derive(Debug)]
-pub struct PooledBuf {
-    pub pool: BufferPool,
+pub struct PooledBuf<B: BufferStore> {
+    pub store: B,
     /// Tracks the origin (Pool or Heap) and holds necessary data for management.
     origin: BufferOrigin,
 }
 
-impl Drop for PooledBuf {
+impl<B: BufferStore> Drop for PooledBuf<B> {
     /// Returns the buffer to the pool or frees heap memory.
     /// Acquires pool lock if Pool.
     fn drop(&mut self) {
         match &mut self.origin {
-            BufferOrigin::Pool { index, size , .. } => { // base_ptr not needed for drop
-                self.pool.return_chunk(*index, *size);
+            BufferOrigin::Pool { index, size, .. } => {
+                // base_ptr not needed for drop
+                self.store.return_chunk(*index, *size);
             }
             BufferOrigin::Heap { .. } => {} // Box drops automatically
         }
@@ -363,17 +406,21 @@ impl Drop for PooledBuf {
 
 // --- Deref / DerefMut ---
 
-impl Deref for PooledBuf {
+impl<B: BufferStore> Deref for PooledBuf<B> {
     type Target = [u8];
     /// Provides immutable access to the buffer's byte slice.
     fn deref(&self) -> &Self::Target {
         match &self.origin {
-            BufferOrigin::Pool { index, size, base_ptr } => {
+            BufferOrigin::Pool {
+                index,
+                size,
+                base_ptr,
+            } => {
                 // Get pointer directly from the stored base_ptr
                 let ptr = unsafe { base_ptr.0.as_ptr().add(*index) }; // Use NonNull::as_ptr()
-                // SAFETY: Pointer validity relies on Arc keeping pool alive,
-                // index/size correctness relies on allocator logic.
-                // Concurrent reads are safe.
+                                                                      // SAFETY: Pointer validity relies on Arc keeping pool alive,
+                                                                      // index/size correctness relies on allocator logic.
+                                                                      // Concurrent reads are safe.
                 unsafe { slice::from_raw_parts(ptr, *size) }
             }
             BufferOrigin::Heap { data, .. } => data.deref(),
@@ -381,11 +428,15 @@ impl Deref for PooledBuf {
     }
 }
 
-impl DerefMut for PooledBuf {
+impl<B: BufferStore> DerefMut for PooledBuf<B> {
     /// Provides mutable access to the buffer's byte slice.
     fn deref_mut(&mut self) -> &mut Self::Target {
         match &mut self.origin {
-            BufferOrigin::Pool { index, size, base_ptr } => {
+            BufferOrigin::Pool {
+                index,
+                size,
+                base_ptr,
+            } => {
                 // Get pointer directly from the stored base_ptr
                 let ptr = unsafe { base_ptr.0.as_ptr().add(*index) };
                 // SAFETY: Pointer validity relies on Arc keeping pool alive.
@@ -400,7 +451,7 @@ impl DerefMut for PooledBuf {
 }
 
 // --- Public Methods for PooledBuf ---
-impl PooledBuf {
+impl<B: BufferStore> PooledBuf<B> {
     /// Returns a string indicating the origin of the buffer's memory ("Pool" or "Heap").
     pub fn origin_type(&self) -> &'static str {
         match &self.origin {
@@ -448,7 +499,7 @@ mod tests {
         assert_eq!(pool.get_stats().heap_allocs, 0);
     }
 
-     #[test]
+    #[test]
     fn data_integrity() {
         let pool = BufferPool::new(4);
         let mut buf = pool.get_buf(PAGE_SIZE);
@@ -464,7 +515,9 @@ mod tests {
 
         // Test with large buffer too
         let mut buf_large = pool.get_buf(LARGE_PAGE_SIZE);
-        let data_to_write_large: Vec<u8> = (0..LARGE_PAGE_SIZE).map(|i| ((i * 3) % 256) as u8).collect();
+        let data_to_write_large: Vec<u8> = (0..LARGE_PAGE_SIZE)
+            .map(|i| ((i * 3) % 256) as u8)
+            .collect();
         buf_large.copy_from_slice(&data_to_write_large);
         let data_read_large: Vec<u8> = buf_large.to_vec();
         assert_eq!(data_read_large, data_to_write_large);
@@ -490,7 +543,7 @@ mod tests {
         assert_eq!(pool.get_stats().heap_allocs, 0);
     }
 
-     #[test]
+    #[test]
     fn pool_exhaustion_heap_fallback() {
         let pool = BufferPool::new(2); // 2 pages
 
@@ -546,10 +599,10 @@ mod tests {
     fn mixed_size_allocations() {
         let pool = BufferPool::new(5); // 5 pages
 
-        let _buf1_4k = pool.get_buf(PAGE_SIZE);       // Page 0
+        let _buf1_4k = pool.get_buf(PAGE_SIZE); // Page 0
         let _buf2_8k = pool.get_buf(LARGE_PAGE_SIZE); // Pages 1, 2
-        let _buf3_4k = pool.get_buf(PAGE_SIZE);       // Page 3
-        // Page 4 is free
+        let _buf3_4k = pool.get_buf(PAGE_SIZE); // Page 3
+                                                // Page 4 is free
 
         assert_eq!(pool.get_stats().pool_allocs_4k, 2);
         assert_eq!(pool.get_stats().pool_allocs_8k, 1);
@@ -579,9 +632,9 @@ mod tests {
     fn fragmentation_reuse() {
         let pool = BufferPool::new(4); // 4 pages
 
-        let buf1_4k = pool.get_buf(PAGE_SIZE);       // Page 0
+        let buf1_4k = pool.get_buf(PAGE_SIZE); // Page 0
         let buf2_8k = pool.get_buf(LARGE_PAGE_SIZE); // Pages 1, 2
-        let buf3_4k = pool.get_buf(PAGE_SIZE);       // Page 3
+        let buf3_4k = pool.get_buf(PAGE_SIZE); // Page 3
         assert_eq!(pool.get_stats().pool_allocs_4k, 2);
         assert_eq!(pool.get_stats().pool_allocs_8k, 1);
 
@@ -597,7 +650,7 @@ mod tests {
         // Keep buf1, buf3, buf4 - pages 0, 1, 2, 3 are allocated
         drop(buf1_4k); // Page 0 free
         drop(buf3_4k); // Page 3 free
-        // Pages 1, 2 still held by buf4_8k
+                       // Pages 1, 2 still held by buf4_8k
 
         // Allocate 4k - should use page 0
         let buf5_4k = pool.get_buf(PAGE_SIZE);
@@ -615,7 +668,7 @@ mod tests {
         assert_eq!(pool.get_stats().heap_allocs, 1);
     }
 
-     #[test]
+    #[test]
     fn stats_accuracy() {
         let pool = BufferPool::new(3); // 3 pages
 
@@ -670,7 +723,8 @@ mod tests {
         let pool = BufferPool::new(10); // 10 pages
         let mut handles = vec![];
 
-        for _ in 0..5 { // Spawn 5 threads
+        for _ in 0..5 {
+            // Spawn 5 threads
             let pool_clone = pool.clone();
             handles.push(thread::spawn(move || {
                 let _buf1 = pool_clone.get_buf(PAGE_SIZE);
@@ -701,18 +755,19 @@ mod tests {
         // --- Simpler Thread Safety Check ---
         let pool_ts = BufferPool::new(20); // Larger pool (20 pages)
         let mut handles_ts = vec![];
-        for i in 0..10 { // 10 threads
-             let pool_clone_ts = pool_ts.clone();
-             handles_ts.push(thread::spawn(move || {
-                 if i % 2 == 0 {
-                     pool_clone_ts.get_buf(PAGE_SIZE) // Allocate 4k
-                 } else {
-                     pool_clone_ts.get_buf(LARGE_PAGE_SIZE) // Allocate 8k
-                 }
-                 // Drop happens implicitly
-             }));
+        for i in 0..10 {
+            // 10 threads
+            let pool_clone_ts = pool_ts.clone();
+            handles_ts.push(thread::spawn(move || {
+                if i % 2 == 0 {
+                    pool_clone_ts.get_buf(PAGE_SIZE) // Allocate 4k
+                } else {
+                    pool_clone_ts.get_buf(LARGE_PAGE_SIZE) // Allocate 8k
+                }
+                // Drop happens implicitly
+            }));
         }
-         for handle in handles_ts {
+        for handle in handles_ts {
             handle.join().unwrap();
         }
 

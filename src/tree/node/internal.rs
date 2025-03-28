@@ -5,27 +5,27 @@ use crate::tree::node::{self, NodeType, Result};
 
 /// An enum representing the effect of an internal node operation.
 #[derive(Debug)]
-pub enum InternalEffect {
+pub enum InternalEffect<S: BufferStore> {
     /// An internal node with 0 keys after a delete was performed on it.
     /// This is a special-case of `Underflow` done to avoid unnecessary
     /// page allocations, since empty non-root nodes aren't allowed.
     Empty,
     /// A newly created internal node that remained  "intact",
     /// i.e. it did not split.
-    Intact(Internal),
+    Intact(Internal<S>),
     /// The left and right splits of an internal node that was created.
-    Split { left: Internal, right: Internal },
+    Split { left: Internal<S>, right: Internal<S> },
 }
 
-impl InternalEffect {
-    fn take_intact(self) -> Internal {
+impl<S: BufferStore> InternalEffect<S> {
+    fn take_intact(self) -> Internal<S> {
         match self {
             InternalEffect::Intact(internal) => internal,
             _ => panic!("{self:?} is not InternalEffect::Intact"),
         }
     }
 
-    fn take_split(self) -> (Internal, Internal) {
+    fn take_split(self) -> (Internal<S>, Internal<S>) {
         match self {
             InternalEffect::Split { left, right } => (left, right),
             _ => panic!("{self:?} is not InternalEffect::Split"),
@@ -111,7 +111,7 @@ pub struct InternalBuilder<'a, S: BufferStore> {
     i: usize,
     cap: usize,
     store: &'a S,
-    buf: PooledBuf,
+    buf: PooledBuf<S>,
 }
 
 impl<'a, S: BufferStore> InternalBuilder<'a, S> {
@@ -160,7 +160,7 @@ impl<'a, S: BufferStore> InternalBuilder<'a, S> {
     }
 
     /// Builds an internal node and optionally splits it if overflowed.
-    pub fn build(self) -> Result<InternalEffect> {
+    pub fn build(self) -> Result<InternalEffect<S>> {
         assert!(
             self.i == self.num_keys,
             "build() called after calling add_child_entry() {} times < num_keys = {}",
@@ -175,7 +175,7 @@ impl<'a, S: BufferStore> InternalBuilder<'a, S> {
     }
 
     /// Builds an internal node.
-    fn build_single(self) -> Internal {
+    fn build_single(self) -> Internal<S> {
         assert!(
             self.i == self.num_keys,
             "build_single() called after calling add_child_entry() {} times < num_keys = {}",
@@ -187,7 +187,7 @@ impl<'a, S: BufferStore> InternalBuilder<'a, S> {
     }
 
     /// Builds two splits of an internal node.
-    fn build_split(self) -> Result<(Internal, Internal)> {
+    fn build_split(self) -> Result<(Internal<S>, Internal<S>)> {
         let num_keys = self.num_keys as usize;
         let mut left_end: usize = 0;
         for i in 0..num_keys {
@@ -212,16 +212,16 @@ impl<'a, S: BufferStore> InternalBuilder<'a, S> {
 
 /// A B+ tree internal node.
 #[derive(Debug)]
-pub struct Internal {
-    buf: PooledBuf,
+pub struct Internal<S: BufferStore> {
+    buf: PooledBuf<S>,
 }
 
-impl Internal {
+impl<S: BufferStore> Internal<S> {
     /// Creates an internal node that is the parent of two splits.
     pub fn parent_of_split(
         keys: [&[u8]; 2],
         child_pointers: [u64; 2],
-        store: &impl BufferStore,
+        store: &S,
     ) -> Result<Self> {
         let parent = InternalBuilder::new(2, store, false)
             .add_child_entry(keys[0], child_pointers[0])?
@@ -232,7 +232,7 @@ impl Internal {
     }
 
     /// Merges child entries into the internal node.
-    pub fn merge_child_entries(&self, entries: &[ChildEntry]) -> Result<InternalEffect> {
+    pub fn merge_child_entries(&self, entries: &[ChildEntry]) -> Result<InternalEffect<S>> {
         let extra = entries
             .iter()
             .filter(|ce| {
@@ -245,7 +245,7 @@ impl Internal {
             .count();
         let mut b = InternalBuilder::new(
             self.get_num_keys() + extra,
-            &self.buf.pool,
+            &self.buf.store,
             extra > 0,
         );
         let mut entries_iter = entries.iter();
@@ -283,12 +283,12 @@ impl Internal {
         b.build()
     }
 
-    pub fn steal_or_merge(left: &Internal, right: &Internal) -> Result<InternalEffect> {
+    pub fn steal_or_merge(left: &Internal<S>, right: &Internal<S>) -> Result<InternalEffect<S>> {
         // TODO: Actually determine if overflow is needed.
         let allow_overflow = true;
         let mut b = InternalBuilder::new(
             left.get_num_keys() + right.get_num_keys(),
-            &left.buf.pool,
+            &left.buf.store,
             allow_overflow,
         );
         for (key, page_num) in left.iter() {
@@ -321,7 +321,7 @@ impl Internal {
     }
 
     /// Creates an key-value iterator for the internal node.
-    pub fn iter<'a>(&'a self) -> InternalIterator<'a> {
+    pub fn iter<'a>(&'a self) -> InternalIterator<'a, S> {
         InternalIterator {
             node: self,
             i: 0,
@@ -330,21 +330,21 @@ impl Internal {
     }
 }
 
-impl Clone for Internal {
+impl<S: BufferStore> Clone for Internal<S> {
     fn clone(&self) -> Self {
-        let buf = self.buf.pool.get_buf(self.buf.len());
+        let buf = self.buf.store.get_buf(self.buf.len());
         Self { buf }
     }
 }
 
 /// A key-value iterator of an internal node.
-pub struct InternalIterator<'a> {
-    node: &'a Internal,
+pub struct InternalIterator<'a, S: BufferStore> {
+    node: &'a Internal<S>,
     i: usize,
     n: usize,
 }
 
-impl<'a> Iterator for InternalIterator<'a> {
+impl<'a, S: BufferStore> Iterator for InternalIterator<'a, S> {
     type Item = (&'a [u8], u64);
 
     fn next(&mut self) -> Option<Self::Item> {
