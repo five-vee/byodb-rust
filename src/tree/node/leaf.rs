@@ -357,14 +357,14 @@ impl<'a> Iterator for LeafIterator<'a> {
 #[cfg(test)]
 mod tests {
     use std::sync::OnceLock;
-    use crate::tree::buffer_store::ArenaPool;
+    use crate::tree::buffer_store::BufferPool;
     use crate::tree::node;
     use super::*;
 
-    static TEST_ARENA_POOL: OnceLock<ArenaPool> = OnceLock::new();
+    static TEST_ARENA_POOL: OnceLock<BufferPool> = OnceLock::new();
 
-    fn pool() -> ArenaPool {
-        TEST_ARENA_POOL.get_or_init(|| ArenaPool::new(8)).clone()
+    fn pool() -> BufferPool {
+        TEST_ARENA_POOL.get_or_init(|| BufferPool::new(8)).clone()
     }
 
     #[test]
