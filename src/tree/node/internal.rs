@@ -118,7 +118,6 @@ pub struct InternalBuilder<'a, B: BufferStore> {
 impl<'a, B: BufferStore> InternalBuilder<'a, B> {
     /// Creates a new internal builder.
     pub fn new(num_keys: usize, store: &'a B, allow_overflow: bool) -> Self {
-        assert!(num_keys >= 2, "An internal node must have at least 2 keys.");
         let (mut buf, cap) = if allow_overflow {
             (store.get_buf(node::PAGE_SIZE * 2), 2 * node::PAGE_SIZE - 4)
         } else {
@@ -305,6 +304,8 @@ impl<B: BufferStore> Internal<B> {
         b.build()
     }
 
+    /// Resolves underflow of either `left` or `right` by either having one
+    /// steal from the other, or merging the two.
     pub fn steal_or_merge(left: &Internal<B>, right: &Internal<B>) -> Result<InternalEffect<B>> {
         // TODO: Actually determine if overflow is needed.
         let allow_overflow = true;
@@ -323,8 +324,14 @@ impl<B: BufferStore> Internal<B> {
     }
 
     /// Finds the index of the child that contains the key.
-    pub fn find(&self, key: &[u8]) -> Option<usize> {
-        (self.get_num_keys() - 1..=0).find(|i| self.get_key(*i) <= key)
+    pub fn find(&self, key: &[u8]) -> usize {
+        let n = self.get_num_keys();
+        assert!(n != 0);
+        (1..n)
+            .rev()
+            .find(|i| self.get_key(*i) <= key)
+            .or(Some(0))
+            .unwrap()
     }
 
     /// Gets the child pointer at an index.
@@ -521,5 +528,89 @@ mod tests {
                 (&[4; node::MAX_KEY_SIZE][..], 4),
             ]
         );
+    }
+
+    #[test]
+    fn steal_or_merge_steal() {
+        let left = InternalBuilder::new(1, &TEST_HEAP_STORE, false)
+            .add_child_entry(&[1; node::MAX_KEY_SIZE], 1)
+            .unwrap()
+            .build()
+            .unwrap()
+            .take_intact();
+        let right = InternalBuilder::new(4, &TEST_HEAP_STORE, false)
+            .add_child_entry(&[2; node::MAX_KEY_SIZE], 2)
+            .unwrap()
+            .add_child_entry(&[3; node::MAX_KEY_SIZE], 3)
+            .unwrap()
+            .add_child_entry(&[4; node::MAX_KEY_SIZE], 4)
+            .unwrap()
+            .add_child_entry(&[5; node::MAX_KEY_SIZE], 5)
+            .unwrap()
+            .build()
+            .unwrap()
+            .take_intact();
+
+        let (left, right) = Internal::steal_or_merge(&left, &right)
+            .unwrap()
+            .take_split();
+        assert!(left.get_num_keys() >= 2);
+        assert!(right.get_num_keys() >= 2);
+        assert!(right.get_num_keys() < 4);
+        let chained = left.iter().chain(right.iter()).collect::<Vec<_>>();
+        assert_eq!(
+            chained,
+            vec![
+                (&[1; node::MAX_KEY_SIZE][..], 1),
+                (&[2; node::MAX_KEY_SIZE][..], 2),
+                (&[3; node::MAX_KEY_SIZE][..], 3),
+                (&[4; node::MAX_KEY_SIZE][..], 4),
+                (&[5; node::MAX_KEY_SIZE][..], 5),
+            ]
+        );
+    }
+
+    #[test]
+    fn steal_or_merge_merge() {
+        let left = InternalBuilder::new(1, &TEST_HEAP_STORE, false)
+            .add_child_entry(&[1], 1)
+            .unwrap()
+            .build()
+            .unwrap()
+            .take_intact();
+        let right = InternalBuilder::new(2, &TEST_HEAP_STORE, false)
+            .add_child_entry(&[2], 2)
+            .unwrap()
+            .add_child_entry(&[3], 3)
+            .unwrap()
+            .build()
+            .unwrap()
+            .take_intact();
+
+        let merged = Internal::steal_or_merge(&left, &right)
+            .unwrap()
+            .take_intact();
+        assert!(merged.get_num_keys() >= 2);
+        assert_eq!(
+            merged.iter().collect::<Vec<_>>(),
+            vec![(&[1][..], 1), (&[2][..], 2), (&[3][..], 3),]
+        );
+    }
+
+    #[test]
+    fn find() {
+        let node = InternalBuilder::new(2, &TEST_HEAP_STORE, false)
+            .add_child_entry(&[1], 1)
+            .unwrap()
+            .add_child_entry(&[2], 2)
+            .unwrap()
+            .build()
+            .unwrap()
+            .take_intact();
+        assert_eq!(node.find(&[1]), 0);
+        assert_eq!(node.find(&[3]), 1);
+        
+        // This works b/c we'd want to be able to insert &[0] into the 0-th child.
+        assert_eq!(node.find(&[0]), 0);
     }
 }

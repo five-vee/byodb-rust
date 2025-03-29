@@ -101,9 +101,7 @@ impl<P: PageStore> Tree<P> {
     pub fn get(&self, key: &[u8]) -> Result<Option<Rc<[u8]>>> {
         match &self.root {
             Node::Internal(root) => {
-                let child_idx = root
-                    .find(key)
-                    .map_or_else(|| Err(TreeError::KeyNotFound), |i| Ok(i))?;
+                let child_idx = root.find(key);
                 let child_num = root.get_child_pointer(child_idx);
                 let child = self.page_store.read_page(child_num)?;
                 let child = Self {
@@ -138,9 +136,7 @@ impl<P: PageStore> Tree<P> {
             // Recursive case
             Node::Internal(internal) => {
                 // Find which child to recursively insert into.
-                let child_idx = internal
-                    .find(key)
-                    .map_or_else(|| Err(TreeError::KeyNotFound), |i| Ok(i))?;
+                let child_idx = internal.find(key);
                 let child_num = internal.get_child_pointer(child_idx);
                 let child = self.page_store.read_page(child_num)?;
                 let child = Self {
@@ -176,9 +172,7 @@ impl<P: PageStore> Tree<P> {
             // Recursive case
             Node::Internal(internal) => {
                 // Find which child to recursively update at.
-                let child_idx = internal
-                    .find(key)
-                    .map_or_else(|| Err(TreeError::KeyNotFound), |i| Ok(i))?;
+                let child_idx = internal.find(key);
                 let child_num = internal.get_child_pointer(child_idx);
                 let child = self.page_store.read_page(child_num)?;
                 let child = Self {
@@ -223,9 +217,7 @@ impl<P: PageStore> Tree<P> {
             // Recursive case
             Node::Internal(parent) => {
                 // Find which child to recursively delete from.
-                let child_idx = parent
-                    .find(key)
-                    .map_or_else(|| Err(TreeError::KeyNotFound), |i| Ok(i))?;
+                let child_idx = parent.find(key);
                 let child_num = parent.get_child_pointer(child_idx);
                 let child = self.page_store.read_page(child_num)?;
                 let child = Self {
