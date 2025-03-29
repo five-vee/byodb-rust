@@ -260,21 +260,22 @@ impl PoolState {
 
 // --- Public Pool Structure ---
 pub trait BufferStore: Clone + fmt::Debug {
-    fn get_buf(&self, requested: usize) -> PooledBuf<Self>;
-    fn return_chunk(&self, index: usize, size: usize);
+    type B: Buffer;
+
+    fn get_buf(&self, requested: usize) -> Self::B;
 }
 
 /// A thread-safe memory pool managing fixed-size buffers (`4KB` or `8KB`).
 /// Uses a bitmap allocator over a pre-allocated memory pool.
 #[derive(Clone, Debug)]
-pub struct BufferPool {
+pub struct Pool {
     state: Arc<Mutex<PoolState>>,
 }
 // Mark as Send + Sync because PoolState is Send (contains Box, Vec<bool>, usize, Stats)
-unsafe impl Send for BufferPool {}
-unsafe impl Sync for BufferPool {}
+unsafe impl Send for Pool {}
+unsafe impl Sync for Pool {}
 
-impl BufferPool {
+impl Pool {
     /// Creates a new pool with a pool sized for `num_pages` of `PAGE_SIZE`.
     pub fn new(num_pages: usize) -> Self {
         Self {
@@ -287,11 +288,19 @@ impl BufferPool {
         let state = self.state.lock().unwrap();
         state.get_stats()
     }
+
+    /// Used internally by PooledBuf Drop for Pool buffers.
+    fn return_chunk(&self, index: usize, size: usize) {
+        let mut state = self.state.lock().unwrap();
+        state.return_chunk(index, size);
+    }
 }
 
-impl BufferStore for BufferPool {
+impl BufferStore for Pool {
+    type B = PoolBuffer;
+
     /// Gets a buffer from the pool, preferring the pool, falling back to the heap.
-    fn get_buf(&self, requested: usize) -> PooledBuf<Self> {
+    fn get_buf(&self, requested: usize) -> Self::B {
         assert!(
             requested > 0 && requested <= LARGE_PAGE_SIZE,
             "Requested buffer size ({}) invalid or exceeds maximum ({})",
@@ -310,8 +319,8 @@ impl BufferStore for BufferPool {
                         size: actual_size,
                         base_ptr: PoolBasePtr(base_ptr), // Store wrapped NonNull ptr
                     };
-                    return PooledBuf {
-                        store: self.clone(),
+                    return PoolBuffer {
+                        pool: self.clone(),
                         origin,
                     };
                 } else {
@@ -337,24 +346,20 @@ impl BufferStore for BufferPool {
         );
         let heap_data = vec![0u8; alloc_size].into_boxed_slice();
         let origin = BufferOrigin::Heap { data: heap_data };
-        PooledBuf {
-            store: self.clone(),
+        PoolBuffer {
+            pool: self.clone(),
             origin,
         }
-    }
-
-    /// Used internally by PooledBuf Drop for Pool buffers.
-    fn return_chunk(&self, index: usize, size: usize) {
-        let mut state = self.state.lock().unwrap();
-        state.return_chunk(index, size);
     }
 }
 
 #[derive(Clone, Debug)]
-pub struct HeapStore {}
+pub struct Heap {}
 
-impl BufferStore for HeapStore {
-    fn get_buf(&self, requested: usize) -> PooledBuf<Self> {
+impl BufferStore for Heap {
+    type B = HeapBuffer;
+
+    fn get_buf(&self, requested: usize) -> Self::B {
         let alloc_size = if requested <= PAGE_SIZE {
             PAGE_SIZE
         } else if requested <= LARGE_PAGE_SIZE {
@@ -362,18 +367,36 @@ impl BufferStore for HeapStore {
         } else {
             panic!("HeapStore doesn't support buffer size > {LARGE_PAGE_SIZE}");
         };
-        let heap_data = vec![0u8; alloc_size].into_boxed_slice();
-        let origin = BufferOrigin::Heap { data: heap_data };
-        PooledBuf {
-            store: self.clone(),
-            origin,
+        HeapBuffer{
+            buf: vec![0u8; alloc_size].into_boxed_slice(),
         }
     }
-
-    fn return_chunk(&self, _index: usize, _size: usize) {}
 }
 
-// --- Public Buffer Handle ---
+// --- Private Buffer Handle ---
+
+trait Buffer : fmt::Debug + Deref<Target = [u8]> + DerefMut<Target = [u8]> {}
+
+#[derive(Debug)]
+pub struct HeapBuffer {
+    buf: Box<[u8]>,
+}
+
+impl Deref for HeapBuffer {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.buf.deref()
+    }
+}
+
+impl DerefMut for HeapBuffer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.buf.deref_mut()
+    }
+}
+
+impl Buffer for HeapBuffer {}
 
 /// A smart pointer representing a buffer allocated from a [`BufferPool`].
 ///
@@ -384,20 +407,20 @@ impl BufferStore for HeapStore {
 /// When `PooledBuf` is dropped, it automatically returns the memory to the
 /// pool's free list or lets the heap allocation be freed, respectively.
 #[derive(Debug)]
-pub struct PooledBuf<B: BufferStore> {
-    pub store: B,
+pub struct PoolBuffer {
+    pub pool: Pool,
     /// Tracks the origin (Pool or Heap) and holds necessary data for management.
     origin: BufferOrigin,
 }
 
-impl<B: BufferStore> Drop for PooledBuf<B> {
+impl Drop for PoolBuffer {
     /// Returns the buffer to the pool or frees heap memory.
     /// Acquires pool lock if Pool.
     fn drop(&mut self) {
         match &mut self.origin {
             BufferOrigin::Pool { index, size, .. } => {
                 // base_ptr not needed for drop
-                self.store.return_chunk(*index, *size);
+                self.pool.return_chunk(*index, *size);
             }
             BufferOrigin::Heap { .. } => {} // Box drops automatically
         }
@@ -406,7 +429,7 @@ impl<B: BufferStore> Drop for PooledBuf<B> {
 
 // --- Deref / DerefMut ---
 
-impl<B: BufferStore> Deref for PooledBuf<B> {
+impl Deref for PoolBuffer {
     type Target = [u8];
     /// Provides immutable access to the buffer's byte slice.
     fn deref(&self) -> &Self::Target {
@@ -428,7 +451,7 @@ impl<B: BufferStore> Deref for PooledBuf<B> {
     }
 }
 
-impl<B: BufferStore> DerefMut for PooledBuf<B> {
+impl DerefMut for PoolBuffer {
     /// Provides mutable access to the buffer's byte slice.
     fn deref_mut(&mut self) -> &mut Self::Target {
         match &mut self.origin {
@@ -450,25 +473,23 @@ impl<B: BufferStore> DerefMut for PooledBuf<B> {
     }
 }
 
-// --- Public Methods for PooledBuf ---
-impl<B: BufferStore> PooledBuf<B> {
-    /// Returns a string indicating the origin of the buffer's memory ("Pool" or "Heap").
-    pub fn origin_type(&self) -> &'static str {
+impl PoolBuffer {
+    fn origin_type(&self) -> &'static str {
         match &self.origin {
             BufferOrigin::Pool { .. } => "Pool",
             BufferOrigin::Heap { .. } => "Heap",
         }
     }
 
-    /// Returns the total capacity of the underlying allocated buffer
-    /// (either [`PAGE_SIZE`] or [`LARGE_PAGE_SIZE`]).
-    pub fn capacity(&self) -> usize {
+    fn capacity(&self) -> usize {
         match &self.origin {
             BufferOrigin::Pool { size, .. } => *size,
             BufferOrigin::Heap { data, .. } => data.len(),
         }
     }
 }
+
+impl Buffer for PoolBuffer {}
 
 #[cfg(test)]
 mod tests {
@@ -477,7 +498,7 @@ mod tests {
 
     #[test]
     fn basic_pool_alloc_4k() {
-        let pool = BufferPool::new(4); // Pool with 4 pages
+        let pool = Pool::new(4); // Pool with 4 pages
         let buf = pool.get_buf(PAGE_SIZE);
 
         assert_eq!(buf.origin_type(), "Pool");
@@ -489,7 +510,7 @@ mod tests {
 
     #[test]
     fn basic_pool_alloc_8k() {
-        let pool = BufferPool::new(4); // Pool with 4 pages
+        let pool = Pool::new(4); // Pool with 4 pages
         let buf = pool.get_buf(LARGE_PAGE_SIZE);
 
         assert_eq!(buf.origin_type(), "Pool");
@@ -501,7 +522,7 @@ mod tests {
 
     #[test]
     fn data_integrity() {
-        let pool = BufferPool::new(4);
+        let pool = Pool::new(4);
         let mut buf = pool.get_buf(PAGE_SIZE);
 
         // Write data
@@ -525,7 +546,7 @@ mod tests {
 
     #[test]
     fn buffer_return_reuse() {
-        let pool = BufferPool::new(1); // Only 1 page
+        let pool = Pool::new(1); // Only 1 page
 
         // Allocate the only page
         let buf1 = pool.get_buf(PAGE_SIZE);
@@ -545,7 +566,7 @@ mod tests {
 
     #[test]
     fn pool_exhaustion_heap_fallback() {
-        let pool = BufferPool::new(2); // 2 pages
+        let pool = Pool::new(2); // 2 pages
 
         let _buf1 = pool.get_buf(PAGE_SIZE);
         let _buf2 = pool.get_buf(PAGE_SIZE);
@@ -571,7 +592,7 @@ mod tests {
 
     #[test]
     fn large_alloc_pool_exhaustion() {
-        let pool = BufferPool::new(2); // 2 pages
+        let pool = Pool::new(2); // 2 pages
 
         // Allocate one large buffer (uses both pages)
         let _buf1 = pool.get_buf(LARGE_PAGE_SIZE);
@@ -597,7 +618,7 @@ mod tests {
 
     #[test]
     fn mixed_size_allocations() {
-        let pool = BufferPool::new(5); // 5 pages
+        let pool = Pool::new(5); // 5 pages
 
         let _buf1_4k = pool.get_buf(PAGE_SIZE); // Page 0
         let _buf2_8k = pool.get_buf(LARGE_PAGE_SIZE); // Pages 1, 2
@@ -630,7 +651,7 @@ mod tests {
 
     #[test]
     fn fragmentation_reuse() {
-        let pool = BufferPool::new(4); // 4 pages
+        let pool = Pool::new(4); // 4 pages
 
         let buf1_4k = pool.get_buf(PAGE_SIZE); // Page 0
         let buf2_8k = pool.get_buf(LARGE_PAGE_SIZE); // Pages 1, 2
@@ -670,7 +691,7 @@ mod tests {
 
     #[test]
     fn stats_accuracy() {
-        let pool = BufferPool::new(3); // 3 pages
+        let pool = Pool::new(3); // 3 pages
 
         let b1 = pool.get_buf(PAGE_SIZE); // Pool 4k: 1
         let b2 = pool.get_buf(LARGE_PAGE_SIZE); // Pool 8k: 1 (uses pages 1, 2)
@@ -705,14 +726,14 @@ mod tests {
     #[test]
     #[should_panic(expected = "Requested buffer size (0) invalid")]
     fn panic_zero_size() {
-        let pool = BufferPool::new(1);
+        let pool = Pool::new(1);
         let _buf = pool.get_buf(0); // Should panic
     }
 
     #[test]
     #[should_panic(expected = "exceeds maximum")]
     fn panic_too_large_size() {
-        let pool = BufferPool::new(1);
+        let pool = Pool::new(1);
         // Request slightly more than the large page size
         let _buf = pool.get_buf(LARGE_PAGE_SIZE + 1); // Should panic
     }
@@ -720,7 +741,7 @@ mod tests {
     // Basic test for thread safety (allocations from multiple threads)
     #[test]
     fn thread_safety_alloc() {
-        let pool = BufferPool::new(10); // 10 pages
+        let pool = Pool::new(10); // 10 pages
         let mut handles = vec![];
 
         for _ in 0..5 {
@@ -753,7 +774,7 @@ mod tests {
         // or just check that *some* allocations happened.
 
         // --- Simpler Thread Safety Check ---
-        let pool_ts = BufferPool::new(20); // Larger pool (20 pages)
+        let pool_ts = Pool::new(20); // Larger pool (20 pages)
         let mut handles_ts = vec![];
         for i in 0..10 {
             // 10 threads
@@ -778,7 +799,7 @@ mod tests {
         assert_eq!(stats_ts.heap_allocs, 0);
 
         // Now test reuse across threads
-        let pool_reuse = BufferPool::new(2); // Small pool
+        let pool_reuse = Pool::new(2); // Small pool
         let buf_main = pool_reuse.get_buf(LARGE_PAGE_SIZE); // Use all pages
         assert_eq!(pool_reuse.get_stats().pool_allocs_8k, 1);
 

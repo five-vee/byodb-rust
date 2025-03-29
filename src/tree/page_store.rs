@@ -1,5 +1,5 @@
-use super::buffer_store::HeapStore;
-use super::{buffer_store::BufferStore, error::PageStoreError};
+use super::buffer_store::{BufferStore, Heap};
+use super::error::PageStoreError;
 use super::node::Node;
 use std::{
     cell::{Cell, RefCell},
@@ -10,12 +10,14 @@ use std::{
 type Result<T> = std::result::Result<T, PageStoreError>;
 
 /// A store of pages that backs a COW B+ Tree.
-pub trait PageStore<B: BufferStore> : Clone {
+pub trait PageStore : Clone {
+    type B: BufferStore;
+
     /// Reads a page from disk into an in-memory B+ tree node.
-    fn read_page(&self, page_num: u64) -> Result<Node<B>>;
+    fn read_page(&self, page_num: u64) -> Result<Node<Self::B>>;
 
     /// Writes an in-memory B+ tree node into a page on disk.
-    fn write_page(&self, node: &Node<B>) -> Result<u64>;
+    fn write_page(&self, node: &Node<Self::B>) -> Result<u64>;
 }
 
 /// An in-memory store of pages. Backed by a hash map.
@@ -25,7 +27,7 @@ pub struct InMemory {
 }
 
 struct InMemoryState {
-    pages: RefCell<HashMap<u64, Node<HeapStore>>>,
+    pages: RefCell<HashMap<u64, Node<Heap>>>,
     counter: Cell<u64>,
 }
 
@@ -42,8 +44,10 @@ impl InMemory {
     }
 }
 
-impl PageStore<HeapStore> for InMemory {
-    fn read_page(&self, page_num: u64) -> Result<Node<HeapStore>> {
+impl PageStore for InMemory {
+    type B = Heap;
+
+    fn read_page(&self, page_num: u64) -> Result<Node<Heap>> {
         self.state.pages.borrow().get(&page_num).map_or(
             Err(PageStoreError::Read(
                 format!("page_num {page_num} does not exist").into(),
@@ -52,7 +56,7 @@ impl PageStore<HeapStore> for InMemory {
         )
     }
 
-    fn write_page(&self, node: &Node<HeapStore>) -> Result<u64> {
+    fn write_page(&self, node: &Node<Heap>) -> Result<u64> {
         let curr = self.state.counter.get();
         assert!(self.state.pages.borrow_mut().insert(curr, node.clone()).is_none());
         self.state.counter.set(curr + 1);

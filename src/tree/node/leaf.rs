@@ -1,29 +1,29 @@
-use crate::tree::buffer_store::{BufferStore, PooledBuf};
+use crate::tree::buffer_store::BufferStore;
 use crate::tree::error::NodeError;
 use crate::tree::node::{self, NodeType, Result};
 
 /// An enum representing the effect of a leaf node operation.
 #[derive(Debug)]
-pub enum LeafEffect<S: BufferStore> {
+pub enum LeafEffect<B: BufferStore> {
     /// A leaf with 0 keys after a delete was performed on it.
     /// This is a special-case of `Underflow` done to avoid unnecessary
     /// page allocations, since empty non-root nodes aren't allowed.
     Empty,
     /// A newly created leaf that remained  "intact", i.e. it did not split.
-    Intact(Leaf<S>),
+    Intact(Leaf<B>),
     /// The left and right splits of a leaf that was created.
-    Split { left: Leaf<S>, right: Leaf<S> },
+    Split { left: Leaf<B>, right: Leaf<B> },
 }
 
-impl<S: BufferStore> LeafEffect<S> {
-    fn take_intact(self) -> Leaf<S> {
+impl<B: BufferStore> LeafEffect<B> {
+    fn take_intact(self) -> Leaf<B> {
         match self {
             LeafEffect::Intact(leaf) => leaf,
             _ => panic!("{self:?} is not LeafEffect::Intact"),
         }
     }
 
-    fn take_split(self) -> (Leaf<S>, Leaf<S>) {
+    fn take_split(self) -> (Leaf<B>, Leaf<B>) {
         match self {
             LeafEffect::Split { left, right } => (left, right),
             _ => panic!("{self:?} is not LeafEffect::Split"),
@@ -84,17 +84,17 @@ impl<S: BufferStore> LeafEffect<S> {
     }
 
     // A builder of a B+ tree leaf node.
-    pub struct LeafBuilder<'a, S: BufferStore> {
+    pub struct LeafBuilder<'a, B: BufferStore> {
         num_keys: usize,
         i: usize,
         cap: usize,
-        store: &'a S,
-        buf: PooledBuf<S>,
+        store: &'a B,
+        buf: B::B,
     }
 
-    impl<'a, S: BufferStore> LeafBuilder<'a, S> {
+    impl<'a, B: BufferStore> LeafBuilder<'a, B> {
         /// Creates a new leaf builder.
-        pub fn new(num_keys: usize, store: &'a S, allow_overflow: bool) -> Self {
+        pub fn new(num_keys: usize, store: &'a B, allow_overflow: bool) -> Self {
             let (mut buf, cap) = if allow_overflow {
                 (store.get_buf(node::PAGE_SIZE * 2), 2 * node::PAGE_SIZE - 4)
             } else {
@@ -138,7 +138,7 @@ impl<S: BufferStore> LeafEffect<S> {
         }
 
         /// Builds a leaf and optionally splits it if overflowed.
-        pub fn build(self) -> Result<LeafEffect<S>> {
+        pub fn build(self) -> Result<LeafEffect<B>> {
             assert!(
                 self.i == self.num_keys,
                 "build() called after calling add_key_value() {} times < num_keys = {}",
@@ -160,7 +160,7 @@ impl<S: BufferStore> LeafEffect<S> {
         }
 
         /// Builds two splits of a leaf.
-        fn build_split(self) -> Result<(Leaf<S>, Leaf<S>)> {
+        fn build_split(self) -> Result<(Leaf<B>, Leaf<B>)> {
             let num_keys = self.num_keys as usize;
             let mut left_end: usize = 0;
             for i in 0..num_keys {
@@ -183,27 +183,28 @@ impl<S: BufferStore> LeafEffect<S> {
         }
 
         /// Builds a leaf.
-        fn build_single(self) -> Leaf<S> {
+        fn build_single(self) -> Leaf<B> {
             assert!(get_num_bytes(&self.buf) <= node::PAGE_SIZE);
-            Leaf { buf: self.buf }
+            Leaf { buf: self.buf, store: self.store.clone() }
         }
     }
 
 /// A B+ tree leaf node.
 #[derive(Debug)]
-pub struct Leaf<S: BufferStore> {
-    buf: PooledBuf<S>,
+pub struct Leaf<B: BufferStore> {
+    buf: B::B,
+    store: B,
 }
 
-impl<S: BufferStore> Leaf<S> {
-    pub fn new(store: &S) -> Self {
+impl<B: BufferStore> Leaf<B> {
+    pub fn new(store: &B) -> Self {
         let mut buf = store.get_buf(node::PAGE_SIZE);
         node::set_page_header(&mut buf, NodeType::Leaf);
-        Self { buf }
+        Self { buf, store: store.clone() }
     }
 
     /// Inserts a key-value pair.
-    pub fn insert(&self, key: &[u8], val: &[u8]) -> Result<LeafEffect<S>> {
+    pub fn insert(&self, key: &[u8], val: &[u8]) -> Result<LeafEffect<B>> {
         if key.len() > node::MAX_KEY_SIZE {
             return Err(NodeError::MaxKeySize(key.len()));
         }
@@ -215,7 +216,7 @@ impl<S: BufferStore> Leaf<S> {
         }
         let mut b = LeafBuilder::new(
             self.get_num_keys() + 1,
-            &self.buf.store,
+            &self.store,
             self.get_num_bytes() + 6 + key.len() + val.len() > node::PAGE_SIZE,
         );
         let mut added = false;
@@ -233,7 +234,7 @@ impl<S: BufferStore> Leaf<S> {
     }
 
     /// Updates the value corresponding to a key.
-    pub fn update(&self, key: &[u8], val: &[u8]) -> Result<LeafEffect<S>> {
+    pub fn update(&self, key: &[u8], val: &[u8]) -> Result<LeafEffect<B>> {
         if key.len() > node::MAX_KEY_SIZE {
             return Err(NodeError::MaxKeySize(key.len()));
         }
@@ -245,7 +246,7 @@ impl<S: BufferStore> Leaf<S> {
             return Err(NodeError::KeyNotFound);
         }
         let old_val = old_val.unwrap();
-        let mut b = LeafBuilder::new(self.get_num_keys(), &self.buf.store, self.get_num_bytes() - old_val.len() + val.len() > node::PAGE_SIZE);
+        let mut b = LeafBuilder::new(self.get_num_keys(), &self.store, self.get_num_bytes() - old_val.len() + val.len() > node::PAGE_SIZE);
         let mut added = false;
         for (k, v) in self.iter() {
             if !added && key == k {
@@ -259,7 +260,7 @@ impl<S: BufferStore> Leaf<S> {
     }
 
     /// Deletes a key and its corresponding value.
-    pub fn delete(&self, key: &[u8]) -> Result<LeafEffect<S>> {
+    pub fn delete(&self, key: &[u8]) -> Result<LeafEffect<B>> {
         if key.len() > node::MAX_KEY_SIZE {
             return Err(NodeError::MaxKeySize(key.len()));
         }
@@ -272,7 +273,7 @@ impl<S: BufferStore> Leaf<S> {
         if n == 1 {
             return Ok(LeafEffect::Empty);
         }
-        let mut b = LeafBuilder::new(n - 1, &self.buf.store, false);
+        let mut b = LeafBuilder::new(n - 1, &self.store, false);
         let mut added = false;
         for (k, v) in self.iter() {
             if !added && key == k {
@@ -289,10 +290,10 @@ impl<S: BufferStore> Leaf<S> {
         self.iter().find(|(k, _)| *k == key).map(|(_, v)| v)
     }
 
-    pub fn steal_or_merge(left: &Leaf<S>, right: &Leaf<S>) -> Result<LeafEffect<S>> {
+    pub fn steal_or_merge(left: &Leaf<B>, right: &Leaf<B>) -> Result<LeafEffect<B>> {
         // TODO: Actually determine if it really needs overflow.
         let allow_overflow = true;
-        let mut b = LeafBuilder::new(left.get_num_keys() + right.get_num_keys(), &left.buf.store, allow_overflow);
+        let mut b = LeafBuilder::new(left.get_num_keys() + right.get_num_keys(), &left.store, allow_overflow);
         for (key, val) in left.iter() {
             b = b.add_key_value(key, val)?;
         }
@@ -310,7 +311,7 @@ impl<S: BufferStore> Leaf<S> {
         node::get_num_keys(&self.buf)
     }
 
-    pub fn iter<'a>(&'a self) -> LeafIterator<'a, S> {
+    pub fn iter<'a>(&'a self) -> LeafIterator<'a, B> {
         LeafIterator {
             node: self,
             i: 0,
@@ -327,21 +328,22 @@ impl<S: BufferStore> Leaf<S> {
     }
 }
 
-impl<S: BufferStore> Clone for Leaf<S> {
+impl<B: BufferStore> Clone for Leaf<B> {
     fn clone(&self) -> Self {
-        let buf = self.buf.store.get_buf(self.buf.len());
-        Self { buf }
+        let mut buf = self.store.get_buf(self.buf.len());
+        buf.copy_from_slice(&self.buf);
+        Self { buf, store: self.store.clone() }
     }
 }
 
 /// An key-value iterator for a leaf node.
-pub struct LeafIterator<'a, S: BufferStore> {
-    node: &'a Leaf<S>,
+pub struct LeafIterator<'a, B: BufferStore> {
+    node: &'a Leaf<B>,
     i: usize,
     n: usize,
 }
 
-impl<'a, S: BufferStore> Iterator for LeafIterator<'a, S> {
+impl<'a, B: BufferStore> Iterator for LeafIterator<'a, B> {
     type Item = (&'a [u8], &'a [u8]);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -357,14 +359,14 @@ impl<'a, S: BufferStore> Iterator for LeafIterator<'a, S> {
 #[cfg(test)]
 mod tests {
     use std::sync::OnceLock;
-    use crate::tree::buffer_store::HeapStore;
+    use crate::tree::buffer_store::Heap;
     use crate::tree::node;
     use super::*;
 
-    static TEST_HEAP_STORE: OnceLock<HeapStore> = OnceLock::new();
+    static TEST_HEAP_STORE: OnceLock<Heap> = OnceLock::new();
 
-    fn store() -> HeapStore {
-        TEST_HEAP_STORE.get_or_init(|| HeapStore{}).clone()
+    fn store() -> Heap {
+        TEST_HEAP_STORE.get_or_init(|| Heap{}).clone()
     }
 
     #[test]

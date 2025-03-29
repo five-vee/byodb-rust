@@ -155,14 +155,14 @@ impl TryFrom<u16> for NodeType {
 
 /// An enum representing the type of B+ tree node.
 #[derive(Clone, Debug)]
-pub enum Node<S: BufferStore> {
+pub enum Node<B: BufferStore> {
     /// A B+ tree leaf node.
-    Leaf(Leaf<S>),
+    Leaf(Leaf<B>),
     /// A B+ tree internal node.
-    Internal(Internal<S>),
+    Internal(Internal<B>),
 }
 
-impl<S: BufferStore> Node<S> {
+impl<B: BufferStore> Node<B> {
     /// Gets the key at a specified node index.
     pub fn get_key(&self, i: usize) -> &[u8] {
         match self {
@@ -181,21 +181,21 @@ impl<S: BufferStore> Node<S> {
 
 /// An enum representing the effect of a node operation.
 #[derive(Debug)]
-pub enum NodeEffect<S: BufferStore> {
+pub enum NodeEffect<B: BufferStore> {
     /// A node without 0 keys after a delete was performed on it.
     /// This is a special-case of `Underflow` done to avoid unnecessary
     /// page allocations, since empty non-root nodes aren't allowed.
     Empty,
     /// A newly created node that remained  "intact", i.e. it did not split.
-    Intact(Node<S>),
+    Intact(Node<B>),
     /// The left and right splits of a node that was created.
     ///
     /// The left and right nodes are the same type.
-    Split { left: Node<S>, right: Node<S> },
+    Split { left: Node<B>, right: Node<B> },
 }
 
-impl<S: BufferStore> From<LeafEffect<S>> for NodeEffect<S> {
-    fn from(value: LeafEffect<S>) -> Self {
+impl<B: BufferStore> From<LeafEffect<B>> for NodeEffect<B> {
+    fn from(value: LeafEffect<B>) -> Self {
         match value {
             LeafEffect::Empty => NodeEffect::Empty,
             LeafEffect::Intact(leaf) => NodeEffect::Intact(Node::Leaf(leaf)),
@@ -204,8 +204,8 @@ impl<S: BufferStore> From<LeafEffect<S>> for NodeEffect<S> {
     }
 }
 
-impl<S: BufferStore> From<InternalEffect<S>> for NodeEffect<S> {
-    fn from(value: InternalEffect<S>) -> Self {
+impl<B: BufferStore> From<InternalEffect<B>> for NodeEffect<B> {
+    fn from(value: InternalEffect<B>) -> Self {
         match value {
             InternalEffect::Empty => NodeEffect::Empty,
             InternalEffect::Intact(internal) => NodeEffect::Intact(Node::Internal(internal)),
@@ -230,7 +230,7 @@ pub enum Sufficiency {
 }
 
 // Returns how sufficient a node is.
-pub fn sufficiency<S: BufferStore>(n: &Node<S>) -> Sufficiency {
+pub fn sufficiency<B: BufferStore>(n: &Node<B>) -> Sufficiency {
     match n.get_num_keys() {
         0 => Sufficiency::Empty,
         1 => Sufficiency::Underflow,
@@ -241,7 +241,7 @@ pub fn sufficiency<S: BufferStore>(n: &Node<S>) -> Sufficiency {
 /// Merges `left` and `right` into a possibly-overflowed node and splits if
 /// needed. This is modeled as a Deletion b/c it is (so far) only useful in the
 /// context of deletion.
-pub fn steal_or_merge<S: BufferStore>(left: &Node<S>, right: &Node<S>) -> Result<NodeEffect<S>> {
+pub fn steal_or_merge<B: BufferStore>(left: &Node<B>, right: &Node<B>) -> Result<NodeEffect<B>> {
     match (left, right) {
         (Node::Leaf(left), Node::Leaf(right)) => Ok(Leaf::steal_or_merge(left, right)?.into()),
         (Node::Internal(left), Node::Internal(right)) => Ok(Internal::steal_or_merge(left, right)?.into()),
