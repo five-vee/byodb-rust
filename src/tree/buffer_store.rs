@@ -277,6 +277,7 @@ unsafe impl Sync for Pool {}
 
 impl Pool {
     /// Creates a new pool with a pool sized for `num_pages` of `PAGE_SIZE`.
+    #[allow(dead_code)]
     pub fn new(num_pages: usize) -> Self {
         Self {
             state: Arc::new(Mutex::new(PoolState::new(num_pages))),
@@ -284,6 +285,7 @@ impl Pool {
     }
 
     /// Returns a copy of the current allocation statistics.
+    #[allow(dead_code)]
     pub fn get_stats(&self) -> PoolStats {
         let state = self.state.lock().unwrap();
         state.get_stats()
@@ -375,7 +377,7 @@ impl BufferStore for Heap {
 
 // --- Private Buffer Handle ---
 
-trait Buffer : fmt::Debug + Deref<Target = [u8]> + DerefMut<Target = [u8]> {}
+pub trait Buffer : fmt::Debug + Deref<Target = [u8]> + DerefMut<Target = [u8]> {}
 
 #[derive(Debug)]
 pub struct HeapBuffer {
@@ -474,17 +476,11 @@ impl DerefMut for PoolBuffer {
 }
 
 impl PoolBuffer {
+    #[allow(dead_code)]
     fn origin_type(&self) -> &'static str {
         match &self.origin {
             BufferOrigin::Pool { .. } => "Pool",
             BufferOrigin::Heap { .. } => "Heap",
-        }
-    }
-
-    fn capacity(&self) -> usize {
-        match &self.origin {
-            BufferOrigin::Pool { size, .. } => *size,
-            BufferOrigin::Heap { data, .. } => data.len(),
         }
     }
 }
@@ -502,7 +498,7 @@ mod tests {
         let buf = pool.get_buf(PAGE_SIZE);
 
         assert_eq!(buf.origin_type(), "Pool");
-        assert_eq!(buf.capacity(), PAGE_SIZE);
+        assert_eq!(buf.len(), PAGE_SIZE);
         assert_eq!(pool.get_stats().pool_allocs_4k, 1);
         assert_eq!(pool.get_stats().pool_allocs_8k, 0);
         assert_eq!(pool.get_stats().heap_allocs, 0);
@@ -514,7 +510,7 @@ mod tests {
         let buf = pool.get_buf(LARGE_PAGE_SIZE);
 
         assert_eq!(buf.origin_type(), "Pool");
-        assert_eq!(buf.capacity(), LARGE_PAGE_SIZE);
+        assert_eq!(buf.len(), LARGE_PAGE_SIZE);
         assert_eq!(pool.get_stats().pool_allocs_4k, 0);
         assert_eq!(pool.get_stats().pool_allocs_8k, 1);
         assert_eq!(pool.get_stats().heap_allocs, 0);
@@ -576,7 +572,7 @@ mod tests {
         // Pool is full, next allocation should use heap
         let buf3 = pool.get_buf(PAGE_SIZE);
         assert_eq!(buf3.origin_type(), "Heap");
-        assert_eq!(buf3.capacity(), PAGE_SIZE); // Heap fallback still uses standard sizes
+        assert_eq!(buf3.len(), PAGE_SIZE); // Heap fallback still uses standard sizes
         assert_eq!(pool.get_stats().pool_allocs_4k, 2);
         assert_eq!(pool.get_stats().heap_allocs, 1);
 

@@ -20,6 +20,7 @@ pub enum InternalEffect<B: BufferStore> {
 }
 
 impl<B: BufferStore> InternalEffect<B> {
+    #[allow(dead_code)]
     fn take_intact(self) -> Internal<B> {
         match self {
             InternalEffect::Intact(internal) => internal,
@@ -27,6 +28,7 @@ impl<B: BufferStore> InternalEffect<B> {
         }
     }
 
+    #[allow(dead_code)]
     fn take_split(self) -> (Internal<B>, Internal<B>) {
         match self {
             InternalEffect::Split { left, right } => (left, right),
@@ -193,7 +195,7 @@ impl<'a, B: BufferStore> InternalBuilder<'a, B> {
         let n = node::get_num_keys(&self.buf);
         // There should be at least 2 keys to be sufficient
         // in each of left and right.
-        let left_end = (2..=n-2)
+        let left_end = (2..=n - 2)
             .rev()
             .find(|i| {
                 let next_offset = get_offset(&self.buf, *i);
@@ -233,26 +235,22 @@ impl<B: BufferStore> Internal<B> {
 
     /// Merges child entries into the internal node.
     pub fn merge_child_entries(&self, entries: &[ChildEntry]) -> Result<InternalEffect<B>> {
-        let delta_keys = entries.iter()
+        let delta_keys = entries
+            .iter()
             .map(|ce| match ce {
                 ChildEntry::Insert { .. } => 1,
                 ChildEntry::Delete { .. } => -1,
                 _ => 0,
             })
             .sum::<isize>();
-        let delta_size = entries.iter()
-            .map(|ce| {
-                match ce {
-                    ChildEntry::Insert { key, page_num } => {
-                        key.len() as isize
-                    },
-                    ChildEntry::Update { i, key, page_num } => {
-                        key.len() as isize - self.get_key(*i).len() as isize
-                    },
-                    ChildEntry::Delete { i } => {
-                        -(self.get_key(*i).len() as isize)
-                    }
+        let delta_size = entries
+            .iter()
+            .map(|ce| match ce {
+                ChildEntry::Insert { key, .. } => key.len() as isize,
+                ChildEntry::Update { i, key, .. } => {
+                    key.len() as isize - self.get_key(*i).len() as isize
                 }
+                ChildEntry::Delete { i } => -(self.get_key(*i).len() as isize),
             })
             .sum::<isize>();
         let mut b = InternalBuilder::new(
@@ -293,6 +291,9 @@ impl<B: BufferStore> Internal<B> {
                     ChildEntry::Insert { key, page_num } if (*key).as_ref() < *k => {
                         b = b.add_child_entry(key, *page_num)?;
                         entries_iter.next();
+                    }
+                    ce @ ChildEntry::Insert { key, .. } if (*key).as_ref() == *k => {
+                        panic!("ChildEntry {ce:?} has a duplicate key");
                     }
                     _ => {
                         b = b.add_child_entry(k, *pn)?;
@@ -349,8 +350,8 @@ impl<B: BufferStore> Internal<B> {
             n: self.get_num_keys(),
         }
     }
-    
-    fn get_num_bytes<>(&self) -> usize {
+
+    fn get_num_bytes(&self) -> usize {
         get_num_bytes(&self.buf)
     }
 }
@@ -462,12 +463,10 @@ mod tests {
             .unwrap()
             .take_intact();
         let (left, right) = node
-            .merge_child_entries(&[
-                ChildEntry::Insert {
-                    key: [3; node::MAX_KEY_SIZE].into(),
-                    page_num: 3,
-                },
-            ])
+            .merge_child_entries(&[ChildEntry::Insert {
+                key: [3; node::MAX_KEY_SIZE].into(),
+                page_num: 3,
+            }])
             .unwrap()
             .take_split();
         assert!(left.get_num_keys() >= 2);
@@ -502,13 +501,11 @@ mod tests {
             .unwrap()
             .take_intact();
         let (left, right) = node
-            .merge_child_entries(&[
-                ChildEntry::Update {
-                    i: 3,
-                    key: [3; node::MAX_KEY_SIZE].into(),
-                    page_num: 3,
-                },
-            ])
+            .merge_child_entries(&[ChildEntry::Update {
+                i: 3,
+                key: [3; node::MAX_KEY_SIZE].into(),
+                page_num: 3,
+            }])
             .unwrap()
             .take_split();
         assert!(left.get_num_keys() >= 2);

@@ -25,7 +25,6 @@ mod page_store;
 
 pub use error::TreeError;
 pub use node::{MAX_KEY_SIZE, MAX_VALUE_SIZE};
-use buffer_store::BufferStore;
 use std::rc::Rc;
 use node::{ChildEntry, Internal, Leaf, Node, NodeEffect, Sufficiency};
 use page_store::PageStore;

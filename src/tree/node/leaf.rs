@@ -16,6 +16,7 @@ pub enum LeafEffect<B: BufferStore> {
 }
 
 impl<B: BufferStore> LeafEffect<B> {
+    #[allow(dead_code)]
     fn take_intact(self) -> Leaf<B> {
         match self {
             LeafEffect::Intact(leaf) => leaf,
@@ -23,6 +24,7 @@ impl<B: BufferStore> LeafEffect<B> {
         }
     }
 
+    #[allow(dead_code)]
     fn take_split(self) -> (Leaf<B>, Leaf<B>) {
         match self {
             LeafEffect::Split { left, right } => (left, right),
