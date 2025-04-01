@@ -2,6 +2,11 @@
   "lockfile-version": 1,
   "manifest": {
     "version": 1,
+    "install": {
+      "just": {
+        "pkg-path": "just"
+      }
+    },
     "hook": {
       "on-activate": "  export PATH=\"$PWD/target/debug:$PATH\"\n"
     },
@@ -17,5 +22,70 @@
       "semver": {}
     }
   },
-  "packages": []
+  "packages": [
+    {
+      "attr_path": "just",
+      "broken": false,
+      "derivation": "/nix/store/qnd463r1c6zqc72q3js5ff91n452myqq-just-1.40.0.drv",
+      "description": "Handy way to save and run project-specific commands",
+      "install_id": "just",
+      "license": "CC0-1.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=52faf482a3889b7619003c0daec593a1912fddc1",
+      "name": "just-1.40.0",
+      "pname": "just",
+      "rev": "52faf482a3889b7619003c0daec593a1912fddc1",
+      "rev_count": 776537,
+      "rev_date": "2025-03-30T06:12:12Z",
+      "scrape_date": "2025-04-01T01:11:36.902328Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "1.40.0",
+      "outputs_to_install": [
+        "man",
+        "out"
+      ],
+      "outputs": {
+        "doc": "/nix/store/4i8qddwrb0p4rw6bb5y25c5dlkmad54s-just-1.40.0-doc",
+        "man": "/nix/store/5kii85cgdlm30lrqb9r6irb0jxxrgkwy-just-1.40.0-man",
+        "out": "/nix/store/6zdsrik11xpgw9m3hz4dxg6bd08szrm1-just-1.40.0"
+      },
+      "system": "aarch64-darwin",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "just",
+      "broken": false,
+      "derivation": "/nix/store/32y3jqby08c0y6yfpjxnm504409j5db7-just-1.40.0.drv",
+      "description": "Handy way to save and run project-specific commands",
+      "install_id": "just",
+      "license": "CC0-1.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=52faf482a3889b7619003c0daec593a1912fddc1",
+      "name": "just-1.40.0",
+      "pname": "just",
+      "rev": "52faf482a3889b7619003c0daec593a1912fddc1",
+      "rev_count": 776537,
+      "rev_date": "2025-03-30T06:12:12Z",
+      "scrape_date": "2025-04-01T01:46:43.356966Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "1.40.0",
+      "outputs_to_install": [
+        "man",
+        "out"
+      ],
+      "outputs": {
+        "doc": "/nix/store/sdydvv0rlqq2q23r2rmiyh2hi82v254h-just-1.40.0-doc",
+        "man": "/nix/store/f5is74zi3m0ry5jk1h4xc7l6ihjvsrq0-just-1.40.0-man",
+        "out": "/nix/store/8c2jmy7m5dfinsfbmia7m47s52am0xx2-just-1.40.0"
+      },
+      "system": "x86_64-darwin",
+      "group": "toplevel",
+      "priority": 5
+    }
+  ]
 }

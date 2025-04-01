@@ -15,6 +15,7 @@ version = 1
 ##  $ flox show gum     <- show all versions of a package
 ## -------------------------------------------------------------------
 [install]
+just.pkg-path = "just"
 
 ## Environment Variables ---------------------------------------------
 ##  ... available for use in the activated environment
