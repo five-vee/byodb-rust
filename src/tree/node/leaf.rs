@@ -123,8 +123,12 @@ impl<'a, B: BufferStore> LeafBuilder<'a, B> {
 
         let offset = set_next_offset(&mut self.buf, self.i, key, val);
         let pos = 4 + n * 2 + offset;
-        assert!(pos + 4 + key.len() + val.len() <= self.cap,
-                "builder unexpectedly overflowed; please call allow_overflow(), or don't add too many key-value pairs.");
+        assert!(
+            pos + 4 + key.len() + val.len() <= self.cap,
+            "builder unexpectedly overflowed: i = {}, n = {}",
+            self.i,
+            n
+        );
 
         self.buf[pos..pos + 2].copy_from_slice(&(key.len() as u16).to_be_bytes());
         self.buf[pos + 2..pos + 4].copy_from_slice(&(val.len() as u16).to_be_bytes());
@@ -158,14 +162,21 @@ impl<'a, B: BufferStore> LeafBuilder<'a, B> {
     /// Builds two splits of a leaf.
     fn build_split(self) -> Result<(Leaf<B>, Leaf<B>)> {
         let n = node::get_num_keys(&self.buf);
-        let mut left_end: usize = 0;
-        for i in 0..n {
-            // include i?
-            let offset = get_offset(&self.buf, i + 1);
-            if 4 + (i + 1) * 2 + offset <= node::PAGE_SIZE {
-                left_end = i + 1;
-            }
+        // Try to have at least 2 keys in each to be sufficient
+        // in each of left and right.
+        let mut left_end = (2..=n - 2).rev().find(|i| {
+            let next_offset = get_offset(&self.buf, *i);
+            4 + *i * 2 + next_offset <= node::PAGE_SIZE
+        });
+        if left_end.is_none() {
+            // Relax the sufficiency requirement by just making sure
+            // each left and right fits within a page.
+            left_end = (0..n).rev().find(|i| {
+                let next_offset = get_offset(&self.buf, *i);
+                4 + *i + 2 + next_offset <= node::PAGE_SIZE
+            })
         }
+        let left_end = left_end.unwrap();
 
         let mut lb = Self::new(left_end, self.store, false);
         for i in 0..left_end {
@@ -317,6 +328,10 @@ impl<B: BufferStore> Leaf<B> {
         get_key(&self.buf, i)
     }
 
+    pub fn get_value(&self, i: usize) -> &[u8] {
+        get_value(&self.buf, i)
+    }
+
     pub fn get_num_keys(&self) -> usize {
         node::get_num_keys(&self.buf)
     }
@@ -327,10 +342,6 @@ impl<B: BufferStore> Leaf<B> {
             i: 0,
             n: self.get_num_keys(),
         }
-    }
-
-    fn get_value(&self, i: usize) -> &[u8] {
-        get_value(&self.buf, i)
     }
 
     fn get_num_bytes(&self) -> usize {
@@ -592,5 +603,66 @@ mod tests {
     fn delete_non_existent() {
         let result = Leaf::new(&TEST_HEAP_STORE).delete("key".as_bytes());
         assert!(matches!(result, Err(NodeError::KeyNotFound)));
+    }
+
+    #[test]
+    fn steal_or_merge_steal() {
+        let left = LeafBuilder::new(1, &TEST_HEAP_STORE, false)
+            .add_key_value(&[1; node::MAX_KEY_SIZE], &[1; node::MAX_VALUE_SIZE])
+            .unwrap()
+            .build()
+            .unwrap()
+            .take_intact();
+
+        let right = LeafBuilder::new(3, &TEST_HEAP_STORE, false)
+            .add_key_value(&[2], &[2])
+            .unwrap()
+            .add_key_value(&[3], &[3])
+            .unwrap()
+            .add_key_value(&[4; node::MAX_KEY_SIZE], &[4; node::MAX_VALUE_SIZE])
+            .unwrap()
+            .build()
+            .unwrap()
+            .take_intact();
+
+        let (left, right) = Leaf::steal_or_merge(&left, &right).unwrap().take_split();
+        assert!(left.get_num_keys() >= 2);
+        assert!(right.get_num_keys() >= 2);
+        assert!(right.get_num_keys() < 3);
+        let chained = left.iter().chain(right.iter()).collect::<Vec<_>>();
+        assert_eq!(
+            chained,
+            vec![
+                (&[1; node::MAX_KEY_SIZE][..], &[1; node::MAX_VALUE_SIZE][..]),
+                (&[2], &[2]),
+                (&[3], &[3]),
+                (&[4; node::MAX_KEY_SIZE], &[4; node::MAX_VALUE_SIZE]),
+            ]
+        );
+    }
+
+    #[test]
+    fn steal_or_merge_merge() {
+        let left = LeafBuilder::new(1, &TEST_HEAP_STORE, false)
+            .add_key_value(&[1], &[1])
+            .unwrap()
+            .build()
+            .unwrap()
+            .take_intact();
+
+        let right = LeafBuilder::new(2, &TEST_HEAP_STORE, false)
+            .add_key_value(&[2], &[2])
+            .unwrap()
+            .add_key_value(&[3], &[3])
+            .unwrap()
+            .build()
+            .unwrap()
+            .take_intact();
+
+        let merged = Leaf::steal_or_merge(&left, &right).unwrap().take_intact();
+        assert_eq!(
+            merged.iter().collect::<Vec<_>>(),
+            vec![(&[1][..], &[1][..]), (&[2], &[2]), (&[3], &[3]),]
+        );
     }
 }

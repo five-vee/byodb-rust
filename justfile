@@ -6,7 +6,7 @@ alias cov := coverage
 
 # Use REMAINDER to specify a test or tests, e.g. tree::node::leaf
 [group('test')]
-coverage REMAINDER='': _check-cargo-llvm-cov _check-cargo-nextest
+coverage +REMAINDER='': _check-cargo-llvm-cov _check-cargo-nextest
   cargo llvm-cov nextest --lcov --output-path target/lcov.info {{REMAINDER}}
   @echo ""
   @echo "(If you're using Visual Studio Code's \"Coverage Gutters\" extension, you can run it now.)"

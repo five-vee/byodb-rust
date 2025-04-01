@@ -149,7 +149,13 @@ impl<'a, B: BufferStore> InternalBuilder<'a, B> {
         let pos = 4 + n * 10 + offset;
         assert!(
             pos + key.len() <= self.cap,
-            "builder unexpectedly overflowed; please call allow_overflow(), or don't add too many key-value pairs.");
+            "builder unexpectedly overflowed: i = {}, n = {}, pos = {}, key_len = {}, cap = {}",
+            self.i,
+            n,
+            pos,
+            key.len(),
+            self.cap
+        );
 
         self.buf[pos..pos + key.len()].copy_from_slice(key);
 
@@ -245,11 +251,11 @@ impl<B: BufferStore> Internal<B> {
         let delta_size = entries
             .iter()
             .map(|ce| match ce {
-                ChildEntry::Insert { key, .. } => key.len() as isize,
+                ChildEntry::Insert { key, .. } => key.len() as isize + 8,
                 ChildEntry::Update { i, key, .. } => {
                     key.len() as isize - self.get_key(*i).len() as isize
                 }
-                ChildEntry::Delete { i } => -(self.get_key(*i).len() as isize),
+                ChildEntry::Delete { i } => -8 - (self.get_key(*i).len() as isize),
             })
             .sum::<isize>();
         let mut b = InternalBuilder::new(
@@ -326,11 +332,8 @@ impl<B: BufferStore> Internal<B> {
     /// Finds the index of the child that contains the key.
     pub fn find(&self, key: &[u8]) -> usize {
         let n = self.get_num_keys();
-        assert!(n != 0);
-        (1..n)
-            .rev()
-            .find(|i| self.get_key(*i) <= key)
-            .unwrap_or(0)
+        assert_ne!(n, 0);
+        (1..n).rev().find(|i| self.get_key(*i) <= key).unwrap_or(0)
     }
 
     /// Gets the child pointer at an index.
@@ -364,7 +367,8 @@ impl<B: BufferStore> Internal<B> {
 
 impl<B: BufferStore> Clone for Internal<B> {
     fn clone(&self) -> Self {
-        let buf = self.store.get_buf(self.buf.len());
+        let mut buf = self.store.get_buf(self.buf.len());
+        buf.copy_from_slice(&self.buf);
         Self {
             buf,
             store: self.store.clone(),
@@ -482,10 +486,10 @@ mod tests {
             chained,
             vec![
                 (&[0; node::MAX_KEY_SIZE][..], 0),
-                (&[1; node::MAX_KEY_SIZE][..], 1),
-                (&[2; node::MAX_KEY_SIZE][..], 2),
-                (&[3; node::MAX_KEY_SIZE][..], 3),
-                (&[4; node::MAX_KEY_SIZE][..], 4),
+                (&[1; node::MAX_KEY_SIZE], 1),
+                (&[2; node::MAX_KEY_SIZE], 2),
+                (&[3; node::MAX_KEY_SIZE], 3),
+                (&[4; node::MAX_KEY_SIZE], 4),
             ]
         );
     }
@@ -521,10 +525,10 @@ mod tests {
             chained,
             vec![
                 (&[0; node::MAX_KEY_SIZE][..], 0),
-                (&[1; node::MAX_KEY_SIZE][..], 1),
-                (&[2; node::MAX_KEY_SIZE][..], 2),
-                (&[3; node::MAX_KEY_SIZE][..], 3),
-                (&[4; node::MAX_KEY_SIZE][..], 4),
+                (&[1; node::MAX_KEY_SIZE], 1),
+                (&[2; node::MAX_KEY_SIZE], 2),
+                (&[3; node::MAX_KEY_SIZE], 3),
+                (&[4; node::MAX_KEY_SIZE], 4),
             ]
         );
     }
@@ -561,10 +565,10 @@ mod tests {
             chained,
             vec![
                 (&[1; node::MAX_KEY_SIZE][..], 1),
-                (&[2; node::MAX_KEY_SIZE][..], 2),
-                (&[3; node::MAX_KEY_SIZE][..], 3),
-                (&[4; node::MAX_KEY_SIZE][..], 4),
-                (&[5; node::MAX_KEY_SIZE][..], 5),
+                (&[2; node::MAX_KEY_SIZE], 2),
+                (&[3; node::MAX_KEY_SIZE], 3),
+                (&[4; node::MAX_KEY_SIZE], 4),
+                (&[5; node::MAX_KEY_SIZE], 5),
             ]
         );
     }
@@ -589,10 +593,9 @@ mod tests {
         let merged = Internal::steal_or_merge(&left, &right)
             .unwrap()
             .take_intact();
-        assert!(merged.get_num_keys() >= 2);
         assert_eq!(
             merged.iter().collect::<Vec<_>>(),
-            vec![(&[1][..], 1), (&[2][..], 2), (&[3][..], 3),]
+            vec![(&[1][..], 1), (&[2], 2), (&[3], 3),]
         );
     }
 
@@ -608,7 +611,7 @@ mod tests {
             .take_intact();
         assert_eq!(node.find(&[1]), 0);
         assert_eq!(node.find(&[3]), 1);
-        
+
         // This works b/c we'd want to be able to insert &[0] into the 0-th child.
         assert_eq!(node.find(&[0]), 0);
     }

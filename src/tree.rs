@@ -18,16 +18,16 @@
 //! versioning and auditing, as previous states of the data structure are
 //! implicitly retained.
 
+mod buffer_store;
 mod error;
 mod node;
-mod buffer_store;
 mod page_store;
 
 pub use error::TreeError;
-pub use node::{MAX_KEY_SIZE, MAX_VALUE_SIZE};
-use std::rc::Rc;
 use node::{ChildEntry, Internal, Leaf, Node, NodeEffect, Sufficiency};
+pub use node::{MAX_KEY_SIZE, MAX_VALUE_SIZE};
 use page_store::PageStore;
+use std::{cmp::max, rc::Rc};
 
 type Result<T> = std::result::Result<T, TreeError>;
 
@@ -89,6 +89,7 @@ impl<P: PageStore> TreeEffect<P> {
 /// accessing the tree will continue to see the consistent, older version of
 /// the data until they reach a point where they would naturally access the
 /// newly written parts.
+#[derive(Clone)]
 pub struct Tree<P: PageStore> {
     root: Node<P::B>,
     page_num: u64,
@@ -97,6 +98,18 @@ pub struct Tree<P: PageStore> {
 }
 
 impl<P: PageStore> Tree<P> {
+    /// Creates an new empty B+ tree.
+    pub fn new(buffer_store: P::B, page_store: P) -> Result<Self> {
+        let root = Node::Leaf(Leaf::new(&buffer_store));
+        let page_num = page_store.write_page(&root)?;
+        Ok(Self {
+            root,
+            page_num,
+            buffer_store,
+            page_store,
+        })
+    }
+
     /// Gets the value corresponding to the key.
     pub fn get(&self, key: &[u8]) -> Result<Option<Rc<[u8]>>> {
         match &self.root {
@@ -121,7 +134,7 @@ impl<P: PageStore> Tree<P> {
         match self.insert_helper(key, val)? {
             TreeEffect::Intact(tree) => Ok(tree),
             TreeEffect::Split { left, right } => self.parent_of_split(left, right),
-            _ => unreachable!()
+            _ => unreachable!(),
         }
     }
 
@@ -143,7 +156,7 @@ impl<P: PageStore> Tree<P> {
                     root: child,
                     page_num: child_num,
                     buffer_store: self.buffer_store.clone(),
-                    page_store: self.page_store.clone()
+                    page_store: self.page_store.clone(),
                 };
                 let child_entries = child.insert_helper(key, val)?.child_entries(child_idx);
                 let effect = internal.merge_child_entries(child_entries.as_ref())?;
@@ -157,7 +170,7 @@ impl<P: PageStore> Tree<P> {
         match self.update_helper(key, val)? {
             TreeEffect::Intact(tree) => Ok(tree),
             TreeEffect::Split { left, right } => self.parent_of_split(left, right),
-            _ => unreachable!()
+            _ => unreachable!(),
         }
     }
 
@@ -202,7 +215,7 @@ impl<P: PageStore> Tree<P> {
                 })
             }
             TreeEffect::Intact(tree) => Ok(tree),
-            TreeEffect::Split { left, right } => self.parent_of_split(left, right)
+            TreeEffect::Split { left, right } => self.parent_of_split(left, right),
         }
     }
 
@@ -228,21 +241,20 @@ impl<P: PageStore> Tree<P> {
                 };
                 match child.delete_helper(key)? {
                     TreeEffect::Empty => {
-                        let effect = parent.merge_child_entries(&[ChildEntry::Delete { i: child_idx }])?;
+                        let effect =
+                            parent.merge_child_entries(&[ChildEntry::Delete { i: child_idx }])?;
                         self.alloc(effect.into())
-                    },
-                    TreeEffect::Intact(child) => {
-                        match node::sufficiency(&child.root) {
-                            Sufficiency::Empty => unreachable!(),
-                            Sufficiency::Underflow => self.try_fix_underflow(parent, child, child_idx),
-                            Sufficiency::Sufficient => {
-                                let effect = parent.merge_child_entries(&[ChildEntry::Update {
-                                    i: child_idx,
-                                    key: child.root.get_key(0).into(),
-                                    page_num: child.page_num,
-                                }])?;
-                                self.alloc(effect.into())
-                            },
+                    }
+                    TreeEffect::Intact(child) => match node::sufficiency(&child.root) {
+                        Sufficiency::Empty => unreachable!(),
+                        Sufficiency::Underflow => self.try_fix_underflow(parent, child, child_idx),
+                        Sufficiency::Sufficient => {
+                            let effect = parent.merge_child_entries(&[ChildEntry::Update {
+                                i: child_idx,
+                                key: child.root.get_key(0).into(),
+                                page_num: child.page_num,
+                            }])?;
+                            self.alloc(effect.into())
                         }
                     },
                     TreeEffect::Split { left, right } => {
@@ -344,8 +356,13 @@ impl<P: PageStore> Tree<P> {
             NodeEffect::Empty => Ok(TreeEffect::Empty),
             NodeEffect::Intact(root) => {
                 let page_num = self.page_store.write_page(&root)?;
-                Ok(TreeEffect::Intact(Self{root, page_num, buffer_store: self.buffer_store.clone(), page_store: self.page_store.clone() }))
-            },
+                Ok(TreeEffect::Intact(Self {
+                    root,
+                    page_num,
+                    buffer_store: self.buffer_store.clone(),
+                    page_store: self.page_store.clone(),
+                }))
+            }
             NodeEffect::Split { left, right } => {
                 let left_page_num = self.page_store.write_page(&left)?;
                 let right_page_num = self.page_store.write_page(&right)?;
@@ -362,7 +379,140 @@ impl<P: PageStore> Tree<P> {
                     page_store: self.page_store.clone(),
                 };
                 Ok(TreeEffect::Split { left, right })
-            },
+            }
         }
+    }
+
+    /// Gets the height of the tree.
+    /// This performs a scan of the entire tree, so it's not really efficient.
+    #[allow(dead_code)]
+    fn height(&self) -> Result<u32> {
+        match &self.root {
+            Node::Leaf(_) => Ok(1),
+            Node::Internal(root) => {
+                let mut height = 1;
+                for (_, pn) in root.iter() {
+                    let child = self.page_store.read_page(pn)?;
+                    let child = Self {
+                        root: child,
+                        page_num: pn,
+                        buffer_store: self.buffer_store.clone(),
+                        page_store: self.page_store.clone(),
+                    };
+                    height = max(height, 1 + child.height()?);
+                }
+                Ok(height)
+            }
+        }
+    }
+
+    /// Iterates through the tree in-order.
+    /// This is very slow, so be careful.
+    #[allow(dead_code)]
+    fn inorder_iter(&self) -> InOrder<P> {
+        InOrder {
+            stack: vec![(0, Rc::new(self.clone()))],
+        }
+    }
+}
+
+struct InOrder<P: PageStore> {
+    stack: Vec<(usize, Rc<Tree<P>>)>,
+}
+
+impl<P: PageStore> Iterator for InOrder<P> {
+    type Item = (Rc<[u8]>, Rc<[u8]>);
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some((i, tree)) = self.stack.pop() {
+            let n = tree.root.get_num_keys();
+            if i == n {
+                continue;
+            }
+            match &tree.root {
+                Node::Leaf(leaf) => {
+                    self.stack.push((i + 1, tree.clone()));
+                    return Some((leaf.get_key(i).into(), leaf.get_value(i).into()));
+                }
+                Node::Internal(internal) => {
+                    let pn = internal.get_child_pointer(i);
+                    let child = tree.page_store.read_page(pn).unwrap();
+                    let child = Rc::new(Tree {
+                        root: child,
+                        page_num: pn,
+                        buffer_store: tree.buffer_store.clone(),
+                        page_store: tree.page_store.clone(),
+                    });
+                    self.stack.push((i + 1, tree));
+                    self.stack.push((0, child));
+                }
+            }
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::OnceLock;
+
+    use super::*;
+    use buffer_store::Heap;
+    use page_store::InMemory;
+
+    static TEST_BUFFER_STORE: Heap = Heap {};
+    static TEST_PAGE_STORE: OnceLock<InMemory> = OnceLock::new();
+
+    fn buffer_store() -> Heap {
+        TEST_BUFFER_STORE.clone()
+    }
+
+    fn page_store() -> InMemory {
+        TEST_PAGE_STORE.get_or_init(InMemory::new).clone()
+    }
+
+    #[test]
+    fn insert_into_empty_tree() {
+        let ps = page_store();
+        let tree = Tree::new(buffer_store(), ps.clone()).unwrap();
+        let tree = tree.insert(&[1], &[1]).unwrap();
+        ps.read_page(tree.page_num).unwrap();
+    }
+
+    #[test]
+    fn insert_until_split() {
+        let ps = page_store();
+        let mut tree = Tree::new(buffer_store(), ps.clone()).unwrap();
+        let mut i = 0u64;
+        loop {
+            if tree.height().unwrap() > 2 {
+                break;
+            }
+            let x = i.to_be_bytes();
+            let result = tree.insert(&x, &x);
+            assert!(
+                result.is_ok(),
+                "insert(i = {}) errored: {:?}",
+                i,
+                result.err().unwrap()
+            );
+            tree = result.unwrap();
+            let found = tree.get(&x).unwrap();
+            assert!(
+                matches!(found, Some(v) if v == x.into()),
+                "did not find val for {i}"
+            );
+            i += 1;
+        }
+        assert!(matches!(tree.root, Node::Internal(_)));
+        assert_eq!(tree.root.get_num_keys(), 2);
+        let got = tree.inorder_iter().collect::<Vec<_>>();
+        let want = (0..got.len() as u64)
+            .map(|i| {
+                let x = i.to_be_bytes();
+                let x: Rc<[u8]> = x.into();
+                (x.clone(), x.clone())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(got, want);
     }
 }
