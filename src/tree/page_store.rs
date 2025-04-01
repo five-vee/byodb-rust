@@ -33,6 +33,7 @@ struct InMemoryState {
 
 impl InMemory {
     /// Creates a new in-memory page store.
+    #[allow(dead_code)]
     fn new() -> Self {
         Self {
             state: InMemoryState {
