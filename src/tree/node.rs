@@ -129,7 +129,7 @@ const _: () = {
             - 2 // type
             - 2 // nkeys
             // 1 key-value pair + overhead
-            - 1 * (2 + 2 + 2 + MAX_KEY_SIZE as isize + MAX_VALUE_SIZE as isize)
+            - (2 + 2 + 2 + MAX_KEY_SIZE as isize + MAX_VALUE_SIZE as isize)
             >= 0,
         "1 key-value pair of max size cannot fit into a leaf node page"
     );

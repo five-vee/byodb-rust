@@ -35,8 +35,8 @@ impl<B: BufferStore> LeafEffect<B> {
 
 /// Gets the `i`th key in a leaf page buffer.
 pub fn get_key(buf: &[u8], i: usize) -> &[u8] {
-    let offset = get_offset(buf, i) as usize;
-    let num_keys = node::get_num_keys(buf) as usize;
+    let offset = get_offset(buf, i);
+    let num_keys = node::get_num_keys(buf);
     let key_len = u16::from_be_bytes([
         buf[4 + num_keys * 2 + offset],
         buf[4 + num_keys * 2 + offset + 1],
@@ -46,8 +46,8 @@ pub fn get_key(buf: &[u8], i: usize) -> &[u8] {
 
 /// Gets the `i`th value in a leaf page buffer.
 pub fn get_value(buf: &[u8], i: usize) -> &[u8] {
-    let offset = get_offset(buf, i) as usize;
-    let num_keys = node::get_num_keys(buf) as usize;
+    let offset = get_offset(buf, i);
+    let num_keys = node::get_num_keys(buf);
     let key_len = u16::from_be_bytes([
         buf[4 + num_keys * 2 + offset],
         buf[4 + num_keys * 2 + offset + 1],
@@ -78,7 +78,7 @@ pub fn get_num_bytes(buf: &[u8]) -> usize {
 fn set_next_offset(buf: &mut [u8], i: usize, key: &[u8], val: &[u8]) -> usize {
     let curr_offset = get_offset(buf, i);
     let next_offset = curr_offset + 4 + key.len() + val.len();
-    let next_i = i as usize + 1;
+    let next_i = i + 1;
     buf[4 + 2 * (next_i - 1)..4 + 2 * next_i].copy_from_slice(&(next_offset as u16).to_be_bytes());
     curr_offset
 }
@@ -152,10 +152,7 @@ impl<'a, B: BufferStore> LeafBuilder<'a, B> {
             return Ok(LeafEffect::Intact(self.build_single()));
         }
         let (left, right) = self.build_split()?;
-        Ok(LeafEffect::Split {
-            left: left,
-            right: right,
-        })
+        Ok(LeafEffect::Split { left, right })
     }
 
     /// Builds two splits of a leaf.
@@ -170,11 +167,11 @@ impl<'a, B: BufferStore> LeafBuilder<'a, B> {
             }
         }
 
-        let mut lb = Self::new(left_end, &self.store, false);
+        let mut lb = Self::new(left_end, self.store, false);
         for i in 0..left_end {
             lb = lb.add_key_value(get_key(&self.buf, i), get_value(&self.buf, i))?;
         }
-        let mut rb = Self::new(n - left_end, &self.store, false);
+        let mut rb = Self::new(n - left_end, self.store, false);
         for i in left_end..n {
             rb = rb.add_key_value(get_key(&self.buf, i), get_value(&self.buf, i))?;
         }
@@ -324,7 +321,7 @@ impl<B: BufferStore> Leaf<B> {
         node::get_num_keys(&self.buf)
     }
 
-    pub fn iter<'a>(&'a self) -> LeafIterator<'a, B> {
+    pub fn iter(&self) -> LeafIterator<B> {
         LeafIterator {
             node: self,
             i: 0,
@@ -449,7 +446,7 @@ mod tests {
     #[test]
     fn find_none() {
         let leaf = Leaf::new(&TEST_HEAP_STORE);
-        assert!(matches!(leaf.find("key".as_bytes()), None))
+        assert!(leaf.find("key".as_bytes()).is_none())
     }
 
     #[test]
@@ -496,7 +493,10 @@ mod tests {
 
         assert_eq!(
             leaf.iter().collect::<Vec<_>>(),
-            vec![("key1".as_bytes(), "val1_new".as_bytes()), ("key2".as_bytes(), "val2".as_bytes())]
+            vec![
+                ("key1".as_bytes(), "val1_new".as_bytes()),
+                ("key2".as_bytes(), "val2".as_bytes())
+            ]
         );
         assert_eq!(leaf.find("key1".as_bytes()).unwrap(), "val1_new".as_bytes());
     }
@@ -513,14 +513,21 @@ mod tests {
             .take_intact();
 
         // Update with a huge value to trigger splitting.
-        let (left, right) = leaf.update("1".as_bytes(), &[1u8; node::MAX_VALUE_SIZE])
+        let (left, right) = leaf
+            .update("1".as_bytes(), &[1u8; node::MAX_VALUE_SIZE])
             .unwrap()
             .take_split();
         drop(leaf);
         assert_eq!(left.get_num_keys(), 1);
         assert_eq!(right.get_num_keys(), 1);
-        assert_eq!(left.find(&[0u8; node::MAX_KEY_SIZE]).unwrap(), &[0u8; node::MAX_VALUE_SIZE]);
-        assert_eq!(right.find("1".as_bytes()).unwrap(), &[1u8; node::MAX_VALUE_SIZE]);
+        assert_eq!(
+            left.find(&[0u8; node::MAX_KEY_SIZE]).unwrap(),
+            &[0u8; node::MAX_VALUE_SIZE]
+        );
+        assert_eq!(
+            right.find("1".as_bytes()).unwrap(),
+            &[1u8; node::MAX_VALUE_SIZE]
+        );
     }
 
     #[test]

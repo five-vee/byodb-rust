@@ -94,7 +94,7 @@ fn get_offset(buf: &[u8], i: usize) -> usize {
 fn set_next_offset(buf: &mut [u8], i: usize, n: usize, key: &[u8]) -> usize {
     let curr_offset = get_offset(buf, i);
     let next_offset = curr_offset + key.len();
-    let next_i = i as usize + 1;
+    let next_i = i + 1;
     buf[4 + n * 8 + 2 * (next_i - 1)..4 + n * 8 + 2 * next_i]
         .copy_from_slice(&(next_offset as u16).to_be_bytes());
     curr_offset
@@ -330,8 +330,7 @@ impl<B: BufferStore> Internal<B> {
         (1..n)
             .rev()
             .find(|i| self.get_key(*i) <= key)
-            .or(Some(0))
-            .unwrap()
+            .unwrap_or(0)
     }
 
     /// Gets the child pointer at an index.
@@ -350,7 +349,7 @@ impl<B: BufferStore> Internal<B> {
     }
 
     /// Creates an key-value iterator for the internal node.
-    pub fn iter<'a>(&'a self) -> InternalIterator<'a, B> {
+    pub fn iter(&self) -> InternalIterator<B> {
         InternalIterator {
             node: self,
             i: 0,
