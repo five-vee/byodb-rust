@@ -33,7 +33,7 @@ use std::rc::Rc;
 type Result<T> = std::result::Result<T, TreeError>;
 
 /// An enum representing the effect of a tree operation.
-enum TreeEffect<P: PageStore> {
+enum TreeEffect<P: PageStore = InMemory> {
     /// A tree with 0 keys after a delete was performed on it.
     /// This is a special-case of `Underflow` done to avoid unnecessary
     /// page allocations, since empty non-root nodes aren't allowed.
@@ -91,7 +91,7 @@ impl<P: PageStore> TreeEffect<P> {
 /// the data until they reach a point where they would naturally access the
 /// newly written parts.
 #[derive(Clone)]
-pub struct Tree<P: PageStore> {
+pub struct Tree<P: PageStore = InMemory> {
     root: Node<P::B>,
     page_num: u64,
     buffer_store: P::B,
@@ -221,7 +221,23 @@ impl<P: PageStore> Tree<P> {
                     page_store: self.page_store.clone(),
                 })
             }
-            TreeEffect::Intact(tree) => Ok(tree),
+            TreeEffect::Intact(tree) => match node::sufficiency(&tree.root) {
+                Sufficiency::Empty => unreachable!(),
+                Sufficiency::Underflow => match &tree.root {
+                    Node::Leaf(_) => Ok(tree),
+                    Node::Internal(internal) => {
+                        let page_num = internal.get_child_pointer(0);
+                        let child = self.page_store.read_page(page_num)?;
+                        Ok(Self {
+                            root: child,
+                            page_num,
+                            buffer_store: self.buffer_store.clone(),
+                            page_store: self.page_store.clone(),
+                        })
+                    }
+                },
+                Sufficiency::Sufficient => Ok(tree),
+            },
             TreeEffect::Split { left, right } => self.parent_of_split(left, right),
         }
     }
@@ -254,13 +270,10 @@ impl<P: PageStore> Tree<P> {
                     }
                     TreeEffect::Intact(child) => match node::sufficiency(&child.root) {
                         Sufficiency::Empty => unreachable!(),
-                        Sufficiency::Underflow => self.try_fix_underflow(parent, child, child_idx),
+                        Sufficiency::Underflow => self.fix_underflow(parent, child, child_idx),
                         Sufficiency::Sufficient => {
-                            let effect = parent.merge_child_entries(&[ChildEntry::Update {
-                                i: child_idx,
-                                key: child.root.get_key(0).into(),
-                                page_num: child.page_num,
-                            }])?;
+                            let child_entries = TreeEffect::Intact(child).child_entries(child_idx);
+                            let effect = parent.merge_child_entries(child_entries.as_ref())?;
                             self.alloc(effect.into())
                         }
                     },
@@ -283,46 +296,28 @@ impl<P: PageStore> Tree<P> {
         }
     }
 
-    /// Tries to fix the underflow of `child` by stealing from or merging from
+    /// Fixes the underflow of `child` by stealing from or merging from
     /// one of its direct siblings
     /// (either at `child_idx - 1` or `child_idx + 1`) within the
     /// parent (internal) node.
-    ///
-    /// If the fix failed, just leaves the child in an underflow state.
-    fn try_fix_underflow(
+    fn fix_underflow(
         &self,
         parent: &Internal<P::B>,
         child: Self,
         child_idx: usize,
     ) -> Result<TreeEffect<P>> {
-        // Try stealing or merging the left sibling.
+        // TODO: The steal is inefficient if either the sibling is insufficient
+        // or the child can't fit what it tries to steal.
+
+        // Steal from or merge with the left sibling.
         if child_idx > 0 {
             return self.steal_or_merge(parent, &child.root, child_idx, child_idx - 1);
         }
-        // Try stealing or merging the right sibling.
-        if child_idx < parent.get_num_keys() - 1 {
-            return self.steal_or_merge(parent, &child.root, child_idx, child_idx + 1);
-        }
-
-        // 5. Just leave child in underflow.
-        // Note: This only happens in leaf nodes and not internal nodes.
-        // We guarantee that an internal node can fit at least 3 keys,
-        // and that an internal node is sufficient if it has at least 2 keys.
-        // The child being in underflow means it has only 1 key.
-        // If the left/right internal node doesn't have enough to steal from,
-        // then the merge of left/right and the child will produce a new node
-        // with 3 keys, which will not exceed the page size.
-        // Leaf nodes, OTOH, can remain underflow due to variable-length
-        // keys and values.
-        let effect = parent.merge_child_entries(&[ChildEntry::Update {
-            i: child_idx,
-            key: child.root.get_key(0).into(),
-            page_num: child.page_num,
-        }])?;
-        self.alloc(effect.into())
+        // Do so with the right sibling.
+        self.steal_or_merge(parent, &child.root, child_idx, child_idx + 1)
     }
 
-    /// Tries to fix the underflow of `child` by stealing from or merging from
+    /// Fixes the underflow of `child` by stealing from or merging from
     /// one of its direct siblings.
     fn steal_or_merge(
         &self,
@@ -332,13 +327,45 @@ impl<P: PageStore> Tree<P> {
         sibling_idx: usize,
     ) -> Result<TreeEffect<P>> {
         let sibling_num = parent.get_child_pointer(sibling_idx);
-        let sibling = self.page_store.read_page(sibling_num)?;
-        let mut left = &sibling;
-        let mut right = child;
+        let sibling = &self.page_store.read_page(sibling_num)?;
+
+        let (mut left, mut right) = (sibling, child);
+        let (mut left_idx, mut right_idx) = (sibling_idx, child_idx);
         if sibling_idx > child_idx {
-            (left, right) = (right, left);
+            (right, left) = (sibling, child);
+            (right_idx, left_idx) = (sibling_idx, child_idx);
         }
-        self.alloc(node::steal_or_merge(left, right)?)
+        match self.alloc(node::steal_or_merge(left, right)?)? {
+            TreeEffect::Empty => unreachable!(),
+            TreeEffect::Intact(child) => {
+                // merged
+                let effect = parent.merge_child_entries(&[
+                    ChildEntry::Update {
+                        i: left_idx,
+                        key: child.root.get_key(0).into(),
+                        page_num: child.page_num,
+                    },
+                    ChildEntry::Delete { i: right_idx },
+                ])?;
+                self.alloc(effect.into())
+            }
+            TreeEffect::Split { left, right } => {
+                // stolen
+                let effect = parent.merge_child_entries(&[
+                    ChildEntry::Update {
+                        i: left_idx,
+                        key: left.root.get_key(0).into(),
+                        page_num: left.page_num,
+                    },
+                    ChildEntry::Update {
+                        i: right_idx,
+                        key: right.root.get_key(0).into(),
+                        page_num: right.page_num,
+                    },
+                ])?;
+                self.alloc(effect.into())
+            }
+        }
     }
 
     /// Returns a new internal root node whose children are split nodes
@@ -396,11 +423,11 @@ impl<P: PageStore> Tree<P> {
     /// Gets the height of the tree.
     /// This performs a scan of the entire tree, so it's not really efficient.
     fn height(&self) -> Result<u32> {
-        use std::cmp::max;
         match &self.root {
             Node::Leaf(_) => Ok(1),
             Node::Internal(root) => {
-                let mut height = 1;
+                assert!(root.get_num_keys() >= 2);
+                let mut height: Option<u32> = None;
                 for (_, pn) in root.iter() {
                     let child = self.page_store.read_page(pn)?;
                     let child = Self {
@@ -409,9 +436,13 @@ impl<P: PageStore> Tree<P> {
                         buffer_store: self.buffer_store.clone(),
                         page_store: self.page_store.clone(),
                     };
-                    height = max(height, 1 + child.height()?);
+                    let child_height = child.height()?;
+                    if height.is_some() {
+                        assert_eq!(height.unwrap(), 1 + child_height);
+                    }
+                    height = Some(1 + child_height);
                 }
-                Ok(height)
+                Ok(height.unwrap())
             }
         }
     }
@@ -468,20 +499,12 @@ mod tests {
     use buffer_store::Heap;
     use page_store::InMemory;
 
-    #[test]
-    fn insert_into_empty_tree() {
-        let ps = InMemory::new();
-        let tree = Tree::new_in(Heap, ps.clone()).unwrap();
-        let tree = tree.insert(&[1], &[1]).unwrap();
-        ps.read_page(tree.page_num).unwrap();
-    }
-
-    #[test]
-    fn insert_until_split() {
+    fn insert_until_height(height: u32) -> Tree {
+        assert_ne!(height, 0);
         let mut tree = Tree::new().unwrap();
         let mut i = 0u64;
         loop {
-            if tree.height().unwrap() > 2 {
+            if tree.height().unwrap() == height {
                 break;
             }
             let x = i.to_be_bytes();
@@ -500,8 +523,50 @@ mod tests {
             );
             i += 1;
         }
+        tree
+    }
+
+    fn insert_complete(height: u32) -> Tree {
+        assert_ne!(height, 0);
+        let mut tree = Tree::new().unwrap();
+        let mut i = 0u64;
+        loop {
+            let x = i.to_be_bytes();
+            let result = tree.insert(&x, &x);
+            assert!(
+                result.is_ok(),
+                "insert(i = {}) errored: {:?}",
+                i,
+                result.err().unwrap()
+            );
+            let new_tree = result.unwrap();
+            let found = new_tree.get(&x).unwrap();
+            assert!(
+                matches!(found, Some(v) if v == x.into()),
+                "did not find val for {i}"
+            );
+            i += 1;
+            if new_tree.height().unwrap() > height {
+                break;
+            }
+            tree = new_tree;
+        }
+        tree
+    }
+
+    #[test]
+    fn insert_into_empty_tree() {
+        let ps = InMemory::new();
+        let tree = Tree::new_in(Heap, ps.clone()).unwrap();
+        let tree = tree.insert(&[1], &[1]).unwrap();
+        ps.read_page(tree.page_num).unwrap();
+    }
+
+    #[test]
+    fn insert_until_split() {
+        let tree = insert_until_height(3);
         assert!(matches!(tree.root, Node::Internal(_)));
-        assert_eq!(tree.root.get_num_keys(), 2);
+        assert!(tree.root.get_num_keys() >= 2);
         let got = tree.inorder_iter().collect::<Vec<_>>();
         let want = (0..got.len() as u64)
             .map(|i| {
@@ -511,5 +576,211 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn get() {
+        let got = insert_until_height(2)
+            .get(&1u64.to_be_bytes())
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, 1u64.to_be_bytes().into());
+    }
+
+    #[test]
+    fn update_intact() {
+        let tree = Tree::new()
+            .unwrap()
+            .insert(&[0], &[0])
+            .unwrap()
+            .update(&[0], &[1])
+            .unwrap();
+        let got = tree.get(&[0]).unwrap().unwrap();
+        assert_eq!(got, [1].into());
+        assert_eq!(tree.height().unwrap(), 1);
+    }
+
+    #[test]
+    fn update_split() {
+        let old_tree = insert_complete(2);
+        let new_tree = old_tree
+            .update(&0u64.to_be_bytes(), &[0u8; node::MAX_VALUE_SIZE])
+            .unwrap();
+        let got = new_tree.get(&0u64.to_be_bytes()).unwrap().unwrap();
+        assert_eq!(got, [0u8; node::MAX_VALUE_SIZE].into());
+        assert_eq!(new_tree.height().unwrap(), old_tree.height().unwrap() + 1);
+    }
+
+    #[test]
+    fn delete_until_empty() {
+        let tree = insert_until_height(3);
+        let max_key = tree.inorder_iter().last().map(|(k, _)| k).unwrap();
+        let max = u64::from_be_bytes([
+            max_key[0], max_key[1], max_key[2], max_key[3], max_key[4], max_key[5], max_key[6],
+            max_key[7],
+        ]);
+        let mut tree = tree;
+        for i in 0..=max {
+            let key = &i.to_be_bytes();
+            let result = tree.delete(key);
+            assert!(
+                result.is_ok(),
+                "delete(i = {}) errored: {:?}",
+                i,
+                result.err().unwrap()
+            );
+            tree = result.unwrap();
+            let result = tree.get(key);
+            assert!(
+                result.is_ok(),
+                "get(deleted i = {}) errored: {:?}",
+                i,
+                result.err().unwrap()
+            );
+            let got = result.unwrap();
+            assert!(
+                got.is_none(),
+                "get(deleted i = {}) was found = {:?}",
+                i,
+                got.unwrap()
+            );
+        }
+        assert_eq!(tree.height().unwrap(), 1);
+        assert_eq!(tree.root.get_num_keys(), 0);
+    }
+
+    // [ 1000          1                     1000          1000          1000      ]
+    // [ 1000 3000 ] [ 1 1000, 1000 1000 ] [ 1000 3000 ] [ 1000 3000 ] [ 1000 3000 ]
+    //
+    // delete 1 1000
+    //
+    // [ 1000          1000          1000          1000          1000      ]
+    // [ 1000 3000 ] [ 1000 1000 ] [ 1000 3000 ] [ 1000 3000 ] [ 1000 3000 ]
+    //
+    // split
+    //
+    // [ 1000                                      1000                    ]
+    // [ 1000          1000          1000      ] [ 1000          1000      ]
+    // [ 1000 3000 ] [ 1000 1000 ] [ 1000 3000 ] [ 1000 3000 ] [ 1000 3000 ]
+    #[test]
+    fn delete_triggers_higher_root() {
+        // Setup
+        let tree = Tree::new()
+            .unwrap()
+            .insert(&[0; MAX_KEY_SIZE], &[0; MAX_VALUE_SIZE])
+            .unwrap()
+            .insert(&[1], &[1; 1000])
+            .unwrap()
+            .insert(&[2; 1000], &[2; 1000])
+            .unwrap()
+            .insert(&[3; MAX_KEY_SIZE], &[3; MAX_VALUE_SIZE])
+            .unwrap()
+            .insert(&[4; MAX_KEY_SIZE], &[4; MAX_VALUE_SIZE])
+            .unwrap()
+            .insert(&[5; MAX_KEY_SIZE], &[5; MAX_VALUE_SIZE])
+            .unwrap();
+        assert_eq!(tree.height().unwrap(), 2);
+        assert_eq!(tree.root.get_num_keys(), 5);
+
+        // Delete &[1]. This should trigger a split,
+        // and the height should grow.
+        let tree = tree.delete(&[1]).unwrap();
+        assert!(tree.get(&[1]).unwrap().is_none());
+        assert_eq!(tree.height().unwrap(), 3);
+        assert_eq!(tree.root.get_num_keys(), 2);
+
+        // Delete the last leaf for more test coverage
+        _ = tree.delete(&[5; MAX_KEY_SIZE]).unwrap();
+    }
+
+    // [ 1000                                                                          1000                    ]
+    // [ 1000          1000          1000          1                     1000      ] [ 1000          1000      ]
+    // [ 1000 3000 ] [ 1000 3000 ] [ 1000 3000 ] [ 1 1000, 1000 1000 ] [ 1000 3000 ] [ 1000 3000 ] [ 1000 3000 ]
+    //
+    // delete 1 1000
+    //
+    // [ 1000                                                                  1000                    ]
+    // [ 1000          1000          1000          1000          1000      ] [ 1000          1000      ]
+    // [ 1000 3000 ] [ 1000 3000 ] [ 1000 3000 ] [ 1000 1000 ] [ 1000 3000 ] [ 1000 3000 ] [ 1000 3000 ]
+    //
+    // split
+    //
+    // [ 1000                                      1000                        1000                    ]
+    // [ 1000          1000          1000      ] [ 1000          1000      ] [ 1000          1000      ]
+    // [ 1000 3000 ] [ 1000 3000 ] [ 1000 3000 ] [ 1000 1000 ] [ 1000 3000 ] [ 1000 3000 ] [ 1000 3000 ]
+    #[test]
+    fn delete_triggers_larger_root() {
+        // Setup
+        let tree = Tree::new()
+            .unwrap()
+            .insert(&[0; MAX_KEY_SIZE], &[0; MAX_VALUE_SIZE])
+            .unwrap()
+            .insert(&[1; MAX_KEY_SIZE], &[1; MAX_VALUE_SIZE])
+            .unwrap()
+            .insert(&[2; MAX_KEY_SIZE], &[2; MAX_VALUE_SIZE])
+            .unwrap()
+            .insert(&[3], &[3; 1000])
+            .unwrap()
+            .insert(&[4; 1000], &[4; 1000])
+            .unwrap()
+            .insert(&[6; MAX_KEY_SIZE], &[6; MAX_VALUE_SIZE])
+            .unwrap()
+            .insert(&[7; MAX_KEY_SIZE], &[7; MAX_VALUE_SIZE])
+            .unwrap()
+            .insert(&[5; MAX_KEY_SIZE], &[5; MAX_VALUE_SIZE])
+            .unwrap();
+        assert_eq!(tree.height().unwrap(), 3);
+        assert_eq!(tree.root.get_num_keys(), 2);
+
+        // Delete &[3]. This should trigger a split,
+        // but the height shouldn't grow.
+        let tree = tree.delete(&[3]).unwrap();
+        assert!(tree.get(&[3]).unwrap().is_none());
+        assert_eq!(tree.height().unwrap(), 3);
+        assert_eq!(tree.root.get_num_keys(), 3);
+    }
+
+    // [ 1000 x 2 ]
+    // [ 1000 x 3 ], [ 1000 x 2 ]
+    // [ 1000 x 4 ] x 4, [ 1000 x 4, 1 ]
+    // [ 1000 3000 ] x 20, [ 1 1000, 1000 1000 ]
+    //
+    // delete 1 1000
+    //
+    // [ 1000 x 2 ]
+    // [ 1000 x 3 ], [ 1000 x 2 ]
+    // [ 1000 x 4 ] x 4, [ 1000 x 5 ]
+    // [ 1000 3000 ] x 20, [ 1000 1000 ]
+    //
+    // split
+    //
+    // [ 1000 x 2 ]
+    // [ 1000 x 3 ] x 2
+    // [ 1000 x 4 ] x 4, [ 1000 x 3 ], [ 1000 x 2 ]
+    // [ 1000 3000 ] x 20, [ 1000 1000 ]
+    #[test]
+    fn delete_triggers_internal_split() {
+        // Setup
+        let mut tree = Tree::new().unwrap();
+        for i in 0u8..=19u8 {
+            tree = tree
+                .insert(&[i; MAX_KEY_SIZE], &[i; MAX_VALUE_SIZE])
+                .unwrap();
+        }
+        tree = tree
+            .insert(&[20], &[20; 1000])
+            .unwrap()
+            .insert(&[21; 1000], &[21; 1000])
+            .unwrap();
+        assert_eq!(tree.height().unwrap(), 4);
+        assert_eq!(tree.root.get_num_keys(), 2);
+
+        // Delete &[20]. This should trigger a split,
+        // but the height shouldn't grow.
+        // Neither should root change number of keys.
+        let tree = tree.delete(&[20]).unwrap();
+        assert!(tree.get(&[20]).unwrap().is_none());
+        assert_eq!(tree.height().unwrap(), 4);
+        assert_eq!(tree.root.get_num_keys(), 2);
     }
 }

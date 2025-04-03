@@ -93,16 +93,16 @@
 //! The node format is just an implementation detail. The B+tree will work as
 //! long as nodes contain the necessary information.
 
-mod leaf;
 mod internal;
+mod leaf;
 
-pub use internal::ChildEntry;
-pub use internal::Internal;
-pub use leaf::Leaf;
-use internal::InternalEffect;
-use leaf::LeafEffect;
 use super::buffer_store::BufferStore;
 use super::error::NodeError;
+pub use internal::ChildEntry;
+pub use internal::Internal;
+use internal::InternalEffect;
+pub use leaf::Leaf;
+use leaf::LeafEffect;
 
 type Result<T> = std::result::Result<T, NodeError>;
 
@@ -177,6 +177,20 @@ impl<B: BufferStore> Node<B> {
             Node::Internal(internal) => internal.get_num_keys(),
         }
     }
+
+    pub fn ref_as_leaf(&self) -> &Leaf<B> {
+        match self {
+            Node::Leaf(leaf) => leaf,
+            _ => panic!("{self:?} is not a Node::Leaf"),
+        }
+    }
+
+    pub fn ref_as_internal(&self) -> &Internal<B> {
+        match self {
+            Node::Internal(internal) => internal,
+            _ => panic!("{self:?} is not a Node::Internal"),
+        }
+    }
 }
 
 /// An enum representing the effect of a node operation.
@@ -199,7 +213,10 @@ impl<B: BufferStore> From<LeafEffect<B>> for NodeEffect<B> {
         match value {
             LeafEffect::Empty => NodeEffect::Empty,
             LeafEffect::Intact(leaf) => NodeEffect::Intact(Node::Leaf(leaf)),
-            LeafEffect::Split{left, right} => NodeEffect::Split { left: Node::Leaf(left), right: Node::Leaf(right) }
+            LeafEffect::Split { left, right } => NodeEffect::Split {
+                left: Node::Leaf(left),
+                right: Node::Leaf(right),
+            },
         }
     }
 }
@@ -209,7 +226,10 @@ impl<B: BufferStore> From<InternalEffect<B>> for NodeEffect<B> {
         match value {
             InternalEffect::Empty => NodeEffect::Empty,
             InternalEffect::Intact(internal) => NodeEffect::Intact(Node::Internal(internal)),
-            InternalEffect::Split{left, right} => NodeEffect::Split { left: Node::Internal(left), right: Node::Internal(right) }
+            InternalEffect::Split { left, right } => NodeEffect::Split {
+                left: Node::Internal(left),
+                right: Node::Internal(right),
+            },
         }
     }
 }
@@ -234,7 +254,7 @@ pub fn sufficiency<B: BufferStore>(n: &Node<B>) -> Sufficiency {
     match n.get_num_keys() {
         0 => Sufficiency::Empty,
         1 => Sufficiency::Underflow,
-        _ => Sufficiency::Sufficient
+        _ => Sufficiency::Sufficient,
     }
 }
 
@@ -244,7 +264,9 @@ pub fn sufficiency<B: BufferStore>(n: &Node<B>) -> Sufficiency {
 pub fn steal_or_merge<B: BufferStore>(left: &Node<B>, right: &Node<B>) -> Result<NodeEffect<B>> {
     match (left, right) {
         (Node::Leaf(left), Node::Leaf(right)) => Ok(Leaf::steal_or_merge(left, right)?.into()),
-        (Node::Internal(left), Node::Internal(right)) => Ok(Internal::steal_or_merge(left, right)?.into()),
+        (Node::Internal(left), Node::Internal(right)) => {
+            Ok(Internal::steal_or_merge(left, right)?.into())
+        }
         _ => unreachable!("It is assumed that both are the same node type."),
     }
 }
