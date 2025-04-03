@@ -28,7 +28,7 @@ pub use error::TreeError;
 use node::{ChildEntry, Internal, Leaf, Node, NodeEffect, Sufficiency};
 pub use node::{MAX_KEY_SIZE, MAX_VALUE_SIZE};
 use page_store::{InMemory, PageStore};
-use std::{cmp::max, rc::Rc};
+use std::rc::Rc;
 
 type Result<T> = std::result::Result<T, TreeError>;
 
@@ -389,11 +389,14 @@ impl<P: PageStore> Tree<P> {
             }
         }
     }
+}
 
+#[cfg(test)]
+impl<P: PageStore> Tree<P> {
     /// Gets the height of the tree.
     /// This performs a scan of the entire tree, so it's not really efficient.
-    #[allow(dead_code)]
     fn height(&self) -> Result<u32> {
+        use std::cmp::max;
         match &self.root {
             Node::Leaf(_) => Ok(1),
             Node::Internal(root) => {
@@ -415,7 +418,6 @@ impl<P: PageStore> Tree<P> {
 
     /// Iterates through the tree in-order.
     /// This is very slow, so be careful.
-    #[allow(dead_code)]
     fn inorder_iter(&self) -> InOrder<P> {
         InOrder {
             stack: vec![(0, Rc::new(self.clone()))],
@@ -423,10 +425,12 @@ impl<P: PageStore> Tree<P> {
     }
 }
 
+#[cfg(test)]
 struct InOrder<P: PageStore> {
     stack: Vec<(usize, Rc<Tree<P>>)>,
 }
 
+#[cfg(test)]
 impl<P: PageStore> Iterator for InOrder<P> {
     type Item = (Rc<[u8]>, Rc<[u8]>);
     fn next(&mut self) -> Option<Self::Item> {
