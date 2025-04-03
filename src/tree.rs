@@ -23,10 +23,11 @@ mod error;
 mod node;
 mod page_store;
 
+use buffer_store::Heap;
 pub use error::TreeError;
 use node::{ChildEntry, Internal, Leaf, Node, NodeEffect, Sufficiency};
 pub use node::{MAX_KEY_SIZE, MAX_VALUE_SIZE};
-use page_store::PageStore;
+use page_store::{InMemory, PageStore};
 use std::{cmp::max, rc::Rc};
 
 type Result<T> = std::result::Result<T, TreeError>;
@@ -97,9 +98,15 @@ pub struct Tree<P: PageStore> {
     page_store: P,
 }
 
+impl Tree<InMemory> {
+    pub fn new() -> Result<Self> {
+        Self::new_in(Heap, InMemory::new())
+    }
+}
+
 impl<P: PageStore> Tree<P> {
     /// Creates an new empty B+ tree.
-    pub fn new(buffer_store: P::B, page_store: P) -> Result<Self> {
+    pub fn new_in(buffer_store: P::B, page_store: P) -> Result<Self> {
         let root = Node::Leaf(Leaf::new(&buffer_store));
         let page_num = page_store.write_page(&root)?;
         Ok(Self {
@@ -453,35 +460,21 @@ impl<P: PageStore> Iterator for InOrder<P> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::OnceLock;
-
     use super::*;
     use buffer_store::Heap;
     use page_store::InMemory;
 
-    static TEST_BUFFER_STORE: Heap = Heap {};
-    static TEST_PAGE_STORE: OnceLock<InMemory> = OnceLock::new();
-
-    fn buffer_store() -> Heap {
-        TEST_BUFFER_STORE.clone()
-    }
-
-    fn page_store() -> InMemory {
-        TEST_PAGE_STORE.get_or_init(InMemory::new).clone()
-    }
-
     #[test]
     fn insert_into_empty_tree() {
-        let ps = page_store();
-        let tree = Tree::new(buffer_store(), ps.clone()).unwrap();
+        let ps = InMemory::new();
+        let tree = Tree::new_in(Heap, ps.clone()).unwrap();
         let tree = tree.insert(&[1], &[1]).unwrap();
         ps.read_page(tree.page_num).unwrap();
     }
 
     #[test]
     fn insert_until_split() {
-        let ps = page_store();
-        let mut tree = Tree::new(buffer_store(), ps.clone()).unwrap();
+        let mut tree = Tree::new().unwrap();
         let mut i = 0u64;
         loop {
             if tree.height().unwrap() > 2 {

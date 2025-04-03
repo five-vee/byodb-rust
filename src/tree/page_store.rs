@@ -5,7 +5,6 @@ use std::sync::{Arc, Mutex};
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
-    rc::Rc,
 };
 
 type Result<T> = std::result::Result<T, PageStoreError>;
@@ -47,7 +46,7 @@ impl InMemory {
 impl PageStore for InMemory {
     type B = Heap;
 
-    fn read_page(&self, page_num: u64) -> Result<Node<Heap>> {
+    fn read_page(&self, page_num: u64) -> Result<Node<Self::B>> {
         let state = self.state.lock().unwrap();
         let result = state.pages.borrow().get(&page_num).map_or(
             Err(PageStoreError::Read(
@@ -58,7 +57,7 @@ impl PageStore for InMemory {
         result
     }
 
-    fn write_page(&self, node: &Node<Heap>) -> Result<u64> {
+    fn write_page(&self, node: &Node<Self::B>) -> Result<u64> {
         let state = self.state.lock().unwrap();
         let curr = state.counter.get();
         assert!(state
