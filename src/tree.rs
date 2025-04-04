@@ -270,7 +270,7 @@ impl<P: PageStore> Tree<P> {
                     }
                     TreeEffect::Intact(child) => match node::sufficiency(&child.root) {
                         Sufficiency::Empty => unreachable!(),
-                        Sufficiency::Underflow => self.fix_underflow(parent, child, child_idx),
+                        Sufficiency::Underflow => self.try_fix_underflow(parent, child, child_idx),
                         Sufficiency::Sufficient => {
                             let child_entries = TreeEffect::Intact(child).child_entries(child_idx);
                             let effect = parent.merge_child_entries(child_entries.as_ref())?;
@@ -300,34 +300,58 @@ impl<P: PageStore> Tree<P> {
     /// one of its direct siblings
     /// (either at `child_idx - 1` or `child_idx + 1`) within the
     /// parent (internal) node.
-    fn fix_underflow(
+    fn try_fix_underflow(
         &self,
         parent: &Internal<P::B>,
         child: Self,
         child_idx: usize,
     ) -> Result<TreeEffect<P>> {
-        // TODO: The steal is inefficient if either the sibling is insufficient
-        // or the child can't fit what it tries to steal.
-
-        // Steal from or merge with the left sibling.
+        // Try to steal from or merge with the left sibling.
         if child_idx > 0 {
-            return self.steal_or_merge(parent, &child.root, child_idx, child_idx - 1);
+            if let Some(effect) =
+                self.try_steal_or_merge(parent, &child.root, child_idx, child_idx - 1)?
+            {
+                return Ok(effect);
+            }
         }
-        // Do so with the right sibling.
-        self.steal_or_merge(parent, &child.root, child_idx, child_idx + 1)
+        // Try to do so with the right sibling.
+        if child_idx < parent.get_num_keys() - 1 {
+            if let Some(effect) =
+                self.try_steal_or_merge(parent, &child.root, child_idx, child_idx + 1)?
+            {
+                return Ok(effect);
+            }
+        }
+
+        // Leave as underflow.
+        self.alloc(
+            parent
+                .merge_child_entries(&[ChildEntry::Update {
+                    i: child_idx,
+                    key: child.root.get_key(0).into(),
+                    page_num: child.page_num,
+                }])?
+                .into(),
+        )
     }
 
     /// Fixes the underflow of `child` by stealing from or merging from
     /// one of its direct siblings.
-    fn steal_or_merge(
+    fn try_steal_or_merge(
         &self,
         parent: &Internal<P::B>,
         child: &Node<P::B>,
         child_idx: usize,
         sibling_idx: usize,
-    ) -> Result<TreeEffect<P>> {
+    ) -> Result<Option<TreeEffect<P>>> {
         let sibling_num = parent.get_child_pointer(sibling_idx);
         let sibling = &self.page_store.read_page(sibling_num)?;
+
+        if !node::can_steal(sibling, child, sibling_idx < child_idx)
+            && !node::can_merge(sibling, child)
+        {
+            return Ok(None);
+        }
 
         let (mut left, mut right) = (sibling, child);
         let (mut left_idx, mut right_idx) = (sibling_idx, child_idx);
@@ -347,7 +371,7 @@ impl<P: PageStore> Tree<P> {
                     },
                     ChildEntry::Delete { i: right_idx },
                 ])?;
-                self.alloc(effect.into())
+                Ok(Some(self.alloc(effect.into())?))
             }
             TreeEffect::Split { left, right } => {
                 // stolen
@@ -363,7 +387,7 @@ impl<P: PageStore> Tree<P> {
                         page_num: right.page_num,
                     },
                 ])?;
-                self.alloc(effect.into())
+                Ok(Some(self.alloc(effect.into())?))
             }
         }
     }

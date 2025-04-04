@@ -178,6 +178,13 @@ impl<B: BufferStore> Node<B> {
         }
     }
 
+    pub fn get_num_bytes(&self) -> usize {
+        match self {
+            Node::Leaf(leaf) => leaf.get_num_bytes(),
+            Node::Internal(internal) => internal.get_num_bytes(),
+        }
+    }
+
     pub fn ref_as_leaf(&self) -> &Leaf<B> {
         match self {
             Node::Leaf(leaf) => leaf,
@@ -269,6 +276,35 @@ pub fn steal_or_merge<B: BufferStore>(left: &Node<B>, right: &Node<B>) -> Result
         }
         _ => unreachable!("It is assumed that both are the same node type."),
     }
+}
+
+/// Checks whether `to` can steal a key from `from`.
+/// `steal_end` determines whether to steal the end key of `from`,
+/// otherwise the beginning key.
+pub fn can_steal<B: BufferStore>(from: &Node<B>, to: &Node<B>, steal_end: bool) -> bool {
+    if from.get_num_keys() <= 2 {
+        return false;
+    }
+    let i = if steal_end {
+        from.get_num_keys() - 1
+    } else {
+        0
+    };
+    match (from, to) {
+        (Node::Leaf(from), Node::Leaf(to)) => {
+            2 + 4 + from.get_key(i).len() + from.get_value(i).len() + to.get_num_bytes()
+                <= PAGE_SIZE
+        }
+        (Node::Internal(from), Node::Internal(to)) => {
+            8 + 2 + from.get_key(i).len() + to.get_num_bytes() <= PAGE_SIZE
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// Checks whether the merging of `left` and `right` doesn't overflow.
+pub fn can_merge<B: BufferStore>(left: &Node<B>, right: &Node<B>) -> bool {
+    left.get_num_bytes() + right.get_num_bytes() - 4 < PAGE_SIZE
 }
 
 /// Sets the page header of a node's page buffer.

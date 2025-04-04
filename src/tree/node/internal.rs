@@ -360,7 +360,7 @@ impl<B: BufferStore> Internal<B> {
         }
     }
 
-    fn get_num_bytes(&self) -> usize {
+    pub fn get_num_bytes(&self) -> usize {
         get_num_bytes(&self.buf)
     }
 }
