@@ -21,4 +21,12 @@ https://build-your-own.org/database/, but instead of Go, use Rust. This a person
 * [x] 5.1 High-level interfaces
 * [x] 5.2 Merge nodes
 * [x] 5.3 B+tree deletion
-* [ ] 5.4 Test the B+tree
+* [x] 5.4 Test the B+tree
+
+## [06. Append-Only KV Store](https://build-your-own.org/database/06_btree_disk)
+
+* [ ] 6.2 Two-phase update
+* [ ] 6.3 Database on a file
+* [ ] 6.4 Manage disk pages
+* [ ] 6.5 The meta page
+* [ ] 6.6 Error handling
