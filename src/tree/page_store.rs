@@ -43,6 +43,12 @@ impl InMemory {
     }
 }
 
+impl Default for InMemory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PageStore for InMemory {
     type B = Heap;
 
