@@ -2,7 +2,12 @@
 default:
   just --list
 
+alias cov-open := coverage-open
 alias cov := coverage
+
+[group('test')]
+coverage-open:
+  cargo llvm-cov nextest --open
 
 # Use REMAINDER to specify a test or tests, e.g. tree::node::leaf
 [group('test')]
