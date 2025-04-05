@@ -19,13 +19,13 @@
 //! implicitly retained.
 
 mod buffer_store;
+pub mod consts;
 mod error;
 mod node;
 mod page_store;
 
 pub use error::TreeError;
 use node::{ChildEntry, Internal, Leaf, Node, NodeEffect, Sufficiency};
-pub use node::{MAX_KEY_SIZE, MAX_VALUE_SIZE};
 use page_store::{InMemory, PageStore};
 use std::rc::Rc;
 
@@ -612,10 +612,10 @@ mod tests {
     fn update_split() {
         let old_tree = insert_complete(2);
         let new_tree = old_tree
-            .update(&0u64.to_be_bytes(), &[0u8; node::MAX_VALUE_SIZE])
+            .update(&0u64.to_be_bytes(), &[0u8; consts::MAX_VALUE_SIZE])
             .unwrap();
         let got = new_tree.get(&0u64.to_be_bytes()).unwrap().unwrap();
-        assert_eq!(got, [0u8; node::MAX_VALUE_SIZE].into());
+        assert_eq!(got, [0u8; consts::MAX_VALUE_SIZE].into());
         assert_eq!(new_tree.height().unwrap(), old_tree.height().unwrap() + 1);
     }
 
@@ -675,17 +675,17 @@ mod tests {
         // Setup
         let tree = Tree::new()
             .unwrap()
-            .insert(&[0; MAX_KEY_SIZE], &[0; MAX_VALUE_SIZE])
+            .insert(&[0; consts::MAX_KEY_SIZE], &[0; consts::MAX_VALUE_SIZE])
             .unwrap()
             .insert(&[1], &[1; 1000])
             .unwrap()
             .insert(&[2; 1000], &[2; 1000])
             .unwrap()
-            .insert(&[3; MAX_KEY_SIZE], &[3; MAX_VALUE_SIZE])
+            .insert(&[3; consts::MAX_KEY_SIZE], &[3; consts::MAX_VALUE_SIZE])
             .unwrap()
-            .insert(&[4; MAX_KEY_SIZE], &[4; MAX_VALUE_SIZE])
+            .insert(&[4; consts::MAX_KEY_SIZE], &[4; consts::MAX_VALUE_SIZE])
             .unwrap()
-            .insert(&[5; MAX_KEY_SIZE], &[5; MAX_VALUE_SIZE])
+            .insert(&[5; consts::MAX_KEY_SIZE], &[5; consts::MAX_VALUE_SIZE])
             .unwrap();
         assert_eq!(tree.height().unwrap(), 2);
         assert_eq!(tree.root.get_num_keys(), 5);
@@ -698,7 +698,7 @@ mod tests {
         assert_eq!(tree.root.get_num_keys(), 2);
 
         // Delete the last leaf for more test coverage
-        _ = tree.delete(&[5; MAX_KEY_SIZE]).unwrap();
+        _ = tree.delete(&[5; consts::MAX_KEY_SIZE]).unwrap();
     }
 
     // [ 1000                                                                          1000                    ]
@@ -721,21 +721,21 @@ mod tests {
         // Setup
         let tree = Tree::new()
             .unwrap()
-            .insert(&[0; MAX_KEY_SIZE], &[0; MAX_VALUE_SIZE])
+            .insert(&[0; consts::MAX_KEY_SIZE], &[0; consts::MAX_VALUE_SIZE])
             .unwrap()
-            .insert(&[1; MAX_KEY_SIZE], &[1; MAX_VALUE_SIZE])
+            .insert(&[1; consts::MAX_KEY_SIZE], &[1; consts::MAX_VALUE_SIZE])
             .unwrap()
-            .insert(&[2; MAX_KEY_SIZE], &[2; MAX_VALUE_SIZE])
+            .insert(&[2; consts::MAX_KEY_SIZE], &[2; consts::MAX_VALUE_SIZE])
             .unwrap()
             .insert(&[3], &[3; 1000])
             .unwrap()
             .insert(&[4; 1000], &[4; 1000])
             .unwrap()
-            .insert(&[6; MAX_KEY_SIZE], &[6; MAX_VALUE_SIZE])
+            .insert(&[6; consts::MAX_KEY_SIZE], &[6; consts::MAX_VALUE_SIZE])
             .unwrap()
-            .insert(&[7; MAX_KEY_SIZE], &[7; MAX_VALUE_SIZE])
+            .insert(&[7; consts::MAX_KEY_SIZE], &[7; consts::MAX_VALUE_SIZE])
             .unwrap()
-            .insert(&[5; MAX_KEY_SIZE], &[5; MAX_VALUE_SIZE])
+            .insert(&[5; consts::MAX_KEY_SIZE], &[5; consts::MAX_VALUE_SIZE])
             .unwrap();
         assert_eq!(tree.height().unwrap(), 3);
         assert_eq!(tree.root.get_num_keys(), 2);
@@ -772,7 +772,7 @@ mod tests {
         let mut tree = Tree::new().unwrap();
         for i in 0u8..=19u8 {
             tree = tree
-                .insert(&[i; MAX_KEY_SIZE], &[i; MAX_VALUE_SIZE])
+                .insert(&[i; consts::MAX_KEY_SIZE], &[i; consts::MAX_VALUE_SIZE])
                 .unwrap();
         }
         tree = tree

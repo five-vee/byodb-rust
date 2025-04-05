@@ -1,4 +1,5 @@
 use crate::tree::buffer_store::BufferStore;
+use crate::tree::consts;
 use crate::tree::error::NodeError;
 use crate::tree::node::{self, NodeType, Result};
 
@@ -95,9 +96,12 @@ impl<'a, B: BufferStore> LeafBuilder<'a, B> {
     /// Creates a new leaf builder.
     pub fn new(num_keys: usize, store: &'a B, allow_overflow: bool) -> Self {
         let (mut buf, cap) = if allow_overflow {
-            (store.get_buf(node::PAGE_SIZE * 2), 2 * node::PAGE_SIZE - 4)
+            (
+                store.get_buf(consts::PAGE_SIZE * 2),
+                2 * consts::PAGE_SIZE - 4,
+            )
         } else {
-            (store.get_buf(node::PAGE_SIZE), node::PAGE_SIZE)
+            (store.get_buf(consts::PAGE_SIZE), consts::PAGE_SIZE)
         };
         node::set_page_header(&mut buf, NodeType::Leaf);
         node::set_num_keys(&mut buf, num_keys);
@@ -118,8 +122,8 @@ impl<'a, B: BufferStore> LeafBuilder<'a, B> {
             self.i,
             n
         );
-        assert!(key.len() <= node::MAX_KEY_SIZE);
-        assert!(val.len() <= node::MAX_VALUE_SIZE);
+        assert!(key.len() <= consts::MAX_KEY_SIZE);
+        assert!(val.len() <= consts::MAX_VALUE_SIZE);
 
         let offset = set_next_offset(&mut self.buf, self.i, key, val);
         let pos = 4 + n * 2 + offset;
@@ -152,7 +156,7 @@ impl<'a, B: BufferStore> LeafBuilder<'a, B> {
             // Technically, an empty leaf is allowed.
             return Ok(LeafEffect::Empty);
         }
-        if get_num_bytes(&self.buf) <= node::PAGE_SIZE {
+        if get_num_bytes(&self.buf) <= consts::PAGE_SIZE {
             return Ok(LeafEffect::Intact(self.build_single()));
         }
         let (left, right) = self.build_split()?;
@@ -166,14 +170,14 @@ impl<'a, B: BufferStore> LeafBuilder<'a, B> {
         // in each of left and right.
         let mut left_end = (2..=n - 2).rev().find(|i| {
             let next_offset = get_offset(&self.buf, *i);
-            4 + *i * 2 + next_offset <= node::PAGE_SIZE
+            4 + *i * 2 + next_offset <= consts::PAGE_SIZE
         });
         if left_end.is_none() {
             // Relax the sufficiency requirement by just making sure
             // each left and right fits within a page.
             left_end = (0..n).rev().find(|i| {
                 let next_offset = get_offset(&self.buf, *i);
-                4 + *i + 2 + next_offset <= node::PAGE_SIZE
+                4 + *i + 2 + next_offset <= consts::PAGE_SIZE
             })
         }
         let left_end = left_end.unwrap();
@@ -191,7 +195,7 @@ impl<'a, B: BufferStore> LeafBuilder<'a, B> {
 
     /// Builds a leaf.
     fn build_single(self) -> Leaf<B> {
-        assert!(get_num_bytes(&self.buf) <= node::PAGE_SIZE);
+        assert!(get_num_bytes(&self.buf) <= consts::PAGE_SIZE);
         Leaf {
             buf: self.buf,
             store: self.store.clone(),
@@ -208,7 +212,7 @@ pub struct Leaf<B: BufferStore> {
 
 impl<B: BufferStore> Leaf<B> {
     pub fn new(store: &B) -> Self {
-        let mut buf = store.get_buf(node::PAGE_SIZE);
+        let mut buf = store.get_buf(consts::PAGE_SIZE);
         node::set_page_header(&mut buf, NodeType::Leaf);
         Self {
             buf,
@@ -218,10 +222,10 @@ impl<B: BufferStore> Leaf<B> {
 
     /// Inserts a key-value pair.
     pub fn insert(&self, key: &[u8], val: &[u8]) -> Result<LeafEffect<B>> {
-        if key.len() > node::MAX_KEY_SIZE {
+        if key.len() > consts::MAX_KEY_SIZE {
             return Err(NodeError::MaxKeySize(key.len()));
         }
-        if val.len() > node::MAX_VALUE_SIZE {
+        if val.len() > consts::MAX_VALUE_SIZE {
             return Err(NodeError::MaxValueSize(val.len()));
         }
         if self.find(key).is_some() {
@@ -230,7 +234,7 @@ impl<B: BufferStore> Leaf<B> {
         let mut b = LeafBuilder::new(
             self.get_num_keys() + 1,
             &self.store,
-            self.get_num_bytes() + 6 + key.len() + val.len() > node::PAGE_SIZE,
+            self.get_num_bytes() + 6 + key.len() + val.len() > consts::PAGE_SIZE,
         );
         let mut added = false;
         for (k, v) in self.iter() {
@@ -248,10 +252,10 @@ impl<B: BufferStore> Leaf<B> {
 
     /// Updates the value corresponding to a key.
     pub fn update(&self, key: &[u8], val: &[u8]) -> Result<LeafEffect<B>> {
-        if key.len() > node::MAX_KEY_SIZE {
+        if key.len() > consts::MAX_KEY_SIZE {
             return Err(NodeError::MaxKeySize(key.len()));
         }
-        if val.len() > node::MAX_VALUE_SIZE {
+        if val.len() > consts::MAX_VALUE_SIZE {
             return Err(NodeError::MaxValueSize(val.len()));
         }
         let old_val = self.find(key);
@@ -262,7 +266,7 @@ impl<B: BufferStore> Leaf<B> {
         let mut b = LeafBuilder::new(
             self.get_num_keys(),
             &self.store,
-            self.get_num_bytes() - old_val.len() + val.len() > node::PAGE_SIZE,
+            self.get_num_bytes() - old_val.len() + val.len() > consts::PAGE_SIZE,
         );
         let mut added = false;
         for (k, v) in self.iter() {
@@ -278,7 +282,7 @@ impl<B: BufferStore> Leaf<B> {
 
     /// Deletes a key and its corresponding value.
     pub fn delete(&self, key: &[u8]) -> Result<LeafEffect<B>> {
-        if key.len() > node::MAX_KEY_SIZE {
+        if key.len() > consts::MAX_KEY_SIZE {
             return Err(NodeError::MaxKeySize(key.len()));
         }
         if self.find(key).is_none() {
@@ -384,7 +388,6 @@ impl<'a, B: BufferStore> Iterator for LeafIterator<'a, B> {
 mod tests {
     use super::*;
     use crate::tree::buffer_store::Heap;
-    use crate::tree::node;
 
     static TEST_HEAP_STORE: Heap = Heap {};
 
@@ -403,23 +406,25 @@ mod tests {
 
     #[test]
     fn insert_max_key_size() {
-        let key = &[0u8; node::MAX_KEY_SIZE + 1];
+        let key = &[0u8; consts::MAX_KEY_SIZE + 1];
         let result = Leaf::new(&TEST_HEAP_STORE).insert(key, "val".as_bytes());
-        assert!(matches!(result, Err(NodeError::MaxKeySize(x)) if x == node::MAX_KEY_SIZE + 1));
+        assert!(matches!(result, Err(NodeError::MaxKeySize(x)) if x == consts::MAX_KEY_SIZE + 1));
     }
 
     #[test]
     fn insert_max_value_size() {
-        let val = &[0u8; node::MAX_VALUE_SIZE + 1];
+        let val = &[0u8; consts::MAX_VALUE_SIZE + 1];
         let result = Leaf::new(&TEST_HEAP_STORE).insert("key".as_bytes(), val);
-        assert!(matches!(result, Err(NodeError::MaxValueSize(x)) if x == node::MAX_VALUE_SIZE + 1));
+        assert!(
+            matches!(result, Err(NodeError::MaxValueSize(x)) if x == consts::MAX_VALUE_SIZE + 1)
+        );
     }
 
     #[test]
     fn insert_split() {
         // Insert 1 huge key-value.
-        let key1 = &[0u8; node::MAX_KEY_SIZE];
-        let val1 = &[0u8; node::MAX_VALUE_SIZE];
+        let key1 = &[0u8; consts::MAX_KEY_SIZE];
+        let val1 = &[0u8; consts::MAX_VALUE_SIZE];
         let result = Leaf::new(&TEST_HEAP_STORE).insert(key1, val1);
         assert!(
             matches!(result, Ok(LeafEffect::Intact(_))),
@@ -428,8 +433,8 @@ mod tests {
         let leaf = result.unwrap().take_intact();
 
         // Insert another huge key-value to trigger splitting.
-        let key2 = &[1u8; node::MAX_KEY_SIZE];
-        let val2 = &[1u8; node::MAX_VALUE_SIZE];
+        let key2 = &[1u8; consts::MAX_KEY_SIZE];
+        let val2 = &[1u8; consts::MAX_VALUE_SIZE];
         let result = leaf.insert(key2, val2);
         assert!(
             matches!(result, Ok(LeafEffect::Split { .. })),
@@ -515,7 +520,7 @@ mod tests {
     #[test]
     fn update_split() {
         let leaf = LeafBuilder::new(2, &TEST_HEAP_STORE, false)
-            .add_key_value(&[0u8; node::MAX_KEY_SIZE], &[0u8; node::MAX_VALUE_SIZE])
+            .add_key_value(&[0u8; consts::MAX_KEY_SIZE], &[0u8; consts::MAX_VALUE_SIZE])
             .unwrap()
             .add_key_value("1".as_bytes(), "1".as_bytes())
             .unwrap()
@@ -525,27 +530,27 @@ mod tests {
 
         // Update with a huge value to trigger splitting.
         let (left, right) = leaf
-            .update("1".as_bytes(), &[1u8; node::MAX_VALUE_SIZE])
+            .update("1".as_bytes(), &[1u8; consts::MAX_VALUE_SIZE])
             .unwrap()
             .take_split();
         drop(leaf);
         assert_eq!(left.get_num_keys(), 1);
         assert_eq!(right.get_num_keys(), 1);
         assert_eq!(
-            left.find(&[0u8; node::MAX_KEY_SIZE]).unwrap(),
-            &[0u8; node::MAX_VALUE_SIZE]
+            left.find(&[0u8; consts::MAX_KEY_SIZE]).unwrap(),
+            &[0u8; consts::MAX_VALUE_SIZE]
         );
         assert_eq!(
             right.find("1".as_bytes()).unwrap(),
-            &[1u8; node::MAX_VALUE_SIZE]
+            &[1u8; consts::MAX_VALUE_SIZE]
         );
     }
 
     #[test]
     fn update_max_key_size() {
-        let key = &[0u8; node::MAX_KEY_SIZE + 1];
+        let key = &[0u8; consts::MAX_KEY_SIZE + 1];
         let result = Leaf::new(&TEST_HEAP_STORE).update(key, "val".as_bytes());
-        assert!(matches!(result, Err(NodeError::MaxKeySize(x)) if x == node::MAX_KEY_SIZE + 1));
+        assert!(matches!(result, Err(NodeError::MaxKeySize(x)) if x == consts::MAX_KEY_SIZE + 1));
     }
 
     #[test]
@@ -556,9 +561,11 @@ mod tests {
             .build()
             .unwrap()
             .take_intact();
-        let val = &[0u8; node::MAX_VALUE_SIZE + 1];
+        let val = &[0u8; consts::MAX_VALUE_SIZE + 1];
         let result = leaf.update("key".as_bytes(), val);
-        assert!(matches!(result, Err(NodeError::MaxValueSize(x)) if x == node::MAX_VALUE_SIZE + 1));
+        assert!(
+            matches!(result, Err(NodeError::MaxValueSize(x)) if x == consts::MAX_VALUE_SIZE + 1)
+        );
     }
 
     #[test]
@@ -608,7 +615,7 @@ mod tests {
     #[test]
     fn steal_or_merge_steal() {
         let left = LeafBuilder::new(1, &TEST_HEAP_STORE, false)
-            .add_key_value(&[1; node::MAX_KEY_SIZE], &[1; node::MAX_VALUE_SIZE])
+            .add_key_value(&[1; consts::MAX_KEY_SIZE], &[1; consts::MAX_VALUE_SIZE])
             .unwrap()
             .build()
             .unwrap()
@@ -619,7 +626,7 @@ mod tests {
             .unwrap()
             .add_key_value(&[3], &[3])
             .unwrap()
-            .add_key_value(&[4; node::MAX_KEY_SIZE], &[4; node::MAX_VALUE_SIZE])
+            .add_key_value(&[4; consts::MAX_KEY_SIZE], &[4; consts::MAX_VALUE_SIZE])
             .unwrap()
             .build()
             .unwrap()
@@ -633,10 +640,13 @@ mod tests {
         assert_eq!(
             chained,
             vec![
-                (&[1; node::MAX_KEY_SIZE][..], &[1; node::MAX_VALUE_SIZE][..]),
+                (
+                    &[1; consts::MAX_KEY_SIZE][..],
+                    &[1; consts::MAX_VALUE_SIZE][..]
+                ),
                 (&[2], &[2]),
                 (&[3], &[3]),
-                (&[4; node::MAX_KEY_SIZE], &[4; node::MAX_VALUE_SIZE]),
+                (&[4; consts::MAX_KEY_SIZE], &[4; consts::MAX_VALUE_SIZE]),
             ]
         );
     }

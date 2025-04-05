@@ -1,4 +1,5 @@
 use crate::tree::buffer_store::BufferStore;
+use crate::tree::consts;
 use crate::tree::node::{self, NodeType, Result};
 use std::rc::Rc;
 
@@ -119,9 +120,12 @@ impl<'a, B: BufferStore> InternalBuilder<'a, B> {
     /// Creates a new internal builder.
     pub fn new(num_keys: usize, store: &'a B, allow_overflow: bool) -> Self {
         let (mut buf, cap) = if allow_overflow {
-            (store.get_buf(node::PAGE_SIZE * 2), 2 * node::PAGE_SIZE - 4)
+            (
+                store.get_buf(consts::PAGE_SIZE * 2),
+                2 * consts::PAGE_SIZE - 4,
+            )
         } else {
-            (store.get_buf(node::PAGE_SIZE), node::PAGE_SIZE)
+            (store.get_buf(consts::PAGE_SIZE), consts::PAGE_SIZE)
         };
         node::set_page_header(&mut buf, NodeType::Internal);
         node::set_num_keys(&mut buf, num_keys);
@@ -142,7 +146,7 @@ impl<'a, B: BufferStore> InternalBuilder<'a, B> {
             self.i,
             n
         );
-        assert!(key.len() <= node::MAX_KEY_SIZE);
+        assert!(key.len() <= consts::MAX_KEY_SIZE);
 
         let offset = set_next_offset(&mut self.buf, self.i, n, key);
         set_child_pointer(&mut self.buf, self.i, page_num);
@@ -172,7 +176,7 @@ impl<'a, B: BufferStore> InternalBuilder<'a, B> {
             self.i,
             n
         );
-        if get_num_bytes(&self.buf) <= node::PAGE_SIZE {
+        if get_num_bytes(&self.buf) <= consts::PAGE_SIZE {
             return Ok(InternalEffect::Intact(self.build_single()));
         }
         let (left, right) = self.build_split()?;
@@ -188,7 +192,7 @@ impl<'a, B: BufferStore> InternalBuilder<'a, B> {
             self.i,
             n
         );
-        assert!(get_num_bytes(&self.buf) <= node::PAGE_SIZE);
+        assert!(get_num_bytes(&self.buf) <= consts::PAGE_SIZE);
         Internal {
             buf: self.buf,
             store: self.store.clone(),
@@ -204,7 +208,7 @@ impl<'a, B: BufferStore> InternalBuilder<'a, B> {
             .rev()
             .find(|i| {
                 let next_offset = get_offset(&self.buf, *i);
-                4 + *i * 10 + next_offset <= node::PAGE_SIZE
+                4 + *i * 10 + next_offset <= consts::PAGE_SIZE
             })
             .unwrap();
 
@@ -229,7 +233,11 @@ pub struct Internal<B: BufferStore> {
 
 impl<B: BufferStore> Internal<B> {
     /// Creates an internal node that is the parent of two splits.
-    pub fn parent_of_split(keys: [&[u8]; 2], child_pointers: [usize; 2], store: &B) -> Result<Self> {
+    pub fn parent_of_split(
+        keys: [&[u8]; 2],
+        child_pointers: [usize; 2],
+        store: &B,
+    ) -> Result<Self> {
         let parent = InternalBuilder::new(2, store, false)
             .add_child_entry(keys[0], child_pointers[0])?
             .add_child_entry(keys[1], child_pointers[1])?
@@ -261,7 +269,7 @@ impl<B: BufferStore> Internal<B> {
         let mut b = InternalBuilder::new(
             (self.get_num_keys() as isize + delta_keys) as usize,
             &self.store,
-            (self.get_num_bytes() as isize + delta_size) as usize > node::PAGE_SIZE,
+            (self.get_num_bytes() as isize + delta_size) as usize > consts::PAGE_SIZE,
         );
         let mut self_iter = self.iter().enumerate().peekable();
         let mut entries_iter = entries.iter().peekable();
@@ -401,9 +409,8 @@ impl<'a, B: BufferStore> Iterator for InternalIterator<'a, B> {
 
 #[cfg(test)]
 mod tests {
-    use crate::tree::{buffer_store::Heap, node};
-
-    use super::{ChildEntry, Internal, InternalBuilder};
+    use super::*;
+    use crate::tree::buffer_store::Heap;
 
     static TEST_HEAP_STORE: Heap = Heap {};
 
@@ -461,20 +468,20 @@ mod tests {
     #[test]
     fn merge_child_entries_insert_split() {
         let node = InternalBuilder::new(4, &TEST_HEAP_STORE, false)
-            .add_child_entry(&[0; node::MAX_KEY_SIZE], 0)
+            .add_child_entry(&[0; consts::MAX_KEY_SIZE], 0)
             .unwrap()
-            .add_child_entry(&[1; node::MAX_KEY_SIZE], 1)
+            .add_child_entry(&[1; consts::MAX_KEY_SIZE], 1)
             .unwrap()
-            .add_child_entry(&[2; node::MAX_KEY_SIZE], 2)
+            .add_child_entry(&[2; consts::MAX_KEY_SIZE], 2)
             .unwrap()
-            .add_child_entry(&[4; node::MAX_KEY_SIZE], 4)
+            .add_child_entry(&[4; consts::MAX_KEY_SIZE], 4)
             .unwrap()
             .build()
             .unwrap()
             .take_intact();
         let (left, right) = node
             .merge_child_entries(&[ChildEntry::Insert {
-                key: [3; node::MAX_KEY_SIZE].into(),
+                key: [3; consts::MAX_KEY_SIZE].into(),
                 page_num: 3,
             }])
             .unwrap()
@@ -485,11 +492,11 @@ mod tests {
         assert_eq!(
             chained,
             vec![
-                (&[0; node::MAX_KEY_SIZE][..], 0),
-                (&[1; node::MAX_KEY_SIZE], 1),
-                (&[2; node::MAX_KEY_SIZE], 2),
-                (&[3; node::MAX_KEY_SIZE], 3),
-                (&[4; node::MAX_KEY_SIZE], 4),
+                (&[0; consts::MAX_KEY_SIZE][..], 0),
+                (&[1; consts::MAX_KEY_SIZE], 1),
+                (&[2; consts::MAX_KEY_SIZE], 2),
+                (&[3; consts::MAX_KEY_SIZE], 3),
+                (&[4; consts::MAX_KEY_SIZE], 4),
             ]
         );
     }
@@ -497,15 +504,15 @@ mod tests {
     #[test]
     fn merge_child_entries_udate_split() {
         let node = InternalBuilder::new(5, &TEST_HEAP_STORE, false)
-            .add_child_entry(&[0; node::MAX_KEY_SIZE], 0)
+            .add_child_entry(&[0; consts::MAX_KEY_SIZE], 0)
             .unwrap()
-            .add_child_entry(&[1; node::MAX_KEY_SIZE], 1)
+            .add_child_entry(&[1; consts::MAX_KEY_SIZE], 1)
             .unwrap()
-            .add_child_entry(&[2; node::MAX_KEY_SIZE], 2)
+            .add_child_entry(&[2; consts::MAX_KEY_SIZE], 2)
             .unwrap()
             .add_child_entry(&[3; 1], 3)
             .unwrap()
-            .add_child_entry(&[4; node::MAX_KEY_SIZE], 4)
+            .add_child_entry(&[4; consts::MAX_KEY_SIZE], 4)
             .unwrap()
             .build()
             .unwrap()
@@ -513,7 +520,7 @@ mod tests {
         let (left, right) = node
             .merge_child_entries(&[ChildEntry::Update {
                 i: 3,
-                key: [3; node::MAX_KEY_SIZE].into(),
+                key: [3; consts::MAX_KEY_SIZE].into(),
                 page_num: 3,
             }])
             .unwrap()
@@ -524,11 +531,11 @@ mod tests {
         assert_eq!(
             chained,
             vec![
-                (&[0; node::MAX_KEY_SIZE][..], 0),
-                (&[1; node::MAX_KEY_SIZE], 1),
-                (&[2; node::MAX_KEY_SIZE], 2),
-                (&[3; node::MAX_KEY_SIZE], 3),
-                (&[4; node::MAX_KEY_SIZE], 4),
+                (&[0; consts::MAX_KEY_SIZE][..], 0),
+                (&[1; consts::MAX_KEY_SIZE], 1),
+                (&[2; consts::MAX_KEY_SIZE], 2),
+                (&[3; consts::MAX_KEY_SIZE], 3),
+                (&[4; consts::MAX_KEY_SIZE], 4),
             ]
         );
     }
@@ -536,19 +543,19 @@ mod tests {
     #[test]
     fn steal_or_merge_steal() {
         let left = InternalBuilder::new(1, &TEST_HEAP_STORE, false)
-            .add_child_entry(&[1; node::MAX_KEY_SIZE], 1)
+            .add_child_entry(&[1; consts::MAX_KEY_SIZE], 1)
             .unwrap()
             .build()
             .unwrap()
             .take_intact();
         let right = InternalBuilder::new(4, &TEST_HEAP_STORE, false)
-            .add_child_entry(&[2; node::MAX_KEY_SIZE], 2)
+            .add_child_entry(&[2; consts::MAX_KEY_SIZE], 2)
             .unwrap()
-            .add_child_entry(&[3; node::MAX_KEY_SIZE], 3)
+            .add_child_entry(&[3; consts::MAX_KEY_SIZE], 3)
             .unwrap()
-            .add_child_entry(&[4; node::MAX_KEY_SIZE], 4)
+            .add_child_entry(&[4; consts::MAX_KEY_SIZE], 4)
             .unwrap()
-            .add_child_entry(&[5; node::MAX_KEY_SIZE], 5)
+            .add_child_entry(&[5; consts::MAX_KEY_SIZE], 5)
             .unwrap()
             .build()
             .unwrap()
@@ -564,11 +571,11 @@ mod tests {
         assert_eq!(
             chained,
             vec![
-                (&[1; node::MAX_KEY_SIZE][..], 1),
-                (&[2; node::MAX_KEY_SIZE], 2),
-                (&[3; node::MAX_KEY_SIZE], 3),
-                (&[4; node::MAX_KEY_SIZE], 4),
-                (&[5; node::MAX_KEY_SIZE], 5),
+                (&[1; consts::MAX_KEY_SIZE][..], 1),
+                (&[2; consts::MAX_KEY_SIZE], 2),
+                (&[3; consts::MAX_KEY_SIZE], 3),
+                (&[4; consts::MAX_KEY_SIZE], 4),
+                (&[5; consts::MAX_KEY_SIZE], 5),
             ]
         );
     }

@@ -96,44 +96,16 @@
 mod internal;
 mod leaf;
 
-use super::buffer_store::BufferStore;
-use super::error::NodeError;
-pub use internal::ChildEntry;
-pub use internal::Internal;
+use crate::tree::buffer_store::BufferStore;
+use crate::tree::consts;
+use crate::tree::error::NodeError;
+pub(crate) use internal::ChildEntry;
+pub(crate) use internal::Internal;
 use internal::InternalEffect;
-pub use leaf::Leaf;
+pub(crate) use leaf::Leaf;
 use leaf::LeafEffect;
 
 type Result<T> = std::result::Result<T, NodeError>;
-
-/// Size of a B+ tree node page.
-pub(crate) const PAGE_SIZE: usize = 4096;
-/// The maximum allowed key size in a tree.
-pub const MAX_KEY_SIZE: usize = 1000;
-/// The maximum allowed value size in a tree.
-pub const MAX_VALUE_SIZE: usize = 3000;
-
-const _: () = {
-    assert!(PAGE_SIZE <= (1 << 16), "page size is within 16 bits");
-    assert!(
-        (PAGE_SIZE as isize)
-            - 2 // type
-            - 2 // nkeys
-            // 3 keys + overhead
-            - 3 * (8 + 2 + MAX_KEY_SIZE as isize)
-            >= 0,
-        "3 keys of max size cannot fit into an internal node page"
-    );
-    assert!(
-        (PAGE_SIZE as isize)
-            - 2 // type
-            - 2 // nkeys
-            // 1 key-value pair + overhead
-            - (2 + 2 + 2 + MAX_KEY_SIZE as isize + MAX_VALUE_SIZE as isize)
-            >= 0,
-        "1 key-value pair of max size cannot fit into a leaf node page"
-    );
-};
 
 /// An enum representing a page's node type.
 #[repr(u16)]
@@ -293,10 +265,10 @@ pub fn can_steal<B: BufferStore>(from: &Node<B>, to: &Node<B>, steal_end: bool) 
     match (from, to) {
         (Node::Leaf(from), Node::Leaf(to)) => {
             2 + 4 + from.get_key(i).len() + from.get_value(i).len() + to.get_num_bytes()
-                <= PAGE_SIZE
+                <= consts::PAGE_SIZE
         }
         (Node::Internal(from), Node::Internal(to)) => {
-            8 + 2 + from.get_key(i).len() + to.get_num_bytes() <= PAGE_SIZE
+            8 + 2 + from.get_key(i).len() + to.get_num_bytes() <= consts::PAGE_SIZE
         }
         _ => unreachable!(),
     }
@@ -304,7 +276,7 @@ pub fn can_steal<B: BufferStore>(from: &Node<B>, to: &Node<B>, steal_end: bool) 
 
 /// Checks whether the merging of `left` and `right` doesn't overflow.
 pub fn can_merge<B: BufferStore>(left: &Node<B>, right: &Node<B>) -> bool {
-    left.get_num_bytes() + right.get_num_bytes() - 4 < PAGE_SIZE
+    left.get_num_bytes() + right.get_num_bytes() - 4 < consts::PAGE_SIZE
 }
 
 /// Sets the page header of a node's page buffer.

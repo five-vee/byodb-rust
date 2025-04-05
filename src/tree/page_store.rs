@@ -1,6 +1,6 @@
-use super::buffer_store::{BufferStore, Heap};
-use super::error::PageStoreError;
-use super::node::Node;
+use crate::tree::buffer_store::{BufferStore, Heap};
+use crate::tree::error::PageStoreError;
+use crate::tree::node::Node;
 use std::sync::{Arc, Mutex};
 use std::{
     cell::{Cell, RefCell},
