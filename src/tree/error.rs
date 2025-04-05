@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::{io, rc::Rc};
 use thiserror;
 
 /// An error type for `mod tree`.
@@ -36,4 +36,10 @@ pub enum PageStoreError {
     Write(Rc<str>),
     #[error("Page not found: {0}")]
     NotFound(u64),
+    #[error(transparent)]
+    IOError(#[from] io::Error),
+    #[error(transparent)]
+    MmapError(#[from] mmap_rs::Error),
+    #[error("Invalid file: {0}")]
+    InvalidFile(Rc<str>),
 }
