@@ -14,10 +14,12 @@ pub trait PageStore: Clone {
     type B: BufferStore;
 
     /// Reads a page from disk into an in-memory B+ tree node.
-    fn read_page(&self, page_num: u64) -> Result<Node<Self::B>>;
+    fn read_page(&self, page_num: usize) -> Result<Node<Self::B>>;
 
     /// Writes an in-memory B+ tree node into a page on disk.
-    fn write_page(&self, node: &Node<Self::B>) -> Result<u64>;
+    fn write_page(&self, node: &Node<Self::B>) -> Result<usize>;
+
+    fn buffer_store(&self) -> &Self::B;
 }
 
 /// An in-memory store of pages. Backed by a hash map.
@@ -27,8 +29,8 @@ pub struct InMemory {
 }
 
 struct InMemoryState {
-    pages: RefCell<HashMap<u64, Node<Heap>>>,
-    counter: Cell<u64>,
+    pages: RefCell<HashMap<usize, Node<Heap>>>,
+    counter: Cell<usize>,
 }
 
 impl InMemory {
@@ -52,7 +54,7 @@ impl Default for InMemory {
 impl PageStore for InMemory {
     type B = Heap;
 
-    fn read_page(&self, page_num: u64) -> Result<Node<Self::B>> {
+    fn read_page(&self, page_num: usize) -> Result<Node<Self::B>> {
         let state = self.state.lock().unwrap();
         let result = state.pages.borrow().get(&page_num).map_or(
             Err(PageStoreError::Read(
@@ -63,7 +65,7 @@ impl PageStore for InMemory {
         result
     }
 
-    fn write_page(&self, node: &Node<Self::B>) -> Result<u64> {
+    fn write_page(&self, node: &Node<Self::B>) -> Result<usize> {
         let state = self.state.lock().unwrap();
         let curr = state.counter.get();
         assert!(state
@@ -73,5 +75,34 @@ impl PageStore for InMemory {
             .is_none());
         state.counter.set(curr + 1);
         Ok(curr)
+    }
+
+    fn buffer_store(&self) -> &Self::B {
+        &Heap
+    }
+}
+
+struct FileState {
+    mmap: mmap_rs::Mmap,
+}
+
+#[derive(Clone)]
+struct File {
+    state: Arc<FileState>,
+}
+
+impl PageStore for File {
+    type B = Heap;
+
+    fn read_page(&self, page_num: usize) -> Result<Node<Self::B>> {
+        todo!()
+    }
+
+    fn write_page(&self, node: &Node<Self::B>) -> Result<usize> {
+        todo!()
+    }
+
+    fn buffer_store(&self) -> &Self::B {
+        &Heap
     }
 }

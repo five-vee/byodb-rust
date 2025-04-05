@@ -42,12 +42,12 @@ impl<B: BufferStore> InternalEffect<B> {
 pub enum ChildEntry {
     Insert {
         key: Rc<[u8]>,
-        page_num: u64,
+        page_num: usize,
     },
     Update {
         i: usize,
         key: Rc<[u8]>,
-        page_num: u64,
+        page_num: usize,
     },
     Delete {
         i: usize,
@@ -63,7 +63,7 @@ pub fn get_key(buf: &[u8], i: usize) -> &[u8] {
 }
 
 /// Gets the `i`th child pointer in an internal node's page buffer.
-pub fn get_child_pointer(buf: &[u8], i: usize) -> u64 {
+pub fn get_child_pointer(buf: &[u8], i: usize) -> usize {
     u64::from_be_bytes([
         buf[4 + i * 8],
         buf[4 + i * 8 + 1],
@@ -73,12 +73,12 @@ pub fn get_child_pointer(buf: &[u8], i: usize) -> u64 {
         buf[4 + i * 8 + 5],
         buf[4 + i * 8 + 6],
         buf[4 + i * 8 + 7],
-    ])
+    ]) as usize
 }
 
 /// Sets the `i`th child pointer in an internal node's page buffer.
-fn set_child_pointer(buf: &mut [u8], i: usize, page_num: u64) {
-    buf[4 + i * 8..4 + (i + 1) * 8].copy_from_slice(&page_num.to_be_bytes());
+fn set_child_pointer(buf: &mut [u8], i: usize, page_num: usize) {
+    buf[4 + i * 8..4 + (i + 1) * 8].copy_from_slice(&(page_num as u64).to_be_bytes());
 }
 
 /// Gets the `i`th offset value.
@@ -134,7 +134,7 @@ impl<'a, B: BufferStore> InternalBuilder<'a, B> {
     }
 
     /// Adds a child entry to the builder.
-    pub fn add_child_entry(mut self, key: &[u8], page_num: u64) -> Result<Self> {
+    pub fn add_child_entry(mut self, key: &[u8], page_num: usize) -> Result<Self> {
         let n = node::get_num_keys(&self.buf);
         assert!(
             self.i < n,
@@ -229,7 +229,7 @@ pub struct Internal<B: BufferStore> {
 
 impl<B: BufferStore> Internal<B> {
     /// Creates an internal node that is the parent of two splits.
-    pub fn parent_of_split(keys: [&[u8]; 2], child_pointers: [u64; 2], store: &B) -> Result<Self> {
+    pub fn parent_of_split(keys: [&[u8]; 2], child_pointers: [usize; 2], store: &B) -> Result<Self> {
         let parent = InternalBuilder::new(2, store, false)
             .add_child_entry(keys[0], child_pointers[0])?
             .add_child_entry(keys[1], child_pointers[1])?
@@ -337,7 +337,7 @@ impl<B: BufferStore> Internal<B> {
     }
 
     /// Gets the child pointer at an index.
-    pub fn get_child_pointer(&self, i: usize) -> u64 {
+    pub fn get_child_pointer(&self, i: usize) -> usize {
         get_child_pointer(&self.buf, i)
     }
 
@@ -384,7 +384,7 @@ pub struct InternalIterator<'a, B: BufferStore> {
 }
 
 impl<'a, B: BufferStore> Iterator for InternalIterator<'a, B> {
-    type Item = (&'a [u8], u64);
+    type Item = (&'a [u8], usize);
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.i >= self.n {

@@ -23,7 +23,6 @@ mod error;
 mod node;
 mod page_store;
 
-use buffer_store::Heap;
 pub use error::TreeError;
 use node::{ChildEntry, Internal, Leaf, Node, NodeEffect, Sufficiency};
 pub use node::{MAX_KEY_SIZE, MAX_VALUE_SIZE};
@@ -93,26 +92,24 @@ impl<P: PageStore> TreeEffect<P> {
 #[derive(Clone)]
 pub struct Tree<P: PageStore = InMemory> {
     root: Node<P::B>,
-    page_num: u64,
-    buffer_store: P::B,
+    page_num: usize,
     page_store: P,
 }
 
 impl Tree<InMemory> {
     pub fn new() -> Result<Self> {
-        Self::new_in(Heap, InMemory::new())
+        Self::new_in(InMemory::new())
     }
 }
 
 impl<P: PageStore> Tree<P> {
     /// Creates an new empty B+ tree.
-    pub fn new_in(buffer_store: P::B, page_store: P) -> Result<Self> {
-        let root = Node::Leaf(Leaf::new(&buffer_store));
+    pub fn new_in(page_store: P) -> Result<Self> {
+        let root = Node::Leaf(Leaf::new(page_store.buffer_store()));
         let page_num = page_store.write_page(&root)?;
         Ok(Self {
             root,
             page_num,
-            buffer_store,
             page_store,
         })
     }
@@ -127,7 +124,6 @@ impl<P: PageStore> Tree<P> {
                 let child = Self {
                     root: child,
                     page_num: child_num,
-                    buffer_store: self.buffer_store.clone(),
                     page_store: self.page_store.clone(),
                 };
                 child.get(key)
@@ -162,7 +158,6 @@ impl<P: PageStore> Tree<P> {
                 let child = Self {
                     root: child,
                     page_num: child_num,
-                    buffer_store: self.buffer_store.clone(),
                     page_store: self.page_store.clone(),
                 };
                 let child_entries = child.insert_helper(key, val)?.child_entries(child_idx);
@@ -198,7 +193,6 @@ impl<P: PageStore> Tree<P> {
                 let child = Self {
                     root: child,
                     page_num: child_num,
-                    buffer_store: self.buffer_store.clone(),
                     page_store: self.page_store.clone(),
                 };
                 let child_entries = child.update_helper(key, val)?.child_entries(child_idx);
@@ -212,12 +206,11 @@ impl<P: PageStore> Tree<P> {
     pub fn delete(&self, key: &[u8]) -> Result<Self> {
         match self.delete_helper(key)? {
             TreeEffect::Empty => {
-                let root = Node::Leaf(Leaf::new(&self.buffer_store));
+                let root = Node::Leaf(Leaf::new(self.page_store.buffer_store()));
                 let page_num = self.page_store.write_page(&root)?;
                 Ok(Self {
                     root,
                     page_num,
-                    buffer_store: self.buffer_store.clone(),
                     page_store: self.page_store.clone(),
                 })
             }
@@ -231,7 +224,6 @@ impl<P: PageStore> Tree<P> {
                         Ok(Self {
                             root: child,
                             page_num,
-                            buffer_store: self.buffer_store.clone(),
                             page_store: self.page_store.clone(),
                         })
                     }
@@ -259,7 +251,6 @@ impl<P: PageStore> Tree<P> {
                 let child = Self {
                     root: child,
                     page_num: child_num,
-                    buffer_store: self.buffer_store.clone(),
                     page_store: self.page_store.clone(),
                 };
                 match child.delete_helper(key)? {
@@ -397,13 +388,12 @@ impl<P: PageStore> Tree<P> {
     fn parent_of_split(&self, left: Self, right: Self) -> Result<Self> {
         let keys = [left.root.get_key(0), right.root.get_key(0)];
         let child_pointers = [left.page_num, right.page_num];
-        let root = Internal::parent_of_split(keys, child_pointers, &self.buffer_store)?;
+        let root = Internal::parent_of_split(keys, child_pointers, self.page_store.buffer_store())?;
         let root = Node::Internal(root);
         let page_num = self.page_store.write_page(&root)?;
         Ok(Self {
             root,
             page_num,
-            buffer_store: self.buffer_store.clone(),
             page_store: self.page_store.clone(),
         })
     }
@@ -417,7 +407,6 @@ impl<P: PageStore> Tree<P> {
                 Ok(TreeEffect::Intact(Self {
                     root,
                     page_num,
-                    buffer_store: self.buffer_store.clone(),
                     page_store: self.page_store.clone(),
                 }))
             }
@@ -427,13 +416,11 @@ impl<P: PageStore> Tree<P> {
                 let left = Self {
                     root: left,
                     page_num: left_page_num,
-                    buffer_store: self.buffer_store.clone(),
                     page_store: self.page_store.clone(),
                 };
                 let right = Self {
                     root: right,
                     page_num: right_page_num,
-                    buffer_store: self.buffer_store.clone(),
                     page_store: self.page_store.clone(),
                 };
                 Ok(TreeEffect::Split { left, right })
@@ -457,7 +444,6 @@ impl<P: PageStore> Tree<P> {
                     let child = Self {
                         root: child,
                         page_num: pn,
-                        buffer_store: self.buffer_store.clone(),
                         page_store: self.page_store.clone(),
                     };
                     let child_height = child.height()?;
@@ -505,7 +491,6 @@ impl<P: PageStore> Iterator for InOrder<P> {
                     let child = Rc::new(Tree {
                         root: child,
                         page_num: pn,
-                        buffer_store: tree.buffer_store.clone(),
                         page_store: tree.page_store.clone(),
                     });
                     self.stack.push((i + 1, tree));
@@ -520,7 +505,6 @@ impl<P: PageStore> Iterator for InOrder<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use buffer_store::Heap;
     use page_store::InMemory;
 
     fn insert_until_height(height: u32) -> Tree {
@@ -581,7 +565,7 @@ mod tests {
     #[test]
     fn insert_into_empty_tree() {
         let ps = InMemory::new();
-        let tree = Tree::new_in(Heap, ps.clone()).unwrap();
+        let tree = Tree::new_in(ps.clone()).unwrap();
         let tree = tree.insert(&[1], &[1]).unwrap();
         ps.read_page(tree.page_num).unwrap();
     }
