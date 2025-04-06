@@ -1,121 +1,123 @@
-use crate::tree::buffer_store::BufferStore;
 use crate::tree::consts;
 use crate::tree::error::NodeError;
 use crate::tree::node::{self, NodeType, Result};
+use crate::tree::page_store::{PageStore, ReadOnlyPage};
 
 /// An enum representing the effect of a leaf node operation.
-#[derive(Debug)]
-pub enum LeafEffect<B: BufferStore> {
+pub enum LeafEffect<P: PageStore> {
     /// A leaf with 0 keys after a delete was performed on it.
     /// This is a special-case of `Underflow` done to avoid unnecessary
     /// page allocations, since empty non-root nodes aren't allowed.
     Empty,
     /// A newly created leaf that remained  "intact", i.e. it did not split.
-    Intact(Leaf<B>),
+    Intact(Leaf<P>),
     /// The left and right splits of a leaf that was created.
-    Split { left: Leaf<B>, right: Leaf<B> },
+    Split { left: Leaf<P>, right: Leaf<P> },
 }
 
-impl<B: BufferStore> LeafEffect<B> {
+impl<P: PageStore> LeafEffect<P> {
     #[allow(dead_code)]
-    fn take_intact(self) -> Leaf<B> {
+    fn take_intact(self) -> Leaf<P> {
         match self {
             LeafEffect::Intact(leaf) => leaf,
-            _ => panic!("{self:?} is not LeafEffect::Intact"),
+            _ => panic!("is not LeafEffect::Intact"),
         }
     }
 
     #[allow(dead_code)]
-    fn take_split(self) -> (Leaf<B>, Leaf<B>) {
+    fn take_split(self) -> (Leaf<P>, Leaf<P>) {
         match self {
             LeafEffect::Split { left, right } => (left, right),
-            _ => panic!("{self:?} is not LeafEffect::Split"),
+            _ => panic!("is not LeafEffect::Split"),
         }
     }
 }
 
 /// Gets the `i`th key in a leaf page buffer.
-pub fn get_key(buf: &[u8], i: usize) -> &[u8] {
-    let offset = get_offset(buf, i);
-    let num_keys = node::get_num_keys(buf);
+fn get_key(page: &[u8], i: usize) -> &[u8] {
+    let offset = get_offset(page, i);
+    let num_keys = node::get_num_keys(page);
     let key_len = u16::from_be_bytes([
-        buf[4 + num_keys * 2 + offset],
-        buf[4 + num_keys * 2 + offset + 1],
+        page[4 + num_keys * 2 + offset],
+        page[4 + num_keys * 2 + offset + 1],
     ]) as usize;
-    &buf[4 + num_keys * 2 + offset + 4..4 + num_keys * 2 + offset + 4 + key_len]
+    &page[4 + num_keys * 2 + offset + 4..4 + num_keys * 2 + offset + 4 + key_len]
 }
 
 /// Gets the `i`th value in a leaf page buffer.
-pub fn get_value(buf: &[u8], i: usize) -> &[u8] {
-    let offset = get_offset(buf, i);
-    let num_keys = node::get_num_keys(buf);
+fn get_value(page: &[u8], i: usize) -> &[u8] {
+    let offset = get_offset(page, i);
+    let num_keys = node::get_num_keys(page);
     let key_len = u16::from_be_bytes([
-        buf[4 + num_keys * 2 + offset],
-        buf[4 + num_keys * 2 + offset + 1],
+        page[4 + num_keys * 2 + offset],
+        page[4 + num_keys * 2 + offset + 1],
     ]) as usize;
     let val_len = u16::from_be_bytes([
-        buf[4 + num_keys * 2 + offset + 2],
-        buf[4 + num_keys * 2 + offset + 3],
+        page[4 + num_keys * 2 + offset + 2],
+        page[4 + num_keys * 2 + offset + 3],
     ]) as usize;
-    &buf[4 + num_keys * 2 + offset + 4 + key_len..4 + num_keys * 2 + offset + 4 + key_len + val_len]
+    &page
+        [4 + num_keys * 2 + offset + 4 + key_len..4 + num_keys * 2 + offset + 4 + key_len + val_len]
 }
 
 /// Gets the `i`th offset value.
-fn get_offset(buf: &[u8], i: usize) -> usize {
+fn get_offset(page: &[u8], i: usize) -> usize {
     if i == 0 {
         return 0;
     }
-    u16::from_be_bytes([buf[4 + 2 * (i - 1)], buf[4 + 2 * i - 1]]) as usize
+    u16::from_be_bytes([page[4 + 2 * (i - 1)], page[4 + 2 * i - 1]]) as usize
 }
 
 /// Gets the number of bytes consumed by a page.
-pub fn get_num_bytes(buf: &[u8]) -> usize {
-    let n = node::get_num_keys(buf);
-    let offset = get_offset(buf, n);
+fn get_num_bytes(page: &[u8]) -> usize {
+    let n = node::get_num_keys(page);
+    let offset = get_offset(page, n);
     4 + (n * 2) + offset
 }
 
 /// Sets the next (i.e. `i+1`th) offset and returns the current offset.
-fn set_next_offset(buf: &mut [u8], i: usize, key: &[u8], val: &[u8]) -> usize {
-    let curr_offset = get_offset(buf, i);
+fn set_next_offset(page: &mut [u8], i: usize, key: &[u8], val: &[u8]) -> usize {
+    let curr_offset = get_offset(page, i);
     let next_offset = curr_offset + 4 + key.len() + val.len();
     let next_i = i + 1;
-    buf[4 + 2 * (next_i - 1)..4 + 2 * next_i].copy_from_slice(&(next_offset as u16).to_be_bytes());
+    page[4 + 2 * (next_i - 1)..4 + 2 * next_i].copy_from_slice(&(next_offset as u16).to_be_bytes());
     curr_offset
 }
 
-// A builder of a B+ tree leaf node.
-pub struct LeafBuilder<'a, B: BufferStore> {
-    i: usize,
-    cap: usize,
-    store: &'a B,
-    buf: B::B,
+trait KeyValueAdder<P: PageStore> {
+    fn add_key_value(self, key: &[u8], val: &[u8]) -> Self;
+    fn build(self) -> Result<LeafEffect<P>>;
 }
 
-impl<'a, B: BufferStore> LeafBuilder<'a, B> {
+// A builder of a B+ tree leaf node.
+struct Builder<P: PageStore> {
+    i: usize,
+    store: P,
+    page: P::Page,
+}
+
+impl<P: PageStore> KeyValueAdder<P> for Builder<P> {
+    fn add_key_value(self, key: &[u8], val: &[u8]) -> Self {
+        self.add_key_value(key, val)
+    }
+
+    fn build(self) -> Result<LeafEffect<P>> {
+        Ok(LeafEffect::Intact(self.build()))
+    }
+}
+
+impl<P: PageStore> Builder<P> {
     /// Creates a new leaf builder.
-    pub fn new(num_keys: usize, store: &'a B, allow_overflow: bool) -> Self {
-        let (mut buf, cap) = if allow_overflow {
-            (
-                store.get_buf(consts::PAGE_SIZE * 2),
-                2 * consts::PAGE_SIZE - 4,
-            )
-        } else {
-            (store.get_buf(consts::PAGE_SIZE), consts::PAGE_SIZE)
-        };
-        node::set_page_header(&mut buf, NodeType::Leaf);
-        node::set_num_keys(&mut buf, num_keys);
-        Self {
-            i: 0,
-            cap,
-            store,
-            buf,
-        }
+    fn new(num_keys: usize, store: P) -> Result<Self> {
+        let mut page = store.new_page()?;
+        node::set_node_type(&mut page, NodeType::Leaf);
+        node::set_num_keys(&mut page, num_keys);
+        Ok(Self { i: 0, store, page })
     }
 
     /// Adds a key-value pair to the builder.
-    pub fn add_key_value(mut self, key: &[u8], val: &[u8]) -> Result<Self> {
-        let n = node::get_num_keys(&self.buf);
+    fn add_key_value(mut self, key: &[u8], val: &[u8]) -> Self {
+        let n = node::get_num_keys(&self.page);
         assert!(
             self.i < n,
             "add_key_value() called {} times, cannot be called more times than num_keys = {}",
@@ -125,103 +127,172 @@ impl<'a, B: BufferStore> LeafBuilder<'a, B> {
         assert!(key.len() <= consts::MAX_KEY_SIZE);
         assert!(val.len() <= consts::MAX_VALUE_SIZE);
 
-        let offset = set_next_offset(&mut self.buf, self.i, key, val);
+        let offset = set_next_offset(&mut self.page, self.i, key, val);
         let pos = 4 + n * 2 + offset;
         assert!(
-            pos + 4 + key.len() + val.len() <= self.cap,
+            pos + 4 + key.len() + val.len() <= consts::PAGE_SIZE,
             "builder unexpectedly overflowed: i = {}, n = {}",
             self.i,
             n
         );
 
-        self.buf[pos..pos + 2].copy_from_slice(&(key.len() as u16).to_be_bytes());
-        self.buf[pos + 2..pos + 4].copy_from_slice(&(val.len() as u16).to_be_bytes());
-        self.buf[pos + 4..pos + 4 + key.len()].copy_from_slice(key);
-        self.buf[pos + 4 + key.len()..pos + 4 + key.len() + val.len()].copy_from_slice(val);
+        self.page[pos..pos + 2].copy_from_slice(&(key.len() as u16).to_be_bytes());
+        self.page[pos + 2..pos + 4].copy_from_slice(&(val.len() as u16).to_be_bytes());
+        self.page[pos + 4..pos + 4 + key.len()].copy_from_slice(key);
+        self.page[pos + 4 + key.len()..pos + 4 + key.len() + val.len()].copy_from_slice(val);
 
         self.i += 1;
-        Ok(self)
+        self
     }
 
-    /// Builds a leaf and optionally splits it if overflowed.
-    pub fn build(self) -> Result<LeafEffect<B>> {
-        let n = node::get_num_keys(&self.buf);
+    /// Builds a leaf.
+    fn build(self) -> Leaf<P> {
+        let n = node::get_num_keys(&self.page);
         assert!(
             self.i == n,
             "build() called after calling add_key_value() {} times < num_keys = {}",
             self.i,
             n
         );
-        if self.buf.len() == 0 {
-            // Technically, an empty leaf is allowed.
-            return Ok(LeafEffect::Empty);
-        }
-        if get_num_bytes(&self.buf) <= consts::PAGE_SIZE {
-            return Ok(LeafEffect::Intact(self.build_single()));
-        }
-        let (left, right) = self.build_split()?;
-        Ok(LeafEffect::Split { left, right })
-    }
-
-    /// Builds two splits of a leaf.
-    fn build_split(self) -> Result<(Leaf<B>, Leaf<B>)> {
-        let n = node::get_num_keys(&self.buf);
-        // Try to have at least 2 keys in each to be sufficient
-        // in each of left and right.
-        let mut left_end = (2..=n - 2).rev().find(|i| {
-            let next_offset = get_offset(&self.buf, *i);
-            4 + *i * 2 + next_offset <= consts::PAGE_SIZE
-        });
-        if left_end.is_none() {
-            // Relax the sufficiency requirement by just making sure
-            // each left and right fits within a page.
-            left_end = (0..n).rev().find(|i| {
-                let next_offset = get_offset(&self.buf, *i);
-                4 + *i + 2 + next_offset <= consts::PAGE_SIZE
-            })
-        }
-        let left_end = left_end.unwrap();
-
-        let mut lb = Self::new(left_end, self.store, false);
-        for i in 0..left_end {
-            lb = lb.add_key_value(get_key(&self.buf, i), get_value(&self.buf, i))?;
-        }
-        let mut rb = Self::new(n - left_end, self.store, false);
-        for i in left_end..n {
-            rb = rb.add_key_value(get_key(&self.buf, i), get_value(&self.buf, i))?;
-        }
-        Ok((lb.build_single(), rb.build_single()))
-    }
-
-    /// Builds a leaf.
-    fn build_single(self) -> Leaf<B> {
-        assert!(get_num_bytes(&self.buf) <= consts::PAGE_SIZE);
+        assert_ne!(n, 0, "This case should be handled by Leaf::delete instead.");
         Leaf {
-            buf: self.buf,
+            page: self.store.write_page(self.page),
             store: self.store.clone(),
         }
     }
 }
 
-/// A B+ tree leaf node.
-#[derive(Debug)]
-pub struct Leaf<B: BufferStore> {
-    buf: B::B,
-    store: B,
+struct SplitBuilder<P: PageStore> {
+    i: usize,
+    store: P,
+    page: P::OverflowPage,
 }
 
-impl<B: BufferStore> Leaf<B> {
-    pub fn new(store: &B) -> Self {
-        let mut buf = store.get_buf(consts::PAGE_SIZE);
-        node::set_page_header(&mut buf, NodeType::Leaf);
-        Self {
-            buf,
-            store: store.clone(),
+impl<P: PageStore> KeyValueAdder<P> for SplitBuilder<P> {
+    fn add_key_value(self, key: &[u8], val: &[u8]) -> Self {
+        self.add_key_value(key, val)
+    }
+
+    fn build(self) -> Result<LeafEffect<P>> {
+        let (left, right) = self.build()?;
+        Ok(LeafEffect::Split { left, right })
+    }
+}
+
+impl<P: PageStore> SplitBuilder<P> {
+    fn new(num_keys: usize, store: P) -> Result<Self> {
+        assert!(num_keys >= 2, "num_keys got = {num_keys}, want > 2; otherwise, there's no point in using SplitBuilder. Use Builder instead.");
+        let mut page = store.new_overflow_page()?;
+        node::set_node_type(&mut page, NodeType::Leaf);
+        node::set_num_keys(&mut page, num_keys);
+        Ok(Self { i: 0, store, page })
+    }
+
+    fn add_key_value(mut self, key: &[u8], val: &[u8]) -> Self {
+        let n = node::get_num_keys(&self.page);
+        assert!(
+            self.i < n,
+            "add_key_value() called {} times, cannot be called more times than num_keys = {}",
+            self.i,
+            n
+        );
+        assert!(key.len() <= consts::MAX_KEY_SIZE);
+        assert!(val.len() <= consts::MAX_VALUE_SIZE);
+
+        let offset = set_next_offset(&mut self.page, self.i, key, val);
+        let pos = 4 + n * 2 + offset;
+        assert!(
+            pos + 4 + key.len() + val.len() <= 2 * consts::PAGE_SIZE - 4,
+            "builder unexpectedly overflowed: i = {}, n = {}",
+            self.i,
+            n
+        );
+
+        self.page[pos..pos + 2].copy_from_slice(&(key.len() as u16).to_be_bytes());
+        self.page[pos + 2..pos + 4].copy_from_slice(&(val.len() as u16).to_be_bytes());
+        self.page[pos + 4..pos + 4 + key.len()].copy_from_slice(key);
+        self.page[pos + 4 + key.len()..pos + 4 + key.len() + val.len()].copy_from_slice(val);
+
+        self.i += 1;
+        self
+    }
+
+    fn build(mut self) -> Result<(Leaf<P>, Leaf<P>)> {
+        let n = node::get_num_keys(&self.page);
+        assert!(
+            self.i == n,
+            "build() called after calling add_key_value() {} times < num_keys = {}",
+            self.i,
+            n
+        );
+        // Try to have at least 2 keys in each to be sufficient
+        // in each of left and right.
+        let mut left_n = (2..=n - 2).rev().find(|i| {
+            let next_offset = get_offset(&self.page, *i);
+            4 + *i * 2 + next_offset <= consts::PAGE_SIZE
+        });
+        if left_n.is_none() {
+            // Relax the sufficiency requirement by just making sure
+            // each left and right fits within a page.
+            left_n = (0..n).rev().find(|i| {
+                let next_offset = get_offset(&self.page, *i);
+                4 + *i + 2 + next_offset <= consts::PAGE_SIZE
+            })
         }
+        let left_n = left_n.unwrap();
+
+        // Build right split with a Builder.
+        let right = {
+            let mut b = Builder::new(n - left_n, self.store.clone())?;
+            for i in left_n..n {
+                b = b.add_key_value(get_key(&self.page, i), get_value(&self.page, i));
+            }
+            b.build()
+        };
+
+        // Build left split via truncation.
+        {
+            let left_n_offset = get_offset(&self.page, left_n);
+            self.page
+                .copy_within(4 + n * 2..4 + n * 2 + left_n_offset, 4 + left_n * 2);
+        }
+        node::set_num_keys(&mut self.page, left_n);
+        let left = Leaf {
+            page: self.store.write_overflow_left_split(self.page)?,
+            store: self.store.clone(),
+        };
+
+        Ok((left, right))
+    }
+}
+
+/// A B+ tree leaf node.
+#[derive(Debug)]
+pub struct Leaf<P: PageStore> {
+    page: P::ReadOnlyPage,
+    store: P,
+}
+
+impl<P: PageStore> Leaf<P> {
+    pub fn new(store: P) -> Result<Self> {
+        let mut page = store.new_page()?;
+        node::set_node_type(&mut page, NodeType::Leaf);
+        Ok(Self {
+            page: store.write_page(page),
+            store,
+        })
+    }
+
+    pub fn from_page(store: P, page: P::ReadOnlyPage) -> Self {
+        Leaf { page, store }
+    }
+
+    pub fn page_num(&self) -> usize {
+        self.page.page_num()
     }
 
     /// Inserts a key-value pair.
-    pub fn insert(&self, key: &[u8], val: &[u8]) -> Result<LeafEffect<B>> {
+    pub fn insert(&self, key: &[u8], val: &[u8]) -> Result<LeafEffect<P>> {
         if key.len() > consts::MAX_KEY_SIZE {
             return Err(NodeError::MaxKeySize(key.len()));
         }
@@ -231,27 +302,42 @@ impl<B: BufferStore> Leaf<B> {
         if self.find(key).is_some() {
             return Err(NodeError::AlreadyExists);
         }
-        let mut b = LeafBuilder::new(
-            self.get_num_keys() + 1,
-            &self.store,
-            self.get_num_bytes() + 6 + key.len() + val.len() > consts::PAGE_SIZE,
-        );
+        if self.get_num_bytes() + 6 + key.len() + val.len() > consts::PAGE_SIZE {
+            return self.insert_with_builder(
+                SplitBuilder::new(self.get_num_keys() + 1, self.store.clone())?,
+                key,
+                val,
+            );
+        }
+        self.insert_with_builder(
+            Builder::new(self.get_num_keys() + 1, self.store.clone())?,
+            key,
+            val,
+        )
+    }
+
+    fn insert_with_builder<B: KeyValueAdder<P>>(
+        &self,
+        mut b: B,
+        key: &[u8],
+        val: &[u8],
+    ) -> Result<LeafEffect<P>> {
         let mut added = false;
         for (k, v) in self.iter() {
             if !added && key < k {
                 added = true;
-                b = b.add_key_value(key, val)?;
+                b = b.add_key_value(key, val);
             }
-            b = b.add_key_value(k, v)?;
+            b = b.add_key_value(k, v);
         }
         if !added {
-            b = b.add_key_value(key, val)?;
+            b = b.add_key_value(key, val);
         }
         b.build()
     }
 
     /// Updates the value corresponding to a key.
-    pub fn update(&self, key: &[u8], val: &[u8]) -> Result<LeafEffect<B>> {
+    pub fn update(&self, key: &[u8], val: &[u8]) -> Result<LeafEffect<P>> {
         if key.len() > consts::MAX_KEY_SIZE {
             return Err(NodeError::MaxKeySize(key.len()));
         }
@@ -263,25 +349,40 @@ impl<B: BufferStore> Leaf<B> {
             return Err(NodeError::KeyNotFound);
         }
         let old_val = old_val.unwrap();
-        let mut b = LeafBuilder::new(
-            self.get_num_keys(),
-            &self.store,
-            self.get_num_bytes() - old_val.len() + val.len() > consts::PAGE_SIZE,
-        );
+        if self.get_num_bytes() - old_val.len() + val.len() > consts::PAGE_SIZE {
+            return self.update_with_builder(
+                SplitBuilder::new(self.get_num_keys(), self.store.clone())?,
+                key,
+                val,
+            );
+        }
+        self.update_with_builder(
+            Builder::new(self.get_num_keys(), self.store.clone())?,
+            key,
+            val,
+        )
+    }
+
+    fn update_with_builder<B: KeyValueAdder<P>>(
+        &self,
+        mut b: B,
+        key: &[u8],
+        val: &[u8],
+    ) -> Result<LeafEffect<P>> {
         let mut added = false;
         for (k, v) in self.iter() {
             if !added && key == k {
                 added = true;
-                b = b.add_key_value(key, val)?;
+                b = b.add_key_value(key, val);
                 continue;
             }
-            b = b.add_key_value(k, v)?;
+            b = b.add_key_value(k, v);
         }
         b.build()
     }
 
     /// Deletes a key and its corresponding value.
-    pub fn delete(&self, key: &[u8]) -> Result<LeafEffect<B>> {
+    pub fn delete(&self, key: &[u8]) -> Result<LeafEffect<P>> {
         if key.len() > consts::MAX_KEY_SIZE {
             return Err(NodeError::MaxKeySize(key.len()));
         }
@@ -294,16 +395,16 @@ impl<B: BufferStore> Leaf<B> {
         if n == 1 {
             return Ok(LeafEffect::Empty);
         }
-        let mut b = LeafBuilder::new(n - 1, &self.store, false);
+        let mut b = Builder::new(n - 1, self.store.clone())?;
         let mut added = false;
         for (k, v) in self.iter() {
             if !added && key == k {
                 added = true;
                 continue;
             }
-            b = b.add_key_value(k, v)?;
+            b = b.add_key_value(k, v);
         }
-        b.build()
+        Ok(LeafEffect::Intact(b.build()))
     }
 
     /// Finds the value corresponding to the queried key.
@@ -311,36 +412,57 @@ impl<B: BufferStore> Leaf<B> {
         self.iter().find(|(k, _)| *k == key).map(|(_, v)| v)
     }
 
-    pub fn steal_or_merge(left: &Leaf<B>, right: &Leaf<B>) -> Result<LeafEffect<B>> {
-        // TODO: Actually determine if it really needs overflow.
-        let allow_overflow = true;
-        let mut b = LeafBuilder::new(
-            left.get_num_keys() + right.get_num_keys(),
-            &left.store,
-            allow_overflow,
-        );
+    pub fn steal_or_merge(left: &Leaf<P>, right: &Leaf<P>) -> Result<LeafEffect<P>> {
+        let overflow = left.get_num_bytes() + right.get_num_bytes() - 4 > consts::PAGE_SIZE;
+        if overflow {
+            // Steal
+            return Self::steal_or_merge_with_builder(
+                SplitBuilder::new(
+                    left.get_num_keys() + right.get_num_keys(),
+                    left.store.clone(),
+                )?,
+                left,
+                right,
+            );
+        }
+        // Merge
+        Self::steal_or_merge_with_builder(
+            Builder::new(
+                left.get_num_keys() + right.get_num_keys(),
+                left.store.clone(),
+            )?,
+            left,
+            right,
+        )
+    }
+
+    fn steal_or_merge_with_builder<B: KeyValueAdder<P>>(
+        mut b: B,
+        left: &Leaf<P>,
+        right: &Leaf<P>,
+    ) -> Result<LeafEffect<P>> {
         for (key, val) in left.iter() {
-            b = b.add_key_value(key, val)?;
+            b = b.add_key_value(key, val);
         }
         for (key, val) in right.iter() {
-            b = b.add_key_value(key, val)?;
+            b = b.add_key_value(key, val);
         }
         b.build()
     }
 
     pub fn get_key(&self, i: usize) -> &[u8] {
-        get_key(&self.buf, i)
+        get_key(&self.page, i)
     }
 
     pub fn get_value(&self, i: usize) -> &[u8] {
-        get_value(&self.buf, i)
+        get_value(&self.page, i)
     }
 
     pub fn get_num_keys(&self) -> usize {
-        node::get_num_keys(&self.buf)
+        node::get_num_keys(&self.page)
     }
 
-    pub fn iter(&self) -> LeafIterator<B> {
+    pub fn iter(&self) -> LeafIterator<P> {
         LeafIterator {
             node: self,
             i: 0,
@@ -349,29 +471,18 @@ impl<B: BufferStore> Leaf<B> {
     }
 
     pub fn get_num_bytes(&self) -> usize {
-        get_num_bytes(&self.buf)
-    }
-}
-
-impl<B: BufferStore> Clone for Leaf<B> {
-    fn clone(&self) -> Self {
-        let mut buf = self.store.get_buf(self.buf.len());
-        buf.copy_from_slice(&self.buf);
-        Self {
-            buf,
-            store: self.store.clone(),
-        }
+        get_num_bytes(&self.page)
     }
 }
 
 /// An key-value iterator for a leaf node.
-pub struct LeafIterator<'a, B: BufferStore> {
-    node: &'a Leaf<B>,
+pub struct LeafIterator<'a, P: PageStore> {
+    node: &'a Leaf<P>,
     i: usize,
     n: usize,
 }
 
-impl<'a, B: BufferStore> Iterator for LeafIterator<'a, B> {
+impl<'a, P: PageStore> Iterator for LeafIterator<'a, P> {
     type Item = (&'a [u8], &'a [u8]);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -386,14 +497,22 @@ impl<'a, B: BufferStore> Iterator for LeafIterator<'a, B> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::tree::buffer_store::Heap;
+    use std::sync::OnceLock;
 
-    static TEST_HEAP_STORE: Heap = Heap {};
+    use crate::tree::page_store::InMemory;
+
+    use super::*;
+
+    static TEST_STORE: OnceLock<InMemory> = OnceLock::new();
+
+    fn test_store() -> InMemory {
+        TEST_STORE.get_or_init(InMemory::new).clone()
+    }
 
     #[test]
     fn insert_intact() {
-        let leaf = Leaf::new(&TEST_HEAP_STORE)
+        let leaf = Leaf::new(test_store())
+            .unwrap()
             .insert("hello".as_bytes(), "world".as_bytes())
             .unwrap()
             .take_intact();
@@ -407,14 +526,18 @@ mod tests {
     #[test]
     fn insert_max_key_size() {
         let key = &[0u8; consts::MAX_KEY_SIZE + 1];
-        let result = Leaf::new(&TEST_HEAP_STORE).insert(key, "val".as_bytes());
+        let result = Leaf::new(test_store())
+            .unwrap()
+            .insert(key, "val".as_bytes());
         assert!(matches!(result, Err(NodeError::MaxKeySize(x)) if x == consts::MAX_KEY_SIZE + 1));
     }
 
     #[test]
     fn insert_max_value_size() {
         let val = &[0u8; consts::MAX_VALUE_SIZE + 1];
-        let result = Leaf::new(&TEST_HEAP_STORE).insert("key".as_bytes(), val);
+        let result = Leaf::new(test_store())
+            .unwrap()
+            .insert("key".as_bytes(), val);
         assert!(
             matches!(result, Err(NodeError::MaxValueSize(x)) if x == consts::MAX_VALUE_SIZE + 1)
         );
@@ -423,58 +546,47 @@ mod tests {
     #[test]
     fn insert_split() {
         // Insert 1 huge key-value.
-        let key1 = &[0u8; consts::MAX_KEY_SIZE];
-        let val1 = &[0u8; consts::MAX_VALUE_SIZE];
-        let result = Leaf::new(&TEST_HEAP_STORE).insert(key1, val1);
-        assert!(
-            matches!(result, Ok(LeafEffect::Intact(_))),
-            "1st insert result: {result:?}"
-        );
+        let key1 = &[1u8; consts::MAX_KEY_SIZE];
+        let val1 = &[1u8; consts::MAX_VALUE_SIZE];
+        let result = Leaf::new(test_store()).unwrap().insert(key1, val1);
+        assert!(matches!(result, Ok(LeafEffect::Intact(_))));
         let leaf = result.unwrap().take_intact();
 
         // Insert another huge key-value to trigger splitting.
-        let key2 = &[1u8; consts::MAX_KEY_SIZE];
-        let val2 = &[1u8; consts::MAX_VALUE_SIZE];
-        let result = leaf.insert(key2, val2);
-        assert!(
-            matches!(result, Ok(LeafEffect::Split { .. })),
-            "2nd insert result: {result:?}"
-        );
+        let key0 = &[0u8; consts::MAX_KEY_SIZE];
+        let val0 = &[0u8; consts::MAX_VALUE_SIZE];
+        let result = leaf.insert(key0, val0);
+        assert!(matches!(result, Ok(LeafEffect::Split { .. })),);
         let (left, right) = result.unwrap().take_split();
         drop(leaf);
         assert_eq!(left.get_num_keys(), 1);
         assert_eq!(right.get_num_keys(), 1);
-        assert_eq!(left.find(key1).unwrap(), val1);
-        assert_eq!(right.find(key2).unwrap(), val2);
+        assert_eq!(left.find(key0).unwrap(), val0);
+        assert_eq!(right.find(key1).unwrap(), val1);
     }
 
     #[test]
     fn find_some() {
-        let leaf = LeafBuilder::new(1, &TEST_HEAP_STORE, false)
+        let leaf = Builder::new(1, test_store())
+            .unwrap()
             .add_key_value("key".as_bytes(), "val".as_bytes())
-            .unwrap()
-            .build()
-            .unwrap()
-            .take_intact();
+            .build();
         assert!(matches!(leaf.find("key".as_bytes()), Some(v) if v == "val".as_bytes()));
     }
 
     #[test]
     fn find_none() {
-        let leaf = Leaf::new(&TEST_HEAP_STORE);
+        let leaf = Leaf::new(test_store()).unwrap();
         assert!(leaf.find("key".as_bytes()).is_none())
     }
 
     #[test]
     fn iter() {
-        let leaf = LeafBuilder::new(2, &TEST_HEAP_STORE, false)
+        let leaf = Builder::new(2, test_store())
+            .unwrap()
             .add_key_value("key1".as_bytes(), "val1".as_bytes())
-            .unwrap()
             .add_key_value("key2".as_bytes(), "val2".as_bytes())
-            .unwrap()
-            .build()
-            .unwrap()
-            .take_intact();
+            .build();
         let got = leaf.iter().collect::<Vec<_>>();
         assert_eq!(
             got,
@@ -487,20 +599,17 @@ mod tests {
 
     #[test]
     fn iter_empty() {
-        let leaf = Leaf::new(&TEST_HEAP_STORE);
+        let leaf = Leaf::new(test_store()).unwrap();
         assert_eq!(leaf.iter().count(), 0);
     }
 
     #[test]
     fn update_intact() {
-        let leaf = LeafBuilder::new(2, &TEST_HEAP_STORE, false)
+        let leaf = Builder::new(2, test_store())
+            .unwrap()
             .add_key_value("key1".as_bytes(), "val1".as_bytes())
-            .unwrap()
             .add_key_value("key2".as_bytes(), "val2".as_bytes())
-            .unwrap()
-            .build()
-            .unwrap()
-            .take_intact();
+            .build();
 
         let leaf = leaf
             .update("key1".as_bytes(), "val1_new".as_bytes())
@@ -519,14 +628,11 @@ mod tests {
 
     #[test]
     fn update_split() {
-        let leaf = LeafBuilder::new(2, &TEST_HEAP_STORE, false)
+        let leaf = Builder::new(2, test_store())
+            .unwrap()
             .add_key_value(&[0u8; consts::MAX_KEY_SIZE], &[0u8; consts::MAX_VALUE_SIZE])
-            .unwrap()
             .add_key_value("1".as_bytes(), "1".as_bytes())
-            .unwrap()
-            .build()
-            .unwrap()
-            .take_intact();
+            .build();
 
         // Update with a huge value to trigger splitting.
         let (left, right) = leaf
@@ -549,18 +655,18 @@ mod tests {
     #[test]
     fn update_max_key_size() {
         let key = &[0u8; consts::MAX_KEY_SIZE + 1];
-        let result = Leaf::new(&TEST_HEAP_STORE).update(key, "val".as_bytes());
+        let result = Leaf::new(test_store())
+            .unwrap()
+            .update(key, "val".as_bytes());
         assert!(matches!(result, Err(NodeError::MaxKeySize(x)) if x == consts::MAX_KEY_SIZE + 1));
     }
 
     #[test]
     fn update_max_value_size() {
-        let leaf = LeafBuilder::new(1, &TEST_HEAP_STORE, false)
+        let leaf = Builder::new(1, test_store())
+            .unwrap()
             .add_key_value("key".as_bytes(), "val".as_bytes())
-            .unwrap()
-            .build()
-            .unwrap()
-            .take_intact();
+            .build();
         let val = &[0u8; consts::MAX_VALUE_SIZE + 1];
         let result = leaf.update("key".as_bytes(), val);
         assert!(
@@ -570,20 +676,19 @@ mod tests {
 
     #[test]
     fn update_non_existent() {
-        let result = Leaf::new(&TEST_HEAP_STORE).update("key".as_bytes(), "val".as_bytes());
+        let result = Leaf::new(test_store())
+            .unwrap()
+            .update("key".as_bytes(), "val".as_bytes());
         assert!(matches!(result, Err(NodeError::KeyNotFound)));
     }
 
     #[test]
     fn delete_intact() {
-        let leaf = LeafBuilder::new(2, &TEST_HEAP_STORE, false)
+        let leaf = Builder::new(2, test_store())
+            .unwrap()
             .add_key_value("key1".as_bytes(), "val1".as_bytes())
-            .unwrap()
             .add_key_value("key2".as_bytes(), "val2".as_bytes())
-            .unwrap()
-            .build()
-            .unwrap()
-            .take_intact();
+            .build();
 
         let leaf = leaf.delete("key1".as_bytes()).unwrap().take_intact();
 
@@ -596,41 +701,33 @@ mod tests {
 
     #[test]
     fn delete_empty() {
-        let leaf = LeafBuilder::new(1, &TEST_HEAP_STORE, false)
+        let leaf = Builder::new(1, test_store())
+            .unwrap()
             .add_key_value("key".as_bytes(), "val".as_bytes())
-            .unwrap()
-            .build()
-            .unwrap()
-            .take_intact();
+            .build();
         let effect = leaf.delete("key".as_bytes()).unwrap();
         assert!(matches!(effect, LeafEffect::Empty));
     }
 
     #[test]
     fn delete_non_existent() {
-        let result = Leaf::new(&TEST_HEAP_STORE).delete("key".as_bytes());
+        let result = Leaf::new(test_store()).unwrap().delete("key".as_bytes());
         assert!(matches!(result, Err(NodeError::KeyNotFound)));
     }
 
     #[test]
     fn steal_or_merge_steal() {
-        let left = LeafBuilder::new(1, &TEST_HEAP_STORE, false)
+        let left = Builder::new(1, test_store())
+            .unwrap()
             .add_key_value(&[1; consts::MAX_KEY_SIZE], &[1; consts::MAX_VALUE_SIZE])
-            .unwrap()
-            .build()
-            .unwrap()
-            .take_intact();
+            .build();
 
-        let right = LeafBuilder::new(3, &TEST_HEAP_STORE, false)
+        let right = Builder::new(3, test_store())
+            .unwrap()
             .add_key_value(&[2], &[2])
-            .unwrap()
             .add_key_value(&[3], &[3])
-            .unwrap()
             .add_key_value(&[4; consts::MAX_KEY_SIZE], &[4; consts::MAX_VALUE_SIZE])
-            .unwrap()
-            .build()
-            .unwrap()
-            .take_intact();
+            .build();
 
         let (left, right) = Leaf::steal_or_merge(&left, &right).unwrap().take_split();
         assert!(left.get_num_keys() >= 2);
@@ -653,21 +750,16 @@ mod tests {
 
     #[test]
     fn steal_or_merge_merge() {
-        let left = LeafBuilder::new(1, &TEST_HEAP_STORE, false)
+        let left = Builder::new(1, test_store())
+            .unwrap()
             .add_key_value(&[1], &[1])
-            .unwrap()
-            .build()
-            .unwrap()
-            .take_intact();
+            .build();
 
-        let right = LeafBuilder::new(2, &TEST_HEAP_STORE, false)
+        let right = Builder::new(2, test_store())
+            .unwrap()
             .add_key_value(&[2], &[2])
-            .unwrap()
             .add_key_value(&[3], &[3])
-            .unwrap()
-            .build()
-            .unwrap()
-            .take_intact();
+            .build();
 
         let merged = Leaf::steal_or_merge(&left, &right).unwrap().take_intact();
         assert_eq!(

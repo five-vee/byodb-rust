@@ -25,6 +25,8 @@ pub enum NodeError {
     AlreadyExists,
     #[error("Key not found")]
     KeyNotFound,
+    #[error("Page store error: {0}")]
+    PageStore(#[from] PageStoreError),
 }
 
 /// An error type for `mod page_store`.
@@ -35,7 +37,7 @@ pub enum PageStoreError {
     #[error("Page write error: {0}")]
     Write(Rc<str>),
     #[error("Page not found: {0}")]
-    NotFound(u64),
+    NotFound(usize),
     #[error(transparent)]
     IOError(#[from] io::Error),
     #[error(transparent)]

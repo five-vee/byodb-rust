@@ -96,9 +96,11 @@
 mod internal;
 mod leaf;
 
-use crate::tree::buffer_store::BufferStore;
+use std::rc::Rc;
+
 use crate::tree::consts;
 use crate::tree::error::NodeError;
+use crate::tree::page_store::PageStore;
 pub(crate) use internal::ChildEntry;
 pub(crate) use internal::Internal;
 use internal::InternalEffect;
@@ -109,6 +111,7 @@ type Result<T> = std::result::Result<T, NodeError>;
 
 /// An enum representing a page's node type.
 #[repr(u16)]
+#[derive(Debug)]
 enum NodeType {
     Leaf = 0b01u16,
     Internal = 0b10u16,
@@ -126,15 +129,33 @@ impl TryFrom<u16> for NodeType {
 }
 
 /// An enum representing the type of B+ tree node.
-#[derive(Clone, Debug)]
-pub enum Node<B: BufferStore> {
+pub enum Node<P: PageStore> {
     /// A B+ tree leaf node.
-    Leaf(Leaf<B>),
+    Leaf(Leaf<P>),
     /// A B+ tree internal node.
-    Internal(Internal<B>),
+    Internal(Internal<P>),
 }
 
-impl<B: BufferStore> Node<B> {
+impl<P: PageStore> Node<P> {
+    fn from_page(store: P, page: P::ReadOnlyPage) -> Result<Self> {
+        match get_node_type(&page)? {
+            NodeType::Leaf => Ok(Node::Leaf(Leaf::from_page(store, page))),
+            NodeType::Internal => Ok(Node::Internal(Internal::from_page(store, page))),
+        }
+    }
+
+    pub fn read(store: P, page_num: usize) -> Result<Self> {
+        let page = store.read_page(page_num)?;
+        Self::from_page(store, page)
+    }
+
+    pub fn page_num(&self) -> usize {
+        match self {
+            Node::Leaf(leaf) => leaf.page_num(),
+            Node::Internal(internal) => internal.page_num(),
+        }
+    }
+
     /// Gets the key at a specified node index.
     pub fn get_key(&self, i: usize) -> &[u8] {
         match self {
@@ -156,39 +177,54 @@ impl<B: BufferStore> Node<B> {
             Node::Internal(internal) => internal.get_num_bytes(),
         }
     }
-
-    pub fn ref_as_leaf(&self) -> &Leaf<B> {
-        match self {
-            Node::Leaf(leaf) => leaf,
-            _ => panic!("{self:?} is not a Node::Leaf"),
-        }
-    }
-
-    pub fn ref_as_internal(&self) -> &Internal<B> {
-        match self {
-            Node::Internal(internal) => internal,
-            _ => panic!("{self:?} is not a Node::Internal"),
-        }
-    }
 }
 
 /// An enum representing the effect of a node operation.
-#[derive(Debug)]
-pub enum NodeEffect<B: BufferStore> {
+pub enum NodeEffect<P: PageStore> {
     /// A node without 0 keys after a delete was performed on it.
     /// This is a special-case of `Underflow` done to avoid unnecessary
     /// page allocations, since empty non-root nodes aren't allowed.
     Empty,
     /// A newly created node that remained  "intact", i.e. it did not split.
-    Intact(Node<B>),
+    Intact(Node<P>),
     /// The left and right splits of a node that was created.
     ///
     /// The left and right nodes are the same type.
-    Split { left: Node<B>, right: Node<B> },
+    Split { left: Node<P>, right: Node<P> },
 }
 
-impl<B: BufferStore> From<LeafEffect<B>> for NodeEffect<B> {
-    fn from(value: LeafEffect<B>) -> Self {
+impl<P: PageStore> NodeEffect<P> {
+    /// Converts the node(s) created during an operation into child
+    /// entries of a B+ tree internal node.
+    ///
+    /// `i` is the index in the internal that the operation was performed on.
+    pub fn child_entries(self, i: usize) -> Rc<[ChildEntry]> {
+        match self {
+            NodeEffect::Empty => Rc::new([]),
+            NodeEffect::Intact(node) => [ChildEntry::Update {
+                i,
+                key: node.get_key(0).into(),
+                page_num: node.page_num(),
+            }]
+            .into(),
+            NodeEffect::Split { left, right } => [
+                ChildEntry::Update {
+                    i,
+                    key: left.get_key(0).into(),
+                    page_num: left.page_num(),
+                },
+                ChildEntry::Insert {
+                    key: right.get_key(0).into(),
+                    page_num: right.page_num(),
+                },
+            ]
+            .into(),
+        }
+    }
+}
+
+impl<P: PageStore> From<LeafEffect<P>> for NodeEffect<P> {
+    fn from(value: LeafEffect<P>) -> Self {
         match value {
             LeafEffect::Empty => NodeEffect::Empty,
             LeafEffect::Intact(leaf) => NodeEffect::Intact(Node::Leaf(leaf)),
@@ -200,10 +236,9 @@ impl<B: BufferStore> From<LeafEffect<B>> for NodeEffect<B> {
     }
 }
 
-impl<B: BufferStore> From<InternalEffect<B>> for NodeEffect<B> {
-    fn from(value: InternalEffect<B>) -> Self {
+impl<P: PageStore> From<InternalEffect<P>> for NodeEffect<P> {
+    fn from(value: InternalEffect<P>) -> Self {
         match value {
-            InternalEffect::Empty => NodeEffect::Empty,
             InternalEffect::Intact(internal) => NodeEffect::Intact(Node::Internal(internal)),
             InternalEffect::Split { left, right } => NodeEffect::Split {
                 left: Node::Internal(left),
@@ -229,7 +264,7 @@ pub enum Sufficiency {
 }
 
 // Returns how sufficient a node is.
-pub fn sufficiency<B: BufferStore>(n: &Node<B>) -> Sufficiency {
+pub fn sufficiency<P: PageStore>(n: &Node<P>) -> Sufficiency {
     match n.get_num_keys() {
         0 => Sufficiency::Empty,
         1 => Sufficiency::Underflow,
@@ -240,7 +275,7 @@ pub fn sufficiency<B: BufferStore>(n: &Node<B>) -> Sufficiency {
 /// Merges `left` and `right` into a possibly-overflowed node and splits if
 /// needed. This is modeled as a Deletion b/c it is (so far) only useful in the
 /// context of deletion.
-pub fn steal_or_merge<B: BufferStore>(left: &Node<B>, right: &Node<B>) -> Result<NodeEffect<B>> {
+pub fn steal_or_merge<P: PageStore>(left: &Node<P>, right: &Node<P>) -> Result<NodeEffect<P>> {
     match (left, right) {
         (Node::Leaf(left), Node::Leaf(right)) => Ok(Leaf::steal_or_merge(left, right)?.into()),
         (Node::Internal(left), Node::Internal(right)) => {
@@ -253,7 +288,7 @@ pub fn steal_or_merge<B: BufferStore>(left: &Node<B>, right: &Node<B>) -> Result
 /// Checks whether `to` can steal a key from `from`.
 /// `steal_end` determines whether to steal the end key of `from`,
 /// otherwise the beginning key.
-pub fn can_steal<B: BufferStore>(from: &Node<B>, to: &Node<B>, steal_end: bool) -> bool {
+pub fn can_steal<P: PageStore>(from: &Node<P>, to: &Node<P>, steal_end: bool) -> bool {
     if from.get_num_keys() <= 2 {
         return false;
     }
@@ -275,21 +310,25 @@ pub fn can_steal<B: BufferStore>(from: &Node<B>, to: &Node<B>, steal_end: bool) 
 }
 
 /// Checks whether the merging of `left` and `right` doesn't overflow.
-pub fn can_merge<B: BufferStore>(left: &Node<B>, right: &Node<B>) -> bool {
+pub fn can_merge<P: PageStore>(left: &Node<P>, right: &Node<P>) -> bool {
     left.get_num_bytes() + right.get_num_bytes() - 4 < consts::PAGE_SIZE
 }
 
 /// Sets the page header of a node's page buffer.
-fn set_page_header(buf: &mut [u8], node_type: NodeType) {
-    buf[0..2].copy_from_slice(&(node_type as u16).to_be_bytes());
+fn set_node_type(page: &mut [u8], node_type: NodeType) {
+    page[0..2].copy_from_slice(&(node_type as u16).to_be_bytes());
+}
+
+fn get_node_type(page: &[u8]) -> Result<NodeType> {
+    NodeType::try_from(u16::from_be_bytes([page[0], page[1]]))
 }
 
 /// Sets the number of keys in a node's page buffer.
-fn set_num_keys(buf: &mut [u8], n: usize) {
-    buf[2..4].copy_from_slice(&(n as u16).to_be_bytes());
+fn set_num_keys(page: &mut [u8], n: usize) {
+    page[2..4].copy_from_slice(&(n as u16).to_be_bytes());
 }
 
 /// Gets the number of keys in a node's page buffer.
-fn get_num_keys(buf: &[u8]) -> usize {
-    u16::from_be_bytes([buf[2], buf[3]]) as usize
+fn get_num_keys(page: &[u8]) -> usize {
+    u16::from_be_bytes([page[2], page[3]]) as usize
 }

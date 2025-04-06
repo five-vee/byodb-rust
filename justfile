@@ -3,6 +3,7 @@ default:
   just --list
 
 alias cov-open := coverage-open
+alias covo := coverage-open
 alias cov := coverage
 
 [group('test')]

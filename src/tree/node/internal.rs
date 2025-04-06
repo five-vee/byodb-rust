@@ -1,39 +1,35 @@
-use crate::tree::buffer_store::BufferStore;
-use crate::tree::consts;
-use crate::tree::node::{self, NodeType, Result};
 use std::rc::Rc;
 
+use crate::tree::consts;
+use crate::tree::node::{self, NodeType, Result};
+use crate::tree::page_store::{PageStore, ReadOnlyPage};
+
 /// An enum representing the effect of an internal node operation.
-#[derive(Debug)]
-pub enum InternalEffect<B: BufferStore> {
-    /// An internal node with 0 keys after a delete was performed on it.
-    /// This is a special-case of `Underflow` done to avoid unnecessary
-    /// page allocations, since empty non-root nodes aren't allowed.
-    Empty,
+pub enum InternalEffect<P: PageStore> {
     /// A newly created internal node that remained  "intact",
     /// i.e. it did not split.
-    Intact(Internal<B>),
+    Intact(Internal<P>),
     /// The left and right splits of an internal node that was created.
     Split {
-        left: Internal<B>,
-        right: Internal<B>,
+        left: Internal<P>,
+        right: Internal<P>,
     },
 }
 
-impl<B: BufferStore> InternalEffect<B> {
+impl<P: PageStore> InternalEffect<P> {
     #[allow(dead_code)]
-    fn take_intact(self) -> Internal<B> {
+    fn take_intact(self) -> Internal<P> {
         match self {
             InternalEffect::Intact(internal) => internal,
-            _ => panic!("{self:?} is not InternalEffect::Intact"),
+            _ => panic!("is not InternalEffect::Intact"),
         }
     }
 
     #[allow(dead_code)]
-    fn take_split(self) -> (Internal<B>, Internal<B>) {
+    fn take_split(self) -> (Internal<P>, Internal<P>) {
         match self {
             InternalEffect::Split { left, right } => (left, right),
-            _ => panic!("{self:?} is not InternalEffect::Split"),
+            _ => panic!("is not InternalEffect::Split"),
         }
     }
 }
@@ -56,90 +52,92 @@ pub enum ChildEntry {
 }
 
 /// Gets the `i`th key in an internal node's page buffer.
-pub fn get_key(buf: &[u8], i: usize) -> &[u8] {
-    let n = node::get_num_keys(buf);
-    let offset = get_offset(buf, i);
-    let key_len = get_offset(buf, i + 1) - offset;
-    &buf[4 + n * 10 + offset..4 + n * 10 + offset + key_len]
+fn get_key(page: &[u8], i: usize) -> &[u8] {
+    let n = node::get_num_keys(page);
+    let offset = get_offset(page, i);
+    let key_len = get_offset(page, i + 1) - offset;
+    &page[4 + n * 10 + offset..4 + n * 10 + offset + key_len]
 }
 
 /// Gets the `i`th child pointer in an internal node's page buffer.
-pub fn get_child_pointer(buf: &[u8], i: usize) -> usize {
+fn get_child_pointer(page: &[u8], i: usize) -> usize {
     u64::from_be_bytes([
-        buf[4 + i * 8],
-        buf[4 + i * 8 + 1],
-        buf[4 + i * 8 + 2],
-        buf[4 + i * 8 + 3],
-        buf[4 + i * 8 + 4],
-        buf[4 + i * 8 + 5],
-        buf[4 + i * 8 + 6],
-        buf[4 + i * 8 + 7],
+        page[4 + i * 8],
+        page[4 + i * 8 + 1],
+        page[4 + i * 8 + 2],
+        page[4 + i * 8 + 3],
+        page[4 + i * 8 + 4],
+        page[4 + i * 8 + 5],
+        page[4 + i * 8 + 6],
+        page[4 + i * 8 + 7],
     ]) as usize
 }
 
 /// Sets the `i`th child pointer in an internal node's page buffer.
-fn set_child_pointer(buf: &mut [u8], i: usize, page_num: usize) {
-    buf[4 + i * 8..4 + (i + 1) * 8].copy_from_slice(&(page_num as u64).to_be_bytes());
+fn set_child_pointer(page: &mut [u8], i: usize, page_num: usize) {
+    page[4 + i * 8..4 + (i + 1) * 8].copy_from_slice(&(page_num as u64).to_be_bytes());
 }
 
 /// Gets the `i`th offset value.
-fn get_offset(buf: &[u8], i: usize) -> usize {
+fn get_offset(page: &[u8], i: usize) -> usize {
     if i == 0 {
         return 0;
     }
-    let n = node::get_num_keys(buf);
-    u16::from_be_bytes([buf[4 + n * 8 + 2 * (i - 1)], buf[4 + n * 8 + 2 * i - 1]]) as usize
+    let n = node::get_num_keys(page);
+    u16::from_be_bytes([page[4 + n * 8 + 2 * (i - 1)], page[4 + n * 8 + 2 * i - 1]]) as usize
 }
 
 /// Sets the next (i.e. `i+1`th) offset and returns the current offset.
-fn set_next_offset(buf: &mut [u8], i: usize, n: usize, key: &[u8]) -> usize {
-    let curr_offset = get_offset(buf, i);
+fn set_next_offset(page: &mut [u8], i: usize, n: usize, key: &[u8]) -> usize {
+    let curr_offset = get_offset(page, i);
     let next_offset = curr_offset + key.len();
     let next_i = i + 1;
-    buf[4 + n * 8 + 2 * (next_i - 1)..4 + n * 8 + 2 * next_i]
+    page[4 + n * 8 + 2 * (next_i - 1)..4 + n * 8 + 2 * next_i]
         .copy_from_slice(&(next_offset as u16).to_be_bytes());
     curr_offset
 }
 
 /// Gets the number of bytes consumed by a page.
-pub fn get_num_bytes(buf: &[u8]) -> usize {
-    let n = node::get_num_keys(buf);
-    let offset = get_offset(buf, n);
+fn get_num_bytes(page: &[u8]) -> usize {
+    let n = node::get_num_keys(page);
+    let offset = get_offset(page, n);
     4 + (n * 10) + offset
 }
 
-/// A builder of a B+ tree internal node.
-pub struct InternalBuilder<'a, B: BufferStore> {
-    i: usize,
-    cap: usize,
-    store: &'a B,
-    buf: B::B,
+trait ChildEntryAdder<P: PageStore> {
+    fn add_child_entry(self, key: &[u8], page_num: usize) -> Self;
+    fn build(self) -> Result<InternalEffect<P>>;
 }
 
-impl<'a, B: BufferStore> InternalBuilder<'a, B> {
+/// A builder of a B+ tree internal node.
+struct Builder<P: PageStore> {
+    i: usize,
+    store: P,
+    page: P::Page,
+}
+
+impl<P: PageStore> ChildEntryAdder<P> for Builder<P> {
+    fn add_child_entry(self, key: &[u8], page_num: usize) -> Self {
+        self.add_child_entry(key, page_num)
+    }
+
+    fn build(self) -> Result<InternalEffect<P>> {
+        Ok(InternalEffect::Intact(self.build()))
+    }
+}
+
+impl<P: PageStore> Builder<P> {
     /// Creates a new internal builder.
-    pub fn new(num_keys: usize, store: &'a B, allow_overflow: bool) -> Self {
-        let (mut buf, cap) = if allow_overflow {
-            (
-                store.get_buf(consts::PAGE_SIZE * 2),
-                2 * consts::PAGE_SIZE - 4,
-            )
-        } else {
-            (store.get_buf(consts::PAGE_SIZE), consts::PAGE_SIZE)
-        };
-        node::set_page_header(&mut buf, NodeType::Internal);
-        node::set_num_keys(&mut buf, num_keys);
-        Self {
-            i: 0,
-            cap,
-            store,
-            buf,
-        }
+    fn new(num_keys: usize, store: P) -> Result<Self> {
+        let mut page = store.new_page()?;
+        node::set_node_type(&mut page, NodeType::Internal);
+        node::set_num_keys(&mut page, num_keys);
+        Ok(Self { i: 0, store, page })
     }
 
     /// Adds a child entry to the builder.
-    pub fn add_child_entry(mut self, key: &[u8], page_num: usize) -> Result<Self> {
-        let n = node::get_num_keys(&self.buf);
+    fn add_child_entry(mut self, key: &[u8], page_num: usize) -> Self {
+        let n = node::get_num_keys(&self.page);
         assert!(
             self.i < n,
             "add_child_entry() called {} times, cannot be called more times than num_keys = {}",
@@ -148,106 +146,158 @@ impl<'a, B: BufferStore> InternalBuilder<'a, B> {
         );
         assert!(key.len() <= consts::MAX_KEY_SIZE);
 
-        let offset = set_next_offset(&mut self.buf, self.i, n, key);
-        set_child_pointer(&mut self.buf, self.i, page_num);
+        let offset = set_next_offset(&mut self.page, self.i, n, key);
+        set_child_pointer(&mut self.page, self.i, page_num);
         let pos = 4 + n * 10 + offset;
         assert!(
-            pos + key.len() <= self.cap,
-            "builder unexpectedly overflowed: i = {}, n = {}, pos = {}, key_len = {}, cap = {}",
+            pos + key.len() <= consts::PAGE_SIZE,
+            "builder unexpectedly overflowed: i = {}, n = {}",
             self.i,
             n,
-            pos,
-            key.len(),
-            self.cap
         );
 
-        self.buf[pos..pos + key.len()].copy_from_slice(key);
+        self.page[pos..pos + key.len()].copy_from_slice(key);
 
         self.i += 1;
-        Ok(self)
+        self
     }
 
     /// Builds an internal node and optionally splits it if overflowed.
-    pub fn build(self) -> Result<InternalEffect<B>> {
-        let n = node::get_num_keys(&self.buf);
+    fn build(self) -> Internal<P> {
+        let n = node::get_num_keys(&self.page);
         assert!(
             self.i == n,
             "build() called after calling add_child_entry() {} times < num_keys = {}",
             self.i,
             n
         );
-        if get_num_bytes(&self.buf) <= consts::PAGE_SIZE {
-            return Ok(InternalEffect::Intact(self.build_single()));
-        }
-        let (left, right) = self.build_split()?;
-        Ok(InternalEffect::Split { left, right })
-    }
-
-    /// Builds an internal node.
-    fn build_single(self) -> Internal<B> {
-        let n = node::get_num_keys(&self.buf);
-        assert!(
-            self.i == n,
-            "build_single() called after calling add_child_entry() {} times < num_keys = {}",
-            self.i,
-            n
-        );
-        assert!(get_num_bytes(&self.buf) <= consts::PAGE_SIZE);
         Internal {
-            buf: self.buf,
+            page: self.store.write_page(self.page),
             store: self.store.clone(),
         }
     }
+}
 
-    /// Builds two splits of an internal node.
-    fn build_split(self) -> Result<(Internal<B>, Internal<B>)> {
-        let n = node::get_num_keys(&self.buf);
+struct SplitBuilder<P: PageStore> {
+    i: usize,
+    store: P,
+    page: P::OverflowPage,
+}
+
+impl<P: PageStore> ChildEntryAdder<P> for SplitBuilder<P> {
+    fn add_child_entry(self, key: &[u8], page_num: usize) -> Self {
+        self.add_child_entry(key, page_num)
+    }
+
+    fn build(self) -> Result<InternalEffect<P>> {
+        let (left, right) = self.build()?;
+        Ok(InternalEffect::Split { left, right })
+    }
+}
+
+impl<P: PageStore> SplitBuilder<P> {
+    fn new(num_keys: usize, store: P) -> Result<Self> {
+        let mut page = store.new_overflow_page()?;
+        node::set_node_type(&mut page, NodeType::Internal);
+        node::set_num_keys(&mut page, num_keys);
+        Ok(Self { i: 0, store, page })
+    }
+
+    fn add_child_entry(mut self, key: &[u8], page_num: usize) -> Self {
+        let n = node::get_num_keys(&self.page);
+        assert!(
+            self.i < n,
+            "add_child_entry() called {} times, cannot be called more times than num_keys = {}",
+            self.i,
+            n
+        );
+        assert!(key.len() <= consts::MAX_KEY_SIZE);
+
+        let offset = set_next_offset(&mut self.page, self.i, n, key);
+        set_child_pointer(&mut self.page, self.i, page_num);
+        let pos = 4 + n * 10 + offset;
+        assert!(
+            pos + key.len() <= 2 * consts::PAGE_SIZE - 4,
+            "builder unexpectedly overflowed: i = {}, n = {}",
+            self.i,
+            n,
+        );
+
+        self.page[pos..pos + key.len()].copy_from_slice(key);
+
+        self.i += 1;
+        self
+    }
+
+    fn build(mut self) -> Result<(Internal<P>, Internal<P>)> {
+        let n = node::get_num_keys(&self.page);
+        assert_eq!(self.i, n);
         // There should be at least 2 keys to be sufficient
         // in each of left and right.
-        let left_end = (2..=n - 2)
+        let left_n = (2..=n - 2)
             .rev()
             .find(|i| {
-                let next_offset = get_offset(&self.buf, *i);
+                let next_offset = get_offset(&self.page, *i);
                 4 + *i * 10 + next_offset <= consts::PAGE_SIZE
             })
             .unwrap();
 
-        let mut lb = Self::new(left_end, self.store, false);
-        for i in 0..left_end {
-            lb = lb.add_child_entry(get_key(&self.buf, i), get_child_pointer(&self.buf, i))?;
+        // Build right split with a Builder.
+        let right = {
+            let mut b = Builder::new(n - left_n, self.store.clone())?;
+            for i in left_n..n {
+                b = b.add_child_entry(get_key(&self.page, i), get_child_pointer(&self.page, i));
+            }
+            b.build()
+        };
+
+        // Build left split via truncation.
+        {
+            let left_n_offset = get_offset(&self.page, left_n);
+            // First truncate offsets array into pointers array.
+            self.page
+                .copy_within(4 + n * 8..4 + n * 8 + left_n * 2, 4 + left_n * 8);
+            // Then truncate keys array into the remaining space.
+            self.page
+                .copy_within(4 + n * 10..4 + n * 10 + left_n_offset, 4 + left_n * 10);
         }
-        let mut rb = Self::new(n - left_end, self.store, false);
-        for i in left_end..n {
-            rb = rb.add_child_entry(get_key(&self.buf, i), get_child_pointer(&self.buf, i))?;
-        }
-        Ok((lb.build_single(), rb.build_single()))
+        node::set_num_keys(&mut self.page, left_n);
+        let left = Internal {
+            page: self.store.write_overflow_left_split(self.page)?,
+            store: self.store.clone(),
+        };
+
+        Ok((left, right))
     }
 }
 
 /// A B+ tree internal node.
 #[derive(Debug)]
-pub struct Internal<B: BufferStore> {
-    buf: B::B,
-    store: B,
+pub struct Internal<P: PageStore> {
+    page: P::ReadOnlyPage,
+    store: P,
 }
 
-impl<B: BufferStore> Internal<B> {
+impl<P: PageStore> Internal<P> {
     /// Creates an internal node that is the parent of two splits.
-    pub fn parent_of_split(
-        keys: [&[u8]; 2],
-        child_pointers: [usize; 2],
-        store: &B,
-    ) -> Result<Self> {
-        let parent = InternalBuilder::new(2, store, false)
-            .add_child_entry(keys[0], child_pointers[0])?
-            .add_child_entry(keys[1], child_pointers[1])?
-            .build()?
-            .take_intact();
+    pub fn parent_of_split(keys: [&[u8]; 2], child_pointers: [usize; 2], store: P) -> Result<Self> {
+        let parent = Builder::new(2, store.clone())?
+            .add_child_entry(keys[0], child_pointers[0])
+            .add_child_entry(keys[1], child_pointers[1])
+            .build();
         Ok(parent)
     }
 
+    pub fn from_page(store: P, page: P::ReadOnlyPage) -> Self {
+        Internal { page, store }
+    }
+
+    pub fn page_num(&self) -> usize {
+        self.page.page_num()
+    }
+
     /// Merges child entries into the internal node.
-    pub fn merge_child_entries(&self, entries: &[ChildEntry]) -> Result<InternalEffect<B>> {
+    pub fn merge_child_entries(&self, entries: &[ChildEntry]) -> Result<InternalEffect<P>> {
         let delta_keys = entries
             .iter()
             .map(|ce| match ce {
@@ -266,23 +316,42 @@ impl<B: BufferStore> Internal<B> {
                 ChildEntry::Delete { i } => -8 - (self.get_key(*i).len() as isize),
             })
             .sum::<isize>();
-        let mut b = InternalBuilder::new(
-            (self.get_num_keys() as isize + delta_keys) as usize,
-            &self.store,
-            (self.get_num_bytes() as isize + delta_size) as usize > consts::PAGE_SIZE,
-        );
+        let overflow = (self.get_num_bytes() as isize + delta_size) as usize > consts::PAGE_SIZE;
+        if overflow {
+            return self.merge_child_entries_with_builder(
+                SplitBuilder::new(
+                    (self.get_num_keys() as isize + delta_keys) as usize,
+                    self.store.clone(),
+                )?,
+                entries,
+            );
+        }
+        self.merge_child_entries_with_builder(
+            Builder::new(
+                (self.get_num_keys() as isize + delta_keys) as usize,
+                self.store.clone(),
+            )?,
+            entries,
+        )
+    }
+
+    fn merge_child_entries_with_builder<B: ChildEntryAdder<P>>(
+        &self,
+        mut b: B,
+        entries: &[ChildEntry],
+    ) -> Result<InternalEffect<P>> {
         let mut self_iter = self.iter().enumerate().peekable();
         let mut entries_iter = entries.iter().peekable();
         loop {
             match (self_iter.peek(), entries_iter.peek()) {
                 (None, None) => break,
                 (Some((_, (k, pn))), None) => {
-                    b = b.add_child_entry(k, *pn)?;
+                    b = b.add_child_entry(k, *pn);
                     self_iter.next();
                 }
                 (None, Some(ce)) => match ce {
                     ChildEntry::Insert { key, page_num } => {
-                        b = b.add_child_entry(key, *page_num)?;
+                        b = b.add_child_entry(key, *page_num);
                         entries_iter.next();
                     }
                     _ => panic!("ChildEntry {ce:?} cannot be applied without corresponding index"),
@@ -293,7 +362,7 @@ impl<B: BufferStore> Internal<B> {
                         key,
                         page_num,
                     } if *i == *j => {
-                        b = b.add_child_entry(key, *page_num)?;
+                        b = b.add_child_entry(key, *page_num);
                         self_iter.next();
                         entries_iter.next();
                     }
@@ -302,14 +371,14 @@ impl<B: BufferStore> Internal<B> {
                         entries_iter.next();
                     }
                     ChildEntry::Insert { key, page_num } if (*key).as_ref() < *k => {
-                        b = b.add_child_entry(key, *page_num)?;
+                        b = b.add_child_entry(key, *page_num);
                         entries_iter.next();
                     }
                     ce @ ChildEntry::Insert { key, .. } if (*key).as_ref() == *k => {
                         panic!("ChildEntry {ce:?} has a duplicate key");
                     }
                     _ => {
-                        b = b.add_child_entry(k, *pn)?;
+                        b = b.add_child_entry(k, *pn);
                         self_iter.next();
                     }
                 },
@@ -320,19 +389,39 @@ impl<B: BufferStore> Internal<B> {
 
     /// Resolves underflow of either `left` or `right` by either having one
     /// steal from the other, or merging the two.
-    pub fn steal_or_merge(left: &Internal<B>, right: &Internal<B>) -> Result<InternalEffect<B>> {
-        // TODO: Actually determine if overflow is needed.
-        let allow_overflow = true;
-        let mut b = InternalBuilder::new(
-            left.get_num_keys() + right.get_num_keys(),
-            &left.store,
-            allow_overflow,
-        );
+    pub fn steal_or_merge(left: &Internal<P>, right: &Internal<P>) -> Result<InternalEffect<P>> {
+        if left.get_num_bytes() + right.get_num_bytes() - 4 > consts::PAGE_SIZE {
+            // Steal
+            return Self::steal_or_merge_with_builder(
+                SplitBuilder::new(
+                    left.get_num_keys() + right.get_num_keys(),
+                    left.store.clone(),
+                )?,
+                left,
+                right,
+            );
+        }
+        // Merge
+        Self::steal_or_merge_with_builder(
+            Builder::new(
+                left.get_num_keys() + right.get_num_keys(),
+                left.store.clone(),
+            )?,
+            left,
+            right,
+        )
+    }
+
+    fn steal_or_merge_with_builder<B: ChildEntryAdder<P>>(
+        mut b: B,
+        left: &Internal<P>,
+        right: &Internal<P>,
+    ) -> Result<InternalEffect<P>> {
         for (key, page_num) in left.iter() {
-            b = b.add_child_entry(key, page_num)?;
+            b = b.add_child_entry(key, page_num);
         }
         for (key, page_num) in right.iter() {
-            b = b.add_child_entry(key, page_num)?;
+            b = b.add_child_entry(key, page_num);
         }
         b.build()
     }
@@ -346,21 +435,21 @@ impl<B: BufferStore> Internal<B> {
 
     /// Gets the child pointer at an index.
     pub fn get_child_pointer(&self, i: usize) -> usize {
-        get_child_pointer(&self.buf, i)
+        get_child_pointer(&self.page, i)
     }
 
     /// Gets the number of keys.
     pub fn get_num_keys(&self) -> usize {
-        node::get_num_keys(&self.buf)
+        node::get_num_keys(&self.page)
     }
 
     /// Gets the `i`th key in the internal buffer.
     pub fn get_key(&self, i: usize) -> &[u8] {
-        get_key(&self.buf, i)
+        get_key(&self.page, i)
     }
 
     /// Creates an key-value iterator for the internal node.
-    pub fn iter(&self) -> InternalIterator<B> {
+    pub fn iter(&self) -> InternalIterator<P> {
         InternalIterator {
             node: self,
             i: 0,
@@ -369,29 +458,18 @@ impl<B: BufferStore> Internal<B> {
     }
 
     pub fn get_num_bytes(&self) -> usize {
-        get_num_bytes(&self.buf)
-    }
-}
-
-impl<B: BufferStore> Clone for Internal<B> {
-    fn clone(&self) -> Self {
-        let mut buf = self.store.get_buf(self.buf.len());
-        buf.copy_from_slice(&self.buf);
-        Self {
-            buf,
-            store: self.store.clone(),
-        }
+        get_num_bytes(&self.page)
     }
 }
 
 /// A key-value iterator of an internal node.
-pub struct InternalIterator<'a, B: BufferStore> {
-    node: &'a Internal<B>,
+pub struct InternalIterator<'a, P: PageStore> {
+    node: &'a Internal<P>,
     i: usize,
     n: usize,
 }
 
-impl<'a, B: BufferStore> Iterator for InternalIterator<'a, B> {
+impl<'a, P: PageStore> Iterator for InternalIterator<'a, P> {
     type Item = (&'a [u8], usize);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -409,17 +487,24 @@ impl<'a, B: BufferStore> Iterator for InternalIterator<'a, B> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::tree::buffer_store::Heap;
+    use std::sync::OnceLock;
 
-    static TEST_HEAP_STORE: Heap = Heap {};
+    use crate::tree::page_store::InMemory;
+
+    use super::*;
+
+    static TEST_STORE: OnceLock<InMemory> = OnceLock::new();
+
+    fn test_store() -> InMemory {
+        TEST_STORE.get_or_init(InMemory::new).clone()
+    }
 
     #[test]
     fn parent_of_slit() {
         let parent = Internal::parent_of_split(
             ["key1".as_bytes(), "key2".as_bytes()],
             [111, 222],
-            &TEST_HEAP_STORE,
+            test_store(),
         )
         .unwrap();
         assert_eq!(
@@ -433,7 +518,7 @@ mod tests {
         let node = Internal::parent_of_split(
             ["key1".as_bytes(), "key2".as_bytes()],
             [111, 222],
-            &TEST_HEAP_STORE,
+            test_store(),
         )
         .unwrap();
         let node = node
@@ -467,18 +552,13 @@ mod tests {
 
     #[test]
     fn merge_child_entries_insert_split() {
-        let node = InternalBuilder::new(4, &TEST_HEAP_STORE, false)
+        let node = Builder::new(4, test_store())
+            .unwrap()
             .add_child_entry(&[0; consts::MAX_KEY_SIZE], 0)
-            .unwrap()
             .add_child_entry(&[1; consts::MAX_KEY_SIZE], 1)
-            .unwrap()
             .add_child_entry(&[2; consts::MAX_KEY_SIZE], 2)
-            .unwrap()
             .add_child_entry(&[4; consts::MAX_KEY_SIZE], 4)
-            .unwrap()
-            .build()
-            .unwrap()
-            .take_intact();
+            .build();
         let (left, right) = node
             .merge_child_entries(&[ChildEntry::Insert {
                 key: [3; consts::MAX_KEY_SIZE].into(),
@@ -503,20 +583,14 @@ mod tests {
 
     #[test]
     fn merge_child_entries_udate_split() {
-        let node = InternalBuilder::new(5, &TEST_HEAP_STORE, false)
+        let node = Builder::new(5, test_store())
+            .unwrap()
             .add_child_entry(&[0; consts::MAX_KEY_SIZE], 0)
-            .unwrap()
             .add_child_entry(&[1; consts::MAX_KEY_SIZE], 1)
-            .unwrap()
             .add_child_entry(&[2; consts::MAX_KEY_SIZE], 2)
-            .unwrap()
             .add_child_entry(&[3; 1], 3)
-            .unwrap()
             .add_child_entry(&[4; consts::MAX_KEY_SIZE], 4)
-            .unwrap()
-            .build()
-            .unwrap()
-            .take_intact();
+            .build();
         let (left, right) = node
             .merge_child_entries(&[ChildEntry::Update {
                 i: 3,
@@ -542,24 +616,17 @@ mod tests {
 
     #[test]
     fn steal_or_merge_steal() {
-        let left = InternalBuilder::new(1, &TEST_HEAP_STORE, false)
+        let left = Builder::new(1, test_store())
+            .unwrap()
             .add_child_entry(&[1; consts::MAX_KEY_SIZE], 1)
+            .build();
+        let right = Builder::new(4, test_store())
             .unwrap()
-            .build()
-            .unwrap()
-            .take_intact();
-        let right = InternalBuilder::new(4, &TEST_HEAP_STORE, false)
             .add_child_entry(&[2; consts::MAX_KEY_SIZE], 2)
-            .unwrap()
             .add_child_entry(&[3; consts::MAX_KEY_SIZE], 3)
-            .unwrap()
             .add_child_entry(&[4; consts::MAX_KEY_SIZE], 4)
-            .unwrap()
             .add_child_entry(&[5; consts::MAX_KEY_SIZE], 5)
-            .unwrap()
-            .build()
-            .unwrap()
-            .take_intact();
+            .build();
 
         let (left, right) = Internal::steal_or_merge(&left, &right)
             .unwrap()
@@ -582,20 +649,15 @@ mod tests {
 
     #[test]
     fn steal_or_merge_merge() {
-        let left = InternalBuilder::new(1, &TEST_HEAP_STORE, false)
+        let left = Builder::new(1, test_store())
+            .unwrap()
             .add_child_entry(&[1], 1)
+            .build();
+        let right = Builder::new(2, test_store())
             .unwrap()
-            .build()
-            .unwrap()
-            .take_intact();
-        let right = InternalBuilder::new(2, &TEST_HEAP_STORE, false)
             .add_child_entry(&[2], 2)
-            .unwrap()
             .add_child_entry(&[3], 3)
-            .unwrap()
-            .build()
-            .unwrap()
-            .take_intact();
+            .build();
 
         let merged = Internal::steal_or_merge(&left, &right)
             .unwrap()
@@ -608,14 +670,11 @@ mod tests {
 
     #[test]
     fn find() {
-        let node = InternalBuilder::new(2, &TEST_HEAP_STORE, false)
+        let node = Builder::new(2, test_store())
+            .unwrap()
             .add_child_entry(&[1], 1)
-            .unwrap()
             .add_child_entry(&[2], 2)
-            .unwrap()
-            .build()
-            .unwrap()
-            .take_intact();
+            .build();
         assert_eq!(node.find(&[1]), 0);
         assert_eq!(node.find(&[3]), 1);
 
