@@ -487,16 +487,12 @@ impl<'a, P: PageStore> Iterator for InternalIterator<'a, P> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::OnceLock;
-
     use crate::tree::page_store::InMemory;
 
     use super::*;
 
-    static TEST_STORE: OnceLock<InMemory> = OnceLock::new();
-
     fn test_store() -> InMemory {
-        TEST_STORE.get_or_init(InMemory::new).clone()
+        InMemory::new()
     }
 
     #[test]

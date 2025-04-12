@@ -1,3 +1,5 @@
+use std::iter::Peekable;
+
 use crate::tree::consts;
 use crate::tree::error::NodeError;
 use crate::tree::node::{self, NodeType, Result};
@@ -84,9 +86,77 @@ fn set_next_offset(page: &mut [u8], i: usize, key: &[u8], val: &[u8]) -> usize {
     curr_offset
 }
 
-trait KeyValueAdder<P: PageStore> {
-    fn add_key_value(self, key: &[u8], val: &[u8]) -> Self;
-    fn build(self) -> Result<LeafEffect<P>>;
+fn find_split<'a, F, I>(itr_func: F, num_keys: usize) -> usize
+where
+    F: Fn() -> I,
+    I: Iterator<Item = (&'a [u8], &'a [u8])>,
+{
+    assert!(num_keys >= 2);
+
+    // Try to split such that both splits are sufficient
+    // (i.e. have at least 2 keys).
+    if num_keys < 4 {
+        // Relax the sufficiency requirement if impossible to meet.
+        return itr_func()
+            .scan(4usize, |size, (k, v)| {
+                *size += 6 + k.len() + v.len();
+                if *size > consts::PAGE_SIZE {
+                    return None;
+                }
+                Some(())
+            })
+            .count();
+    }
+    itr_func()
+        .enumerate()
+        .scan(4usize, |size, (i, (k, v))| {
+            *size += 6 + k.len() + v.len();
+            if i < 2 {
+                return Some(());
+            }
+            if *size > consts::PAGE_SIZE || i >= num_keys - 2 {
+                return None;
+            }
+            Some(())
+        })
+        .count()
+}
+
+fn build_split<'a, P, F, I>(store: P, itr_func: &F, num_keys: usize) -> Result<LeafEffect<P>>
+where
+    P: PageStore + 'a,
+    F: Fn() -> I,
+    I: Iterator<Item = (&'a [u8], &'a [u8])>,
+{
+    let split_at = find_split(itr_func, num_keys);
+    let itr = itr_func();
+    let (mut lb, mut rb) = (
+        Builder::new(split_at, store.clone())?,
+        Builder::new(num_keys - split_at, store.clone())?,
+    );
+    for (i, (k, v)) in itr.enumerate() {
+        if i < split_at {
+            lb = lb.add_key_value(k, v);
+        } else {
+            rb = rb.add_key_value(k, v);
+        }
+    }
+    let (left, right) = (lb.build(), rb.build());
+    Ok(LeafEffect::Split { left, right })
+}
+
+fn build<'a, P, F, I>(store: P, itr_func: F, num_keys: usize) -> Result<LeafEffect<P>>
+where
+    P: PageStore + 'a,
+    F: FnOnce() -> I,
+    I: Iterator<Item = (&'a [u8], &'a [u8])>,
+{
+    let itr = itr_func();
+    let mut b = Builder::new(num_keys, store)?;
+    for (k, v) in itr {
+        b = b.add_key_value(k, v);
+    }
+    Ok(LeafEffect::Intact(b.build()))
 }
 
 // A builder of a B+ tree leaf node.
@@ -94,16 +164,6 @@ struct Builder<P: PageStore> {
     i: usize,
     store: P,
     page: P::Page,
-}
-
-impl<P: PageStore> KeyValueAdder<P> for Builder<P> {
-    fn add_key_value(self, key: &[u8], val: &[u8]) -> Self {
-        self.add_key_value(key, val)
-    }
-
-    fn build(self) -> Result<LeafEffect<P>> {
-        Ok(LeafEffect::Intact(self.build()))
-    }
 }
 
 impl<P: PageStore> Builder<P> {
@@ -121,7 +181,7 @@ impl<P: PageStore> Builder<P> {
         assert!(
             self.i < n,
             "add_key_value() called {} times, cannot be called more times than num_keys = {}",
-            self.i,
+            self.i + 1,
             n
         );
         assert!(key.len() <= consts::MAX_KEY_SIZE);
@@ -162,110 +222,6 @@ impl<P: PageStore> Builder<P> {
     }
 }
 
-struct SplitBuilder<P: PageStore> {
-    i: usize,
-    store: P,
-    page: P::OverflowPage,
-}
-
-impl<P: PageStore> KeyValueAdder<P> for SplitBuilder<P> {
-    fn add_key_value(self, key: &[u8], val: &[u8]) -> Self {
-        self.add_key_value(key, val)
-    }
-
-    fn build(self) -> Result<LeafEffect<P>> {
-        let (left, right) = self.build()?;
-        Ok(LeafEffect::Split { left, right })
-    }
-}
-
-impl<P: PageStore> SplitBuilder<P> {
-    fn new(num_keys: usize, store: P) -> Result<Self> {
-        assert!(num_keys >= 2, "num_keys got = {num_keys}, want > 2; otherwise, there's no point in using SplitBuilder. Use Builder instead.");
-        let mut page = store.new_overflow_page()?;
-        node::set_node_type(&mut page, NodeType::Leaf);
-        node::set_num_keys(&mut page, num_keys);
-        Ok(Self { i: 0, store, page })
-    }
-
-    fn add_key_value(mut self, key: &[u8], val: &[u8]) -> Self {
-        let n = node::get_num_keys(&self.page);
-        assert!(
-            self.i < n,
-            "add_key_value() called {} times, cannot be called more times than num_keys = {}",
-            self.i,
-            n
-        );
-        assert!(key.len() <= consts::MAX_KEY_SIZE);
-        assert!(val.len() <= consts::MAX_VALUE_SIZE);
-
-        let offset = set_next_offset(&mut self.page, self.i, key, val);
-        let pos = 4 + n * 2 + offset;
-        assert!(
-            pos + 4 + key.len() + val.len() <= 2 * consts::PAGE_SIZE - 4,
-            "builder unexpectedly overflowed: i = {}, n = {}",
-            self.i,
-            n
-        );
-
-        self.page[pos..pos + 2].copy_from_slice(&(key.len() as u16).to_be_bytes());
-        self.page[pos + 2..pos + 4].copy_from_slice(&(val.len() as u16).to_be_bytes());
-        self.page[pos + 4..pos + 4 + key.len()].copy_from_slice(key);
-        self.page[pos + 4 + key.len()..pos + 4 + key.len() + val.len()].copy_from_slice(val);
-
-        self.i += 1;
-        self
-    }
-
-    fn build(mut self) -> Result<(Leaf<P>, Leaf<P>)> {
-        let n = node::get_num_keys(&self.page);
-        assert!(
-            self.i == n,
-            "build() called after calling add_key_value() {} times < num_keys = {}",
-            self.i,
-            n
-        );
-        // Try to have at least 2 keys in each to be sufficient
-        // in each of left and right.
-        let mut left_n = (2..=n - 2).rev().find(|i| {
-            let next_offset = get_offset(&self.page, *i);
-            4 + *i * 2 + next_offset <= consts::PAGE_SIZE
-        });
-        if left_n.is_none() {
-            // Relax the sufficiency requirement by just making sure
-            // each left and right fits within a page.
-            left_n = (0..n).rev().find(|i| {
-                let next_offset = get_offset(&self.page, *i);
-                4 + *i + 2 + next_offset <= consts::PAGE_SIZE
-            })
-        }
-        let left_n = left_n.unwrap();
-
-        // Build right split with a Builder.
-        let right = {
-            let mut b = Builder::new(n - left_n, self.store.clone())?;
-            for i in left_n..n {
-                b = b.add_key_value(get_key(&self.page, i), get_value(&self.page, i));
-            }
-            b.build()
-        };
-
-        // Build left split via truncation.
-        {
-            let left_n_offset = get_offset(&self.page, left_n);
-            self.page
-                .copy_within(4 + n * 2..4 + n * 2 + left_n_offset, 4 + left_n * 2);
-        }
-        node::set_num_keys(&mut self.page, left_n);
-        let left = Leaf {
-            page: self.store.write_overflow_left_split(self.page)?,
-            store: self.store.clone(),
-        };
-
-        Ok((left, right))
-    }
-}
-
 /// A B+ tree leaf node.
 #[derive(Debug)]
 pub struct Leaf<P: PageStore> {
@@ -302,38 +258,11 @@ impl<P: PageStore> Leaf<P> {
         if self.find(key).is_some() {
             return Err(NodeError::AlreadyExists);
         }
+        let itr_func = || self.insert_iter(key, val);
         if self.get_num_bytes() + 6 + key.len() + val.len() > consts::PAGE_SIZE {
-            return self.insert_with_builder(
-                SplitBuilder::new(self.get_num_keys() + 1, self.store.clone())?,
-                key,
-                val,
-            );
+            return build_split(self.store.clone(), &itr_func, self.get_num_keys() + 1);
         }
-        self.insert_with_builder(
-            Builder::new(self.get_num_keys() + 1, self.store.clone())?,
-            key,
-            val,
-        )
-    }
-
-    fn insert_with_builder<B: KeyValueAdder<P>>(
-        &self,
-        mut b: B,
-        key: &[u8],
-        val: &[u8],
-    ) -> Result<LeafEffect<P>> {
-        let mut added = false;
-        for (k, v) in self.iter() {
-            if !added && key < k {
-                added = true;
-                b = b.add_key_value(key, val);
-            }
-            b = b.add_key_value(k, v);
-        }
-        if !added {
-            b = b.add_key_value(key, val);
-        }
-        b.build()
+        build(self.store.clone(), itr_func, self.get_num_keys() + 1)
     }
 
     /// Updates the value corresponding to a key.
@@ -349,36 +278,11 @@ impl<P: PageStore> Leaf<P> {
             return Err(NodeError::KeyNotFound);
         }
         let old_val = old_val.unwrap();
+        let itr_func = || self.update_iter(key, val);
         if self.get_num_bytes() - old_val.len() + val.len() > consts::PAGE_SIZE {
-            return self.update_with_builder(
-                SplitBuilder::new(self.get_num_keys(), self.store.clone())?,
-                key,
-                val,
-            );
+            return build_split(self.store.clone(), &itr_func, self.get_num_keys());
         }
-        self.update_with_builder(
-            Builder::new(self.get_num_keys(), self.store.clone())?,
-            key,
-            val,
-        )
-    }
-
-    fn update_with_builder<B: KeyValueAdder<P>>(
-        &self,
-        mut b: B,
-        key: &[u8],
-        val: &[u8],
-    ) -> Result<LeafEffect<P>> {
-        let mut added = false;
-        for (k, v) in self.iter() {
-            if !added && key == k {
-                added = true;
-                b = b.add_key_value(key, val);
-                continue;
-            }
-            b = b.add_key_value(k, v);
-        }
-        b.build()
+        build(self.store.clone(), itr_func, self.get_num_keys())
     }
 
     /// Deletes a key and its corresponding value.
@@ -413,41 +317,15 @@ impl<P: PageStore> Leaf<P> {
     }
 
     pub fn steal_or_merge(left: &Leaf<P>, right: &Leaf<P>) -> Result<LeafEffect<P>> {
+        let itr_func = || left.iter().chain(right.iter());
+        let total_num_keys = left.get_num_keys() + right.get_num_keys();
         let overflow = left.get_num_bytes() + right.get_num_bytes() - 4 > consts::PAGE_SIZE;
         if overflow {
             // Steal
-            return Self::steal_or_merge_with_builder(
-                SplitBuilder::new(
-                    left.get_num_keys() + right.get_num_keys(),
-                    left.store.clone(),
-                )?,
-                left,
-                right,
-            );
+            return build_split(left.store.clone(), &itr_func, total_num_keys);
         }
         // Merge
-        Self::steal_or_merge_with_builder(
-            Builder::new(
-                left.get_num_keys() + right.get_num_keys(),
-                left.store.clone(),
-            )?,
-            left,
-            right,
-        )
-    }
-
-    fn steal_or_merge_with_builder<B: KeyValueAdder<P>>(
-        mut b: B,
-        left: &Leaf<P>,
-        right: &Leaf<P>,
-    ) -> Result<LeafEffect<P>> {
-        for (key, val) in left.iter() {
-            b = b.add_key_value(key, val);
-        }
-        for (key, val) in right.iter() {
-            b = b.add_key_value(key, val);
-        }
-        b.build()
+        build(left.store.clone(), itr_func, total_num_keys)
     }
 
     pub fn get_key(&self, i: usize) -> &[u8] {
@@ -467,6 +345,24 @@ impl<P: PageStore> Leaf<P> {
             node: self,
             i: 0,
             n: self.get_num_keys(),
+        }
+    }
+
+    fn insert_iter<'a>(&'a self, key: &'a [u8], val: &'a [u8]) -> InsertIterator<'a, P> {
+        InsertIterator {
+            leaf_itr: self.iter().peekable(),
+            key,
+            val,
+            added: false,
+        }
+    }
+
+    fn update_iter<'a>(&'a self, key: &'a [u8], val: &'a [u8]) -> UpdateIterator<'a, P> {
+        UpdateIterator {
+            leaf_itr: self.iter().peekable(),
+            key,
+            val,
+            skip: false,
         }
     }
 
@@ -495,18 +391,72 @@ impl<'a, P: PageStore> Iterator for LeafIterator<'a, P> {
     }
 }
 
+struct InsertIterator<'a, P: PageStore> {
+    leaf_itr: Peekable<LeafIterator<'a, P>>,
+    key: &'a [u8],
+    val: &'a [u8],
+    added: bool,
+}
+
+impl<'a, P: PageStore> Iterator for InsertIterator<'a, P> {
+    type Item = (&'a [u8], &'a [u8]);
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.added {
+            return self.leaf_itr.next();
+        }
+        match self.leaf_itr.peek() {
+            None => {
+                self.added = true;
+                Some((self.key, self.val))
+            }
+            Some(&(leaf_key, _)) => {
+                if self.key < leaf_key {
+                    self.added = true;
+                    Some((self.key, self.val))
+                } else {
+                    self.leaf_itr.next()
+                }
+            }
+        }
+    }
+}
+
+struct UpdateIterator<'a, P: PageStore> {
+    leaf_itr: Peekable<LeafIterator<'a, P>>,
+    key: &'a [u8],
+    val: &'a [u8],
+    skip: bool,
+}
+
+impl<'a, P: PageStore> Iterator for UpdateIterator<'a, P> {
+    type Item = (&'a [u8], &'a [u8]);
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.leaf_itr.peek() {
+            None => None,
+            Some(&(leaf_key, _)) => {
+                if self.skip {
+                    self.skip = false;
+                    self.leaf_itr.next();
+                    return self.leaf_itr.next();
+                }
+                if self.key == leaf_key {
+                    self.skip = true;
+                    return Some((self.key, self.val));
+                }
+                self.leaf_itr.next()
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::OnceLock;
-
     use crate::tree::page_store::InMemory;
 
     use super::*;
 
-    static TEST_STORE: OnceLock<InMemory> = OnceLock::new();
-
     fn test_store() -> InMemory {
-        TEST_STORE.get_or_init(InMemory::new).clone()
+        InMemory::new()
     }
 
     #[test]

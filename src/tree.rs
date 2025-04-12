@@ -396,16 +396,12 @@ impl<P: PageStore> Iterator for InOrder<P> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::OnceLock;
-
     use page_store::InMemory;
 
     use super::*;
 
-    static TEST_STORE: OnceLock<InMemory> = OnceLock::new();
-
     fn test_store() -> InMemory {
-        TEST_STORE.get_or_init(InMemory::new).clone()
+        InMemory::new()
     }
 
     fn insert_until_height(height: u32) -> Tree<InMemory> {
