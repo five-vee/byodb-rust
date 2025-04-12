@@ -62,7 +62,7 @@ fn get_key(page: &[u8], i: usize) -> &[u8] {
 
 /// Gets the `i`th child pointer in an internal node's page buffer.
 fn get_child_pointer(page: &[u8], i: usize) -> usize {
-    u64::from_be_bytes([
+    u64::from_le_bytes([
         page[4 + i * 8],
         page[4 + i * 8 + 1],
         page[4 + i * 8 + 2],
@@ -76,7 +76,7 @@ fn get_child_pointer(page: &[u8], i: usize) -> usize {
 
 /// Sets the `i`th child pointer in an internal node's page buffer.
 fn set_child_pointer(page: &mut [u8], i: usize, page_num: usize) {
-    page[4 + i * 8..4 + (i + 1) * 8].copy_from_slice(&(page_num as u64).to_be_bytes());
+    page[4 + i * 8..4 + (i + 1) * 8].copy_from_slice(&(page_num as u64).to_le_bytes());
 }
 
 /// Gets the `i`th offset value.
@@ -85,7 +85,7 @@ fn get_offset(page: &[u8], i: usize) -> usize {
         return 0;
     }
     let n = node::get_num_keys(page);
-    u16::from_be_bytes([page[4 + n * 8 + 2 * (i - 1)], page[4 + n * 8 + 2 * i - 1]]) as usize
+    u16::from_le_bytes([page[4 + n * 8 + 2 * (i - 1)], page[4 + n * 8 + 2 * i - 1]]) as usize
 }
 
 /// Sets the next (i.e. `i+1`th) offset and returns the current offset.
@@ -94,7 +94,7 @@ fn set_next_offset(page: &mut [u8], i: usize, n: usize, key: &[u8]) -> usize {
     let next_offset = curr_offset + key.len();
     let next_i = i + 1;
     page[4 + n * 8 + 2 * (next_i - 1)..4 + n * 8 + 2 * next_i]
-        .copy_from_slice(&(next_offset as u16).to_be_bytes());
+        .copy_from_slice(&(next_offset as u16).to_le_bytes());
     curr_offset
 }
 

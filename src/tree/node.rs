@@ -316,19 +316,19 @@ pub fn can_merge<P: PageStore>(left: &Node<P>, right: &Node<P>) -> bool {
 
 /// Sets the page header of a node's page buffer.
 fn set_node_type(page: &mut [u8], node_type: NodeType) {
-    page[0..2].copy_from_slice(&(node_type as u16).to_be_bytes());
+    page[0..2].copy_from_slice(&(node_type as u16).to_le_bytes());
 }
 
 fn get_node_type(page: &[u8]) -> Result<NodeType> {
-    NodeType::try_from(u16::from_be_bytes([page[0], page[1]]))
+    NodeType::try_from(u16::from_le_bytes([page[0], page[1]]))
 }
 
 /// Sets the number of keys in a node's page buffer.
 fn set_num_keys(page: &mut [u8], n: usize) {
-    page[2..4].copy_from_slice(&(n as u16).to_be_bytes());
+    page[2..4].copy_from_slice(&(n as u16).to_le_bytes());
 }
 
 /// Gets the number of keys in a node's page buffer.
 fn get_num_keys(page: &[u8]) -> usize {
-    u16::from_be_bytes([page[2], page[3]]) as usize
+    u16::from_le_bytes([page[2], page[3]]) as usize
 }

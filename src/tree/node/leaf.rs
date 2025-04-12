@@ -39,7 +39,7 @@ impl<P: PageStore> LeafEffect<P> {
 fn get_key(page: &[u8], i: usize) -> &[u8] {
     let offset = get_offset(page, i);
     let num_keys = node::get_num_keys(page);
-    let key_len = u16::from_be_bytes([
+    let key_len = u16::from_le_bytes([
         page[4 + num_keys * 2 + offset],
         page[4 + num_keys * 2 + offset + 1],
     ]) as usize;
@@ -50,11 +50,11 @@ fn get_key(page: &[u8], i: usize) -> &[u8] {
 fn get_value(page: &[u8], i: usize) -> &[u8] {
     let offset = get_offset(page, i);
     let num_keys = node::get_num_keys(page);
-    let key_len = u16::from_be_bytes([
+    let key_len = u16::from_le_bytes([
         page[4 + num_keys * 2 + offset],
         page[4 + num_keys * 2 + offset + 1],
     ]) as usize;
-    let val_len = u16::from_be_bytes([
+    let val_len = u16::from_le_bytes([
         page[4 + num_keys * 2 + offset + 2],
         page[4 + num_keys * 2 + offset + 3],
     ]) as usize;
@@ -67,7 +67,7 @@ fn get_offset(page: &[u8], i: usize) -> usize {
     if i == 0 {
         return 0;
     }
-    u16::from_be_bytes([page[4 + 2 * (i - 1)], page[4 + 2 * i - 1]]) as usize
+    u16::from_le_bytes([page[4 + 2 * (i - 1)], page[4 + 2 * i - 1]]) as usize
 }
 
 /// Gets the number of bytes consumed by a page.
@@ -82,7 +82,7 @@ fn set_next_offset(page: &mut [u8], i: usize, key: &[u8], val: &[u8]) -> usize {
     let curr_offset = get_offset(page, i);
     let next_offset = curr_offset + 4 + key.len() + val.len();
     let next_i = i + 1;
-    page[4 + 2 * (next_i - 1)..4 + 2 * next_i].copy_from_slice(&(next_offset as u16).to_be_bytes());
+    page[4 + 2 * (next_i - 1)..4 + 2 * next_i].copy_from_slice(&(next_offset as u16).to_le_bytes());
     curr_offset
 }
 
@@ -196,8 +196,8 @@ impl<P: PageStore> Builder<P> {
             n
         );
 
-        self.page[pos..pos + 2].copy_from_slice(&(key.len() as u16).to_be_bytes());
-        self.page[pos + 2..pos + 4].copy_from_slice(&(val.len() as u16).to_be_bytes());
+        self.page[pos..pos + 2].copy_from_slice(&(key.len() as u16).to_le_bytes());
+        self.page[pos + 2..pos + 4].copy_from_slice(&(val.len() as u16).to_le_bytes());
         self.page[pos + 4..pos + 4 + key.len()].copy_from_slice(key);
         self.page[pos + 4 + key.len()..pos + 4 + key.len() + val.len()].copy_from_slice(val);
 

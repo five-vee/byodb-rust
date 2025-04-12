@@ -436,7 +436,7 @@ mod tests {
         let mut tree = Tree::new(test_store()).unwrap();
         let mut i = 0u64;
         loop {
-            let x = i.to_be_bytes();
+            let x = i.to_le_bytes();
             let result = tree.insert(&x, &x);
             assert!(
                 result.is_ok(),
@@ -510,9 +510,9 @@ mod tests {
     fn update_split() {
         let old_tree = insert_complete(2);
         let new_tree = old_tree
-            .update(&0u64.to_be_bytes(), &[0u8; consts::MAX_VALUE_SIZE])
+            .update(&0u64.to_le_bytes(), &[0u8; consts::MAX_VALUE_SIZE])
             .unwrap();
-        let got = new_tree.get(&0u64.to_be_bytes()).unwrap().unwrap();
+        let got = new_tree.get(&0u64.to_le_bytes()).unwrap().unwrap();
         assert_eq!(got, [0u8; consts::MAX_VALUE_SIZE].into());
         assert_eq!(new_tree.height().unwrap(), old_tree.height().unwrap() + 1);
     }
