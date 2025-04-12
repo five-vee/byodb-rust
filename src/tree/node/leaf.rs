@@ -88,7 +88,7 @@ fn set_next_offset(page: &mut [u8], i: usize, key: &[u8], val: &[u8]) -> usize {
 
 fn find_split<'a, F, I>(itr_func: F, num_keys: usize) -> usize
 where
-    F: Fn() -> I,
+    F: FnOnce() -> I,
     I: Iterator<Item = (&'a [u8], &'a [u8])>,
 {
     assert!(num_keys >= 2);
@@ -124,7 +124,7 @@ where
 
 fn build_split<'a, P, F, I>(store: P, itr_func: &F, num_keys: usize) -> Result<LeafEffect<P>>
 where
-    P: PageStore + 'a,
+    P: PageStore,
     F: Fn() -> I,
     I: Iterator<Item = (&'a [u8], &'a [u8])>,
 {
@@ -147,7 +147,7 @@ where
 
 fn build<'a, P, F, I>(store: P, itr_func: F, num_keys: usize) -> Result<LeafEffect<P>>
 where
-    P: PageStore + 'a,
+    P: PageStore,
     F: FnOnce() -> I,
     I: Iterator<Item = (&'a [u8], &'a [u8])>,
 {

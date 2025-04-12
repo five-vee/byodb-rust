@@ -1,3 +1,4 @@
+use std::iter::Peekable;
 use std::rc::Rc;
 
 use crate::tree::consts;
@@ -104,9 +105,65 @@ fn get_num_bytes(page: &[u8]) -> usize {
     4 + (n * 10) + offset
 }
 
-trait ChildEntryAdder<P: PageStore> {
-    fn add_child_entry(self, key: &[u8], page_num: usize) -> Self;
-    fn build(self) -> Result<InternalEffect<P>>;
+fn find_split<'a, F, I>(itr_func: F, num_keys: usize) -> usize
+where
+    F: FnOnce() -> I,
+    I: Iterator<Item = (&'a [u8], usize)>,
+{
+    assert!(num_keys >= 4);
+
+    // Try to split such that both splits are sufficient
+    // (i.e. have at least 2 keys).
+    itr_func()
+        .enumerate()
+        .scan(4usize, |size, (i, (k, _))| {
+            *size += 10 + k.len();
+            if i < 2 {
+                return Some(());
+            }
+            if *size > consts::PAGE_SIZE || i >= num_keys - 2 {
+                return None;
+            }
+            Some(())
+        })
+        .count()
+}
+
+fn build_split<'a, P, F, I>(store: P, itr_func: &F, num_keys: usize) -> Result<InternalEffect<P>>
+where
+    P: PageStore,
+    F: Fn() -> I,
+    I: Iterator<Item = (&'a [u8], usize)>,
+{
+    let split_at = find_split(itr_func, num_keys);
+    let itr = itr_func();
+    let (mut lb, mut rb) = (
+        Builder::new(split_at, store.clone())?,
+        Builder::new(num_keys - split_at, store.clone())?,
+    );
+    for (i, (k, pn)) in itr.enumerate() {
+        if i < split_at {
+            lb = lb.add_child_entry(k, pn);
+        } else {
+            rb = rb.add_child_entry(k, pn);
+        }
+    }
+    let (left, right) = (lb.build(), rb.build());
+    Ok(InternalEffect::Split { left, right })
+}
+
+fn build<'a, P, F, I>(store: P, itr_func: F, num_keys: usize) -> Result<InternalEffect<P>>
+where
+    P: PageStore,
+    F: FnOnce() -> I,
+    I: Iterator<Item = (&'a [u8], usize)>,
+{
+    let itr = itr_func();
+    let mut b = Builder::new(num_keys, store)?;
+    for (k, pn) in itr {
+        b = b.add_child_entry(k, pn);
+    }
+    Ok(InternalEffect::Intact(b.build()))
 }
 
 /// A builder of a B+ tree internal node.
@@ -114,16 +171,6 @@ struct Builder<P: PageStore> {
     i: usize,
     store: P,
     page: P::Page,
-}
-
-impl<P: PageStore> ChildEntryAdder<P> for Builder<P> {
-    fn add_child_entry(self, key: &[u8], page_num: usize) -> Self {
-        self.add_child_entry(key, page_num)
-    }
-
-    fn build(self) -> Result<InternalEffect<P>> {
-        Ok(InternalEffect::Intact(self.build()))
-    }
 }
 
 impl<P: PageStore> Builder<P> {
@@ -178,99 +225,6 @@ impl<P: PageStore> Builder<P> {
     }
 }
 
-struct SplitBuilder<P: PageStore> {
-    i: usize,
-    store: P,
-    page: P::OverflowPage,
-}
-
-impl<P: PageStore> ChildEntryAdder<P> for SplitBuilder<P> {
-    fn add_child_entry(self, key: &[u8], page_num: usize) -> Self {
-        self.add_child_entry(key, page_num)
-    }
-
-    fn build(self) -> Result<InternalEffect<P>> {
-        let (left, right) = self.build()?;
-        Ok(InternalEffect::Split { left, right })
-    }
-}
-
-impl<P: PageStore> SplitBuilder<P> {
-    fn new(num_keys: usize, store: P) -> Result<Self> {
-        let mut page = store.new_overflow_page()?;
-        node::set_node_type(&mut page, NodeType::Internal);
-        node::set_num_keys(&mut page, num_keys);
-        Ok(Self { i: 0, store, page })
-    }
-
-    fn add_child_entry(mut self, key: &[u8], page_num: usize) -> Self {
-        let n = node::get_num_keys(&self.page);
-        assert!(
-            self.i < n,
-            "add_child_entry() called {} times, cannot be called more times than num_keys = {}",
-            self.i,
-            n
-        );
-        assert!(key.len() <= consts::MAX_KEY_SIZE);
-
-        let offset = set_next_offset(&mut self.page, self.i, n, key);
-        set_child_pointer(&mut self.page, self.i, page_num);
-        let pos = 4 + n * 10 + offset;
-        assert!(
-            pos + key.len() <= 2 * consts::PAGE_SIZE - 4,
-            "builder unexpectedly overflowed: i = {}, n = {}",
-            self.i,
-            n,
-        );
-
-        self.page[pos..pos + key.len()].copy_from_slice(key);
-
-        self.i += 1;
-        self
-    }
-
-    fn build(mut self) -> Result<(Internal<P>, Internal<P>)> {
-        let n = node::get_num_keys(&self.page);
-        assert_eq!(self.i, n);
-        // There should be at least 2 keys to be sufficient
-        // in each of left and right.
-        let left_n = (2..=n - 2)
-            .rev()
-            .find(|i| {
-                let next_offset = get_offset(&self.page, *i);
-                4 + *i * 10 + next_offset <= consts::PAGE_SIZE
-            })
-            .unwrap();
-
-        // Build right split with a Builder.
-        let right = {
-            let mut b = Builder::new(n - left_n, self.store.clone())?;
-            for i in left_n..n {
-                b = b.add_child_entry(get_key(&self.page, i), get_child_pointer(&self.page, i));
-            }
-            b.build()
-        };
-
-        // Build left split via truncation.
-        {
-            let left_n_offset = get_offset(&self.page, left_n);
-            // First truncate offsets array into pointers array.
-            self.page
-                .copy_within(4 + n * 8..4 + n * 8 + left_n * 2, 4 + left_n * 8);
-            // Then truncate keys array into the remaining space.
-            self.page
-                .copy_within(4 + n * 10..4 + n * 10 + left_n_offset, 4 + left_n * 10);
-        }
-        node::set_num_keys(&mut self.page, left_n);
-        let left = Internal {
-            page: self.store.write_overflow_left_split(self.page)?,
-            store: self.store.clone(),
-        };
-
-        Ok((left, right))
-    }
-}
-
 /// A B+ tree internal node.
 #[derive(Debug)]
 pub struct Internal<P: PageStore> {
@@ -316,114 +270,26 @@ impl<P: PageStore> Internal<P> {
                 ChildEntry::Delete { i } => -8 - (self.get_key(*i).len() as isize),
             })
             .sum::<isize>();
+        let itr_func = || self.merge_iter(entries);
+        let total_num_keys = (self.get_num_keys() as isize + delta_keys) as usize;
         let overflow = (self.get_num_bytes() as isize + delta_size) as usize > consts::PAGE_SIZE;
         if overflow {
-            return self.merge_child_entries_with_builder(
-                SplitBuilder::new(
-                    (self.get_num_keys() as isize + delta_keys) as usize,
-                    self.store.clone(),
-                )?,
-                entries,
-            );
+            return build_split(self.store.clone(), &itr_func, total_num_keys);
         }
-        self.merge_child_entries_with_builder(
-            Builder::new(
-                (self.get_num_keys() as isize + delta_keys) as usize,
-                self.store.clone(),
-            )?,
-            entries,
-        )
-    }
-
-    fn merge_child_entries_with_builder<B: ChildEntryAdder<P>>(
-        &self,
-        mut b: B,
-        entries: &[ChildEntry],
-    ) -> Result<InternalEffect<P>> {
-        let mut self_iter = self.iter().enumerate().peekable();
-        let mut entries_iter = entries.iter().peekable();
-        loop {
-            match (self_iter.peek(), entries_iter.peek()) {
-                (None, None) => break,
-                (Some((_, (k, pn))), None) => {
-                    b = b.add_child_entry(k, *pn);
-                    self_iter.next();
-                }
-                (None, Some(ce)) => match ce {
-                    ChildEntry::Insert { key, page_num } => {
-                        b = b.add_child_entry(key, *page_num);
-                        entries_iter.next();
-                    }
-                    _ => panic!("ChildEntry {ce:?} cannot be applied without corresponding index"),
-                },
-                (Some((i, (k, pn))), Some(ce)) => match ce {
-                    ChildEntry::Update {
-                        i: j,
-                        key,
-                        page_num,
-                    } if *i == *j => {
-                        b = b.add_child_entry(key, *page_num);
-                        self_iter.next();
-                        entries_iter.next();
-                    }
-                    ChildEntry::Delete { i: j } if *i == *j => {
-                        self_iter.next();
-                        entries_iter.next();
-                    }
-                    ChildEntry::Insert { key, page_num } if (*key).as_ref() < *k => {
-                        b = b.add_child_entry(key, *page_num);
-                        entries_iter.next();
-                    }
-                    ce @ ChildEntry::Insert { key, .. } if (*key).as_ref() == *k => {
-                        panic!("ChildEntry {ce:?} has a duplicate key");
-                    }
-                    _ => {
-                        b = b.add_child_entry(k, *pn);
-                        self_iter.next();
-                    }
-                },
-            }
-        }
-        b.build()
+        build(self.store.clone(), itr_func, total_num_keys)
     }
 
     /// Resolves underflow of either `left` or `right` by either having one
     /// steal from the other, or merging the two.
     pub fn steal_or_merge(left: &Internal<P>, right: &Internal<P>) -> Result<InternalEffect<P>> {
+        let itr_func = || left.iter().chain(right.iter());
+        let total_keys = left.get_num_keys() + right.get_num_keys();
         if left.get_num_bytes() + right.get_num_bytes() - 4 > consts::PAGE_SIZE {
             // Steal
-            return Self::steal_or_merge_with_builder(
-                SplitBuilder::new(
-                    left.get_num_keys() + right.get_num_keys(),
-                    left.store.clone(),
-                )?,
-                left,
-                right,
-            );
+            return build_split(left.store.clone(), &itr_func, total_keys);
         }
         // Merge
-        Self::steal_or_merge_with_builder(
-            Builder::new(
-                left.get_num_keys() + right.get_num_keys(),
-                left.store.clone(),
-            )?,
-            left,
-            right,
-        )
-    }
-
-    fn steal_or_merge_with_builder<B: ChildEntryAdder<P>>(
-        mut b: B,
-        left: &Internal<P>,
-        right: &Internal<P>,
-    ) -> Result<InternalEffect<P>> {
-        for (key, page_num) in left.iter() {
-            b = b.add_child_entry(key, page_num);
-        }
-        for (key, page_num) in right.iter() {
-            b = b.add_child_entry(key, page_num);
-        }
-        b.build()
+        build(left.store.clone(), itr_func, total_keys)
     }
 
     /// Finds the index of the child that contains the key.
@@ -457,6 +323,16 @@ impl<P: PageStore> Internal<P> {
         }
     }
 
+    fn merge_iter<'a>(
+        &'a self,
+        entries: &'a [ChildEntry],
+    ) -> MergeIterator<'a, InternalIterator<'a, P>, std::slice::Iter<'a, ChildEntry>> {
+        MergeIterator {
+            node_iter: self.iter().enumerate().peekable(),
+            entries_iter: entries.iter().peekable(),
+        }
+    }
+
     pub fn get_num_bytes(&self) -> usize {
         get_num_bytes(&self.page)
     }
@@ -482,6 +358,67 @@ impl<'a, P: PageStore> Iterator for InternalIterator<'a, P> {
         ));
         self.i += 1;
         item
+    }
+}
+
+struct MergeIterator<'a, I, E>
+where
+    I: Iterator<Item = (&'a [u8], usize)>,
+    E: Iterator<Item = &'a ChildEntry>,
+{
+    node_iter: Peekable<std::iter::Enumerate<I>>,
+    entries_iter: Peekable<E>,
+}
+
+impl<'a, I, E> Iterator for MergeIterator<'a, I, E>
+where
+    I: Iterator<Item = (&'a [u8], usize)>,
+    E: Iterator<Item = &'a ChildEntry>,
+{
+    type Item = (&'a [u8], usize);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match (self.node_iter.peek(), self.entries_iter.peek()) {
+            (None, None) => None,
+            (Some(&(_, (k, pn))), None) => {
+                self.node_iter.next();
+                Some((k, pn))
+            }
+            (None, Some(&ce)) => match ce {
+                ChildEntry::Insert { key, page_num } => {
+                    self.entries_iter.next();
+                    Some((key.as_ref(), *page_num))
+                }
+                _ => panic!("ChildEntry {ce:?} cannot be applied without corresponding index"),
+            },
+            (Some(&(i, (k, pn))), Some(ce)) => match ce {
+                ChildEntry::Update {
+                    i: j,
+                    key,
+                    page_num,
+                } if i == *j => {
+                    self.node_iter.next();
+                    self.entries_iter.next();
+                    Some((key.as_ref(), *page_num))
+                }
+                ChildEntry::Delete { i: j } if i == *j => {
+                    self.node_iter.next();
+                    self.entries_iter.next();
+                    self.next()
+                }
+                ChildEntry::Insert { key, page_num } if key.as_ref() < k => {
+                    self.entries_iter.next();
+                    Some((key.as_ref(), *page_num))
+                }
+                ce @ &ChildEntry::Insert { key, .. } if key.as_ref() == k => {
+                    panic!("ChildEntry {ce:?} has a duplicate key");
+                }
+                _ => {
+                    self.node_iter.next();
+                    Some((k, pn))
+                }
+            },
+        }
     }
 }
 
