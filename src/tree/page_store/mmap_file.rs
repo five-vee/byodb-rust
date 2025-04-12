@@ -173,7 +173,6 @@ impl MmapFile {
 
 impl PageStore for MmapFile {
     type Page = MmapPage;
-    type OverflowPage = OverflowMmapPage;
     type ReadOnlyPage = ReadOnlyMmapPage;
 
     fn read_page(&self, page_num: usize) -> Result<ReadOnlyMmapPage> {
@@ -213,23 +212,6 @@ impl PageStore for MmapFile {
             offset: page.offset,
         };
         page
-    }
-
-    fn new_overflow_page(&self) -> Result<Self::OverflowPage> {
-        let mut writer = self.state.writer.borrow_mut();
-        writer.grow_if_needed(2)?;
-        let page = OverflowMmapPage {
-            mmap: writer.mmap.clone(),
-            offset: writer.new_pointer,
-        };
-        writer.new_pointer += 2 * consts::PAGE_SIZE;
-        Ok(page)
-    }
-
-    fn write_overflow_left_split(&self, page: Self::OverflowPage) -> Result<Self::ReadOnlyPage> {
-        let mut left_split = self.new_page()?;
-        left_split.copy_from_slice(&page[page.offset..page.offset + consts::PAGE_SIZE]);
-        Ok(self.write_page(left_split))
     }
 
     fn flush(&self) -> Result<()> {
@@ -290,30 +272,5 @@ impl Deref for ReadOnlyMmapPage {
 impl ReadOnlyPage for ReadOnlyMmapPage {
     fn page_num(&self) -> usize {
         self.offset / consts::PAGE_SIZE
-    }
-}
-
-pub struct OverflowMmapPage {
-    mmap: Rc<MmapMut>,
-    offset: usize,
-}
-
-impl Deref for OverflowMmapPage {
-    type Target = [u8];
-    fn deref(&self) -> &Self::Target {
-        &self.mmap[self.offset..self.offset + consts::PAGE_SIZE]
-    }
-}
-
-impl DerefMut for OverflowMmapPage {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        // SAFETY: The buffer is mutable b/c it's guaranteed that no two
-        // MmapPage's will overlap.
-        // SAFETY: MmapFile guarantees that offset..offset+PAGE_SIZE
-        // is within the bounds of the mmap.
-        unsafe {
-            let ptr = self.mmap.as_ptr().add(self.offset) as *mut u8;
-            &mut *std::ptr::slice_from_raw_parts_mut(ptr, consts::PAGE_SIZE)
-        }
     }
 }

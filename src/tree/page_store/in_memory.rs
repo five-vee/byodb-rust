@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     ops::{Deref, DerefMut},
     sync::{Arc, Mutex},
 };
@@ -51,7 +51,6 @@ impl Default for InMemory {
 
 impl PageStore for InMemory {
     type Page = InMemoryPage;
-    type OverflowPage = OverflowInMemoryPage;
     type ReadOnlyPage = ReadOnlyInMemoryPage;
 
     fn read_page(&self, page_num: usize) -> Result<Self::ReadOnlyPage> {
@@ -99,18 +98,6 @@ impl PageStore for InMemory {
             ptr: page.ptr,
             page_num: page.page_num,
         }
-    }
-
-    fn new_overflow_page(&self) -> Result<Self::OverflowPage> {
-        Ok(OverflowInMemoryPage {
-            buf: Box::new([0u8; 2 * consts::PAGE_SIZE]),
-        })
-    }
-
-    fn write_overflow_left_split(&self, page: Self::OverflowPage) -> Result<Self::ReadOnlyPage> {
-        let mut left_split = self.new_page().unwrap();
-        left_split.copy_from_slice(&page.buf[..consts::PAGE_SIZE]);
-        Ok(self.write_page(left_split))
     }
 
     fn flush(&self) -> Result<()> {
@@ -179,23 +166,6 @@ impl ReadOnlyPage for ReadOnlyInMemoryPage {
     }
 }
 
-pub struct OverflowInMemoryPage {
-    buf: Box<[u8]>,
-}
-
-impl Deref for OverflowInMemoryPage {
-    type Target = [u8];
-    fn deref(&self) -> &Self::Target {
-        &self.buf
-    }
-}
-
-impl DerefMut for OverflowInMemoryPage {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.buf
-    }
-}
-
 mod tests {
     use super::*;
 
@@ -207,24 +177,14 @@ mod tests {
             "page 0 should not yet exist"
         );
         let mut page = store.new_page().unwrap();
-        let mut overflow_page = store.new_overflow_page().unwrap();
         page[0] = 42;
-        overflow_page[0] = 7;
-        {
-            let n = overflow_page.len();
-            overflow_page[n - 1] = 8;
-        }
         assert!(
             matches!(store.read_page(0), Err(PageStoreError::Read(_))),
             "page 0 should not be written yet"
         );
         assert_eq!(page[0], 42);
-        assert_eq!(overflow_page[0], 7);
         let read_only_page = store.write_page(page);
-        let read_only_left_split = store.write_overflow_left_split(overflow_page).unwrap();
         assert_eq!(read_only_page[0], 42);
-        assert_eq!(read_only_left_split[0], 7);
-        assert_ne!(read_only_page.page_num(), read_only_left_split.page_num());
         assert!(
             matches!(
                 store.read_page(read_only_page.page_num()),
@@ -232,24 +192,10 @@ mod tests {
             ),
             "read_only_page hasn't flushed yet"
         );
-        assert!(
-            matches!(
-                store.read_page(read_only_left_split.page_num()),
-                Err(PageStoreError::Read(_))
-            ),
-            "read_only_left_split has not flushed yet"
-        );
         store.flush().unwrap();
         assert_eq!(
             read_only_page.deref(),
             store.read_page(read_only_page.page_num()).unwrap().deref()
-        );
-        assert_eq!(
-            read_only_left_split.deref(),
-            store
-                .read_page(read_only_left_split.page_num())
-                .unwrap()
-                .deref()
         );
     }
 }
