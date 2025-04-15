@@ -2,7 +2,8 @@ use std::iter::Peekable;
 use std::rc::Rc;
 
 use crate::tree::consts;
-use crate::tree::node::{self, NodeType, Result};
+use crate::tree::node::header;
+use crate::tree::node::{NodeType, Result};
 use crate::tree::page_store::{PageStore, ReadOnlyPage};
 
 /// An enum representing the effect of an internal node operation.
@@ -54,7 +55,7 @@ pub enum ChildEntry {
 
 /// Gets the `i`th key in an internal node's page buffer.
 fn get_key(page: &[u8], i: usize) -> &[u8] {
-    let n = node::get_num_keys(page);
+    let n = header::get_num_keys(page);
     let offset = get_offset(page, i);
     let key_len = get_offset(page, i + 1) - offset;
     &page[4 + n * 10 + offset..4 + n * 10 + offset + key_len]
@@ -84,7 +85,7 @@ fn get_offset(page: &[u8], i: usize) -> usize {
     if i == 0 {
         return 0;
     }
-    let n = node::get_num_keys(page);
+    let n = header::get_num_keys(page);
     u16::from_le_bytes([page[4 + n * 8 + 2 * (i - 1)], page[4 + n * 8 + 2 * i - 1]]) as usize
 }
 
@@ -100,7 +101,7 @@ fn set_next_offset(page: &mut [u8], i: usize, n: usize, key: &[u8]) -> usize {
 
 /// Gets the number of bytes consumed by a page.
 fn get_num_bytes(page: &[u8]) -> usize {
-    let n = node::get_num_keys(page);
+    let n = header::get_num_keys(page);
     let offset = get_offset(page, n);
     4 + (n * 10) + offset
 }
@@ -177,14 +178,14 @@ impl<P: PageStore> Builder<P> {
     /// Creates a new internal builder.
     fn new(num_keys: usize, store: P) -> Result<Self> {
         let mut page = store.new_page()?;
-        node::set_node_type(&mut page, NodeType::Internal);
-        node::set_num_keys(&mut page, num_keys);
+        header::set_node_type(&mut page, NodeType::Internal);
+        header::set_num_keys(&mut page, num_keys);
         Ok(Self { i: 0, store, page })
     }
 
     /// Adds a child entry to the builder.
     fn add_child_entry(mut self, key: &[u8], page_num: usize) -> Self {
-        let n = node::get_num_keys(&self.page);
+        let n = header::get_num_keys(&self.page);
         assert!(
             self.i < n,
             "add_child_entry() called {} times, cannot be called more times than num_keys = {}",
@@ -211,7 +212,7 @@ impl<P: PageStore> Builder<P> {
 
     /// Builds an internal node and optionally splits it if overflowed.
     fn build(self) -> Internal<P> {
-        let n = node::get_num_keys(&self.page);
+        let n = header::get_num_keys(&self.page);
         assert!(
             self.i == n,
             "build() called after calling add_child_entry() {} times < num_keys = {}",
@@ -306,7 +307,7 @@ impl<P: PageStore> Internal<P> {
 
     /// Gets the number of keys.
     pub fn get_num_keys(&self) -> usize {
-        node::get_num_keys(&self.page)
+        header::get_num_keys(&self.page)
     }
 
     /// Gets the `i`th key in the internal buffer.

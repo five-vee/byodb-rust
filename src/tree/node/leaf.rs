@@ -2,7 +2,8 @@ use std::iter::Peekable;
 
 use crate::tree::consts;
 use crate::tree::error::NodeError;
-use crate::tree::node::{self, NodeType, Result};
+use crate::tree::node::header;
+use crate::tree::node::{NodeType, Result};
 use crate::tree::page_store::{PageStore, ReadOnlyPage};
 
 /// An enum representing the effect of a leaf node operation.
@@ -38,7 +39,7 @@ impl<P: PageStore> LeafEffect<P> {
 /// Gets the `i`th key in a leaf page buffer.
 fn get_key(page: &[u8], i: usize) -> &[u8] {
     let offset = get_offset(page, i);
-    let num_keys = node::get_num_keys(page);
+    let num_keys = header::get_num_keys(page);
     let key_len = u16::from_le_bytes([
         page[4 + num_keys * 2 + offset],
         page[4 + num_keys * 2 + offset + 1],
@@ -49,7 +50,7 @@ fn get_key(page: &[u8], i: usize) -> &[u8] {
 /// Gets the `i`th value in a leaf page buffer.
 fn get_value(page: &[u8], i: usize) -> &[u8] {
     let offset = get_offset(page, i);
-    let num_keys = node::get_num_keys(page);
+    let num_keys = header::get_num_keys(page);
     let key_len = u16::from_le_bytes([
         page[4 + num_keys * 2 + offset],
         page[4 + num_keys * 2 + offset + 1],
@@ -72,7 +73,7 @@ fn get_offset(page: &[u8], i: usize) -> usize {
 
 /// Gets the number of bytes consumed by a page.
 fn get_num_bytes(page: &[u8]) -> usize {
-    let n = node::get_num_keys(page);
+    let n = header::get_num_keys(page);
     let offset = get_offset(page, n);
     4 + (n * 2) + offset
 }
@@ -170,14 +171,14 @@ impl<P: PageStore> Builder<P> {
     /// Creates a new leaf builder.
     fn new(num_keys: usize, store: P) -> Result<Self> {
         let mut page = store.new_page()?;
-        node::set_node_type(&mut page, NodeType::Leaf);
-        node::set_num_keys(&mut page, num_keys);
+        header::set_node_type(&mut page, NodeType::Leaf);
+        header::set_num_keys(&mut page, num_keys);
         Ok(Self { i: 0, store, page })
     }
 
     /// Adds a key-value pair to the builder.
     fn add_key_value(mut self, key: &[u8], val: &[u8]) -> Self {
-        let n = node::get_num_keys(&self.page);
+        let n = header::get_num_keys(&self.page);
         assert!(
             self.i < n,
             "add_key_value() called {} times, cannot be called more times than num_keys = {}",
@@ -207,7 +208,7 @@ impl<P: PageStore> Builder<P> {
 
     /// Builds a leaf.
     fn build(self) -> Leaf<P> {
-        let n = node::get_num_keys(&self.page);
+        let n = header::get_num_keys(&self.page);
         assert!(
             self.i == n,
             "build() called after calling add_key_value() {} times < num_keys = {}",
@@ -232,7 +233,7 @@ pub struct Leaf<P: PageStore> {
 impl<P: PageStore> Leaf<P> {
     pub fn new(store: P) -> Result<Self> {
         let mut page = store.new_page()?;
-        node::set_node_type(&mut page, NodeType::Leaf);
+        header::set_node_type(&mut page, NodeType::Leaf);
         Ok(Self {
             page: store.write_page(page),
             store,
@@ -337,7 +338,7 @@ impl<P: PageStore> Leaf<P> {
     }
 
     pub fn get_num_keys(&self) -> usize {
-        node::get_num_keys(&self.page)
+        header::get_num_keys(&self.page)
     }
 
     pub fn iter(&self) -> LeafIterator<P> {

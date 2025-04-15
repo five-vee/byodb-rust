@@ -93,6 +93,7 @@
 //! The node format is just an implementation detail. The B+tree will work as
 //! long as nodes contain the necessary information.
 
+mod header;
 mod internal;
 mod leaf;
 
@@ -101,6 +102,7 @@ use std::rc::Rc;
 use crate::tree::consts;
 use crate::tree::error::NodeError;
 use crate::tree::page_store::PageStore;
+use header::NodeType;
 pub(crate) use internal::ChildEntry;
 pub(crate) use internal::Internal;
 use internal::InternalEffect;
@@ -108,25 +110,6 @@ pub(crate) use leaf::Leaf;
 use leaf::LeafEffect;
 
 type Result<T> = std::result::Result<T, NodeError>;
-
-/// An enum representing a page's node type.
-#[repr(u16)]
-#[derive(Debug)]
-enum NodeType {
-    Leaf = 0b01u16,
-    Internal = 0b10u16,
-}
-
-impl TryFrom<u16> for NodeType {
-    type Error = NodeError;
-    fn try_from(value: u16) -> Result<Self> {
-        match value {
-            0b01u16 => Ok(NodeType::Leaf),
-            0b10u16 => Ok(NodeType::Internal),
-            _ => Err(NodeError::UnexpectedNodeType(value)),
-        }
-    }
-}
 
 /// An enum representing the type of B+ tree node.
 pub enum Node<P: PageStore> {
@@ -138,7 +121,7 @@ pub enum Node<P: PageStore> {
 
 impl<P: PageStore> Node<P> {
     fn from_page(store: P, page: P::ReadOnlyPage) -> Result<Self> {
-        match get_node_type(&page)? {
+        match header::get_node_type(&page)? {
             NodeType::Leaf => Ok(Node::Leaf(Leaf::from_page(store, page))),
             NodeType::Internal => Ok(Node::Internal(Internal::from_page(store, page))),
         }
@@ -312,23 +295,4 @@ pub fn can_steal<P: PageStore>(from: &Node<P>, to: &Node<P>, steal_end: bool) ->
 /// Checks whether the merging of `left` and `right` doesn't overflow.
 pub fn can_merge<P: PageStore>(left: &Node<P>, right: &Node<P>) -> bool {
     left.get_num_bytes() + right.get_num_bytes() - 4 < consts::PAGE_SIZE
-}
-
-/// Sets the page header of a node's page buffer.
-fn set_node_type(page: &mut [u8], node_type: NodeType) {
-    page[0..2].copy_from_slice(&(node_type as u16).to_le_bytes());
-}
-
-fn get_node_type(page: &[u8]) -> Result<NodeType> {
-    NodeType::try_from(u16::from_le_bytes([page[0], page[1]]))
-}
-
-/// Sets the number of keys in a node's page buffer.
-fn set_num_keys(page: &mut [u8], n: usize) {
-    page[2..4].copy_from_slice(&(n as u16).to_le_bytes());
-}
-
-/// Gets the number of keys in a node's page buffer.
-fn get_num_keys(page: &[u8]) -> usize {
-    u16::from_le_bytes([page[2], page[3]]) as usize
 }
