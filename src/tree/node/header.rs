@@ -1,4 +1,4 @@
-use crate::tree::error::NodeError;
+use crate::error::NodeError;
 
 type Result<T> = std::result::Result<T, NodeError>;
 
@@ -20,7 +20,6 @@ impl TryFrom<u16> for NodeType {
         }
     }
 }
-
 
 /// Sets the page header of a node's page buffer.
 pub fn set_node_type(page: &mut [u8], node_type: NodeType) {

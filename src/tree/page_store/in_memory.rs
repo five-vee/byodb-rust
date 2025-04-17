@@ -6,12 +6,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crate::tree::{
-    consts,
-    page_store::{PageStore, PageStoreError, ReadOnlyPage},
-};
+use crate::consts;
+use crate::tree::page_store::{PageError, PageStore, ReadOnlyPage};
 
-type Result<T> = std::result::Result<T, PageStoreError>;
+type Result<T> = std::result::Result<T, PageError>;
 
 /// An in-memory store of pages. Backed by a hash map.
 #[derive(Clone)]
@@ -56,12 +54,12 @@ impl PageStore for InMemory {
     fn read_page(&self, page_num: usize) -> Result<Self::ReadOnlyPage> {
         let guard = self.state.lock().unwrap();
         if guard.new.contains_key(&page_num) {
-            return Err(PageStoreError::Read(
+            return Err(PageError::Read(
                 format!("page {page_num} was not written yet").into(),
             ));
         }
         if guard.written.contains_key(&page_num) {
-            return Err(PageStoreError::Read(
+            return Err(PageError::Read(
                 format!("page {page_num} was not flushed yet").into(),
             ));
         }
@@ -72,7 +70,7 @@ impl PageStore for InMemory {
                 page_num,
             });
         }
-        Err(PageStoreError::NotFound(page_num))
+        Err(PageError::NotFound(page_num))
     }
 
     fn new_page(&self) -> Result<Self::Page> {
@@ -173,13 +171,13 @@ mod tests {
     fn functional_test() {
         let store = InMemory::new();
         assert!(
-            matches!(store.read_page(0), Err(PageStoreError::NotFound(_))),
+            matches!(store.read_page(0), Err(PageError::NotFound(_))),
             "page 0 should not yet exist"
         );
         let mut page = store.new_page().unwrap();
         page[0] = 42;
         assert!(
-            matches!(store.read_page(0), Err(PageStoreError::Read(_))),
+            matches!(store.read_page(0), Err(PageError::Read(_))),
             "page 0 should not be written yet"
         );
         assert_eq!(page[0], 42);
@@ -188,7 +186,7 @@ mod tests {
         assert!(
             matches!(
                 store.read_page(read_only_page.page_num()),
-                Err(PageStoreError::Read(_))
+                Err(PageError::Read(_))
             ),
             "read_only_page hasn't flushed yet"
         );

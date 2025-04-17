@@ -4,7 +4,6 @@ pub(crate) const PAGE_SIZE: usize = 4096;
 pub const MAX_KEY_SIZE: usize = 1000;
 /// The maximum allowed value size in a tree.
 pub const MAX_VALUE_SIZE: usize = 3000;
-pub(crate) const META_SIZE: usize = 64;
 
 const _: () = {
     assert!(PAGE_SIZE <= (1 << 16), "page size is within 16 bits");

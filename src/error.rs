@@ -7,7 +7,7 @@ pub enum TreeError {
     #[error("Node error: {0}")]
     Node(#[from] NodeError),
     #[error("Page store error: {0}")]
-    PageStore(#[from] PageStoreError),
+    Page(#[from] PageError),
     #[error("Key not found")]
     KeyNotFound,
 }
@@ -26,12 +26,12 @@ pub enum NodeError {
     #[error("Key not found")]
     KeyNotFound,
     #[error("Page store error: {0}")]
-    PageStore(#[from] PageStoreError),
+    Page(#[from] PageError),
 }
 
 /// An error type for `mod page_store`.
 #[derive(thiserror::Error, Debug)]
-pub enum PageStoreError {
+pub enum PageError {
     #[error("Page read error: {0}")]
     Read(Rc<str>),
     #[error("Page write error: {0}")]

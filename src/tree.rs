@@ -18,12 +18,10 @@
 //! versioning and auditing, as previous states of the data structure are
 //! implicitly retained.
 
-pub mod consts;
-mod error;
 mod node;
 mod page_store;
 
-pub use error::TreeError;
+pub use crate::error::TreeError;
 use node::{ChildEntry, Internal, Leaf, Node, NodeEffect, Sufficiency};
 use page_store::PageStore;
 use std::rc::Rc;
@@ -397,6 +395,8 @@ impl<P: PageStore> Iterator for InOrder<P> {
 #[cfg(test)]
 mod tests {
     use page_store::InMemory;
+
+    use crate::consts;
 
     use super::*;
 

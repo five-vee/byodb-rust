@@ -1,16 +1,13 @@
 use std::ops::{Deref, DerefMut};
 
-use crate::tree::error::PageStoreError;
+use crate::error::PageError;
 
 mod in_memory;
-mod mmap_file;
-
-pub use mmap_file::{MmapFile, MmapPage, ReadOnlyMmapPage};
 
 #[cfg(test)]
 pub use in_memory::{InMemory, InMemoryPage, ReadOnlyInMemoryPage};
 
-type Result<T> = std::result::Result<T, PageStoreError>;
+type Result<T> = std::result::Result<T, PageError>;
 
 /// A store of pages that backs a COW B+ Tree.
 pub trait PageStore: Clone {

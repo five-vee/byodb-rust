@@ -99,8 +99,8 @@ mod leaf;
 
 use std::rc::Rc;
 
-use crate::tree::consts;
-use crate::tree::error::NodeError;
+use crate::consts;
+use crate::error::NodeError;
 use crate::tree::page_store::PageStore;
 use header::NodeType;
 pub(crate) use internal::ChildEntry;

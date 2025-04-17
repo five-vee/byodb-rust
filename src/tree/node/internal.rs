@@ -1,7 +1,7 @@
 use std::iter::Peekable;
 use std::rc::Rc;
 
-use crate::tree::consts;
+use crate::consts;
 use crate::tree::node::header;
 use crate::tree::node::{NodeType, Result};
 use crate::tree::page_store::{PageStore, ReadOnlyPage};
