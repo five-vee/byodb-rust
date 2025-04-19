@@ -8,7 +8,6 @@ use std::{
     marker::PhantomData,
     ops::{Deref, DerefMut, Range},
     path::Path,
-    rc::Rc,
     sync::{Arc, Mutex, MutexGuard},
 };
 
@@ -21,7 +20,7 @@ use crate::{consts, error::PageError};
 type Result<T> = std::result::Result<T, PageError>;
 
 pub struct Mmap {
-    file: Option<Rc<File>>,
+    file: Option<Arc<File>>,
     mmap: MmapMut,
 }
 
@@ -77,7 +76,7 @@ impl Mmap {
         // Safety: it is assumed that no other process has a mutable mapping to the same file.
         let mmap = unsafe { MmapOptions::new(0)?.with_file(&file, 0).map_mut()? };
         Ok(Mmap {
-            file: Some(Rc::new(file)),
+            file: Some(Arc::new(file)),
             mmap,
         })
     }
