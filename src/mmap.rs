@@ -39,11 +39,15 @@ impl DerefMut for Mmap {
 }
 
 impl Mmap {
-    pub fn new_anonymous(num_pages: usize) -> Result<Self> {
-        let mut mmap =
-            MmapOptions::new(meta_node::META_OFFSET + num_pages * consts::PAGE_SIZE)?.map_mut()?;
-        MetaNode::new().copy_to_slice(mmap.deref_mut(), meta_node::Position::A)?;
-        Ok(Mmap { file: None, mmap })
+    pub fn new_anonymous(num_pages: usize) -> Self {
+        let mut mmap = MmapOptions::new(meta_node::META_OFFSET + num_pages * consts::PAGE_SIZE)
+            .expect("len > 0")
+            .map_mut()
+            .expect("mmap is correctly created");
+        MetaNode::new()
+            .copy_to_slice(mmap.deref_mut(), meta_node::Position::A)
+            .expect("mmap is already large enough to hold 2 meta nodes");
+        Mmap { file: None, mmap }
     }
 
     pub fn open_or_create<P: AsRef<Path>>(path: P) -> Result<Self> {
@@ -78,29 +82,28 @@ impl Mmap {
         })
     }
 
-    fn flush(&self, range: Range<usize>) -> Result<()> {
-        self.mmap.flush(range)?;
-        Ok(())
+    fn flush(&self, range: Range<usize>) {
+        self.mmap.flush(range).expect("mmap can validly msync");
     }
 
-    fn grow(&self, new_len: usize) -> Result<Self> {
-        let mut mmap_opts = MmapOptions::new(new_len)?;
+    fn grow(&self, new_len: usize) -> Self {
+        let mut mmap_opts = MmapOptions::new(new_len).expect("new_len > 0");
         let mmap = match &self.file {
             None => {
-                let mut mmap = mmap_opts.map_mut()?;
+                let mut mmap = mmap_opts.map_mut().expect("mmap is correctly created");
                 mmap[..self.mmap.len()].copy_from_slice(self.mmap.deref());
                 mmap
             }
             Some(f) => {
                 // Safety: it is assumed that no other process has a mutable mapping to the same file.
                 mmap_opts = unsafe { mmap_opts.with_file(f, 0) };
-                mmap_opts.map_mut()?
+                mmap_opts.map_mut().expect("mmap is correctly created")
             }
         };
-        Ok(Mmap {
+        Mmap {
             file: self.file.clone(),
             mmap,
-        })
+        }
     }
 
     fn pages_ptr(&self) -> *mut u8 {
@@ -158,27 +161,26 @@ impl WriterState {
         self.mmap_mut()
     }
 
-    fn flush_pages(&mut self) -> Result<()> {
+    fn flush_pages(&mut self) {
         let m = self.mmap_mut();
-        m.flush(self.flush_offset..self.write_offset)?;
+        m.flush(self.flush_offset..self.write_offset);
         self.flush_offset = self.write_offset;
-        Ok(())
     }
 
     #[allow(clippy::arc_with_non_send_sync)] // We manually ensure thread-safety via Mutex/ArcSwap.
-    fn grow_if_needed(&mut self) -> Result<bool> {
+    fn grow_if_needed(&mut self) -> bool {
         let m = self.mmap();
         if self.new_offset + consts::PAGE_SIZE <= m.len() {
-            return Ok(false);
+            return false;
         }
         let expand = max(self.new_offset + consts::PAGE_SIZE - m.len(), m.len());
         let expand = max(expand, 1 << 26 /* 64MB */);
         let new_len = meta_node::META_OFFSET + m.len() + expand;
-        self.mmap = Arc::new(UnsafeCell::new(m.grow(new_len)?));
-        Ok(true)
+        self.mmap = Arc::new(UnsafeCell::new(m.grow(new_len)));
+        true
     }
 
-    fn flush_new_meta_node(&mut self, new_root_ptr: usize) -> Result<()> {
+    fn flush_new_meta_node(&mut self, new_root_ptr: usize) {
         let m = self.mmap_mut();
         let (
             MetaNode {
@@ -186,7 +188,8 @@ impl WriterState {
                 ..
             },
             prev_pos,
-        ) = MetaNode::read_last_valid_meta_node(m.deref())?;
+        ) = MetaNode::read_last_valid_meta_node(m.deref())
+            .expect("there exists at least 1 valid meta node");
         let mut curr = MetaNode {
             signature: meta_node::DB_SIG,
             root_ptr: new_root_ptr,
@@ -195,8 +198,9 @@ impl WriterState {
             checksum: 0,
         };
         curr.checksum = curr.checksum();
-        curr.copy_to_slice(m.deref_mut(), prev_pos.next())?;
-        m.flush(0..meta_node::META_OFFSET)
+        curr.copy_to_slice(m.deref_mut(), prev_pos.next())
+            .expect("mmap is already large enough to hold 2 meta nodes");
+        m.flush(0..meta_node::META_OFFSET);
     }
 }
 
@@ -232,7 +236,7 @@ impl Store {
             guard: self.reader.load(),
         }
     }
-    
+
     pub fn writer(&self) -> Writer<'_> {
         Writer {
             guard: self.writer.lock().unwrap(),
@@ -276,8 +280,8 @@ pub struct Writer<'s> {
 }
 
 impl<'s> Writer<'s> {
-    pub fn new_page<'w>(&'w mut self) -> Result<Page<'s, 'w>> {
-        self.guard.grow_if_needed()?;
+    pub fn new_page<'w>(&'w mut self) -> Page<'s, 'w> {
+        self.guard.grow_if_needed();
         let m = self.guard.mmap();
         let page = Page {
             _phantom: PhantomData,
@@ -285,7 +289,7 @@ impl<'s> Writer<'s> {
             page_ptr: unsafe { m.pages_ptr().add(self.guard.new_offset * consts::PAGE_SIZE) },
         };
         self.guard.new_offset += consts::PAGE_SIZE;
-        Ok(page)
+        page
     }
 
     pub fn write_page<'w>(&'w mut self, page: Page<'s, 'w>) -> usize {
@@ -293,17 +297,16 @@ impl<'s> Writer<'s> {
         (page.page_ptr as usize - self.guard.mmap().pages_ptr() as usize) / consts::PAGE_SIZE
     }
 
-    pub fn flush(&mut self, new_root_ptr: usize) -> Result<()> {
+    pub fn flush(&mut self, new_root_ptr: usize) {
         if self.guard.write_offset < self.guard.new_offset {
             panic!("there are still new pages not yet written");
         }
-        self.guard.flush_pages()?;
-        self.guard.flush_new_meta_node(new_root_ptr)?;
+        self.guard.flush_pages();
+        self.guard.flush_new_meta_node(new_root_ptr);
         self.store.reader.store(Arc::new(ReaderState {
             mmap: self.guard.mmap.clone(),
             flush_offset: self.guard.flush_offset,
         }));
-        Ok(())
     }
 }
 
