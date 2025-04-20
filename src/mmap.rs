@@ -8,6 +8,7 @@ use std::{
     marker::PhantomData,
     ops::{Deref, DerefMut, Range},
     path::Path,
+    rc::Rc,
     sync::{Arc, Mutex, MutexGuard},
 };
 
@@ -26,7 +27,7 @@ const SYSTEM_PAGE_SIZE: usize = unimplemented!("I don't know yet");
 type Result<T> = std::result::Result<T, PageError>;
 
 pub struct Mmap {
-    file: Option<Arc<RefCell<File>>>,
+    file: Option<Rc<RefCell<File>>>,
     mmap: MmapMut,
 }
 
@@ -84,7 +85,7 @@ impl Mmap {
         // Safety: it is assumed that no other process has a mutable mapping to the same file.
         let mmap = unsafe { MmapOptions::new(file_len)?.with_file(&file, 0).map_mut()? };
         Ok(Mmap {
-            file: Some(Arc::new(RefCell::new(file))),
+            file: Some(Rc::new(RefCell::new(file))),
             mmap,
         })
     }
@@ -417,7 +418,6 @@ impl DerefMut for Page<'_, '_> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
     use tempfile::NamedTempFile;
 
     use crate::consts;
