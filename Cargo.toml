@@ -10,3 +10,6 @@ memoffset = "0.9.1"
 mmap-rs = "0.6.1"
 rand = "0.9.1"
 thiserror = "2.0.12"
+
+[dev-dependencies]
+tempfile = "3.19.1"

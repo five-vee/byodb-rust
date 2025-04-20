@@ -4,7 +4,7 @@ use std::{
     cell::{RefCell, UnsafeCell},
     cmp::max,
     fs::{File, OpenOptions},
-    io::Write as _,
+    io::{Seek, Write as _},
     marker::PhantomData,
     ops::{Deref, DerefMut, Range},
     path::Path,
@@ -17,10 +17,16 @@ use mmap_rs::{MmapMut, MmapOptions};
 use crate::{consts, error::PageError};
 use meta_node::MetaNode;
 
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+const SYSTEM_PAGE_SIZE: usize = 16384;
+
+#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+const SYSTEM_PAGE_SIZE: usize = unimplemented!("I don't know yet");
+
 type Result<T> = std::result::Result<T, PageError>;
 
 pub struct Mmap {
-    file: Option<Arc<File>>,
+    file: Option<Arc<RefCell<File>>>,
     mmap: MmapMut,
 }
 
@@ -56,7 +62,15 @@ impl Mmap {
             .create(true)
             .truncate(false)
             .open(path)?;
-        let file_len = file.metadata()?.len() as usize;
+        let mut file_len = file.metadata()?.len() as usize;
+        if file_len == 0 {
+            let mut meta_prelude = [0u8; meta_node::META_OFFSET];
+            MetaNode::new().copy_to_slice(&mut meta_prelude, meta_node::Position::A)?;
+            file.write_all(&meta_prelude)?;
+            file_len = file.metadata()?.len() as usize;
+            // Don't need to sync until a write happens later.
+        }
+        let file_len = file_len;
         if file_len < meta_node::META_OFFSET {
             return Err(PageError::InvalidFile(
                 "file must be at least 2 meta page sizes".into(),
@@ -67,23 +81,41 @@ impl Mmap {
                 "file size must be 2 meta pages, plus a multiple of page size".into(),
             ));
         }
-        if file_len == 0 {
-            let mut meta_prelude = [0u8; meta_node::META_OFFSET];
-            MetaNode::new().copy_to_slice(&mut meta_prelude, meta_node::Position::A)?;
-            file.write_all(&meta_prelude)?;
-            // Don't need to sync until a write happens later.
-        }
         // Safety: it is assumed that no other process has a mutable mapping to the same file.
-        let mmap = unsafe { MmapOptions::new(0)?.with_file(&file, 0).map_mut()? };
+        let mmap = unsafe { MmapOptions::new(file_len)?.with_file(&file, 0).map_mut()? };
         Ok(Mmap {
-            file: Some(Arc::new(file)),
+            file: Some(Arc::new(RefCell::new(file))),
             mmap,
         })
     }
 
     fn flush(&self, range: Range<usize>) {
         if self.file.is_some() {
-            self.mmap.flush(range).expect("mmap can validly msync");
+            if range.is_empty() {
+                return; // Nothing to flush
+            }
+
+            // Calculate aligned start (floor to page boundary)
+            let aligned_start = range.start - (range.start % SYSTEM_PAGE_SIZE);
+
+            // Calculate aligned end (ceiling to page boundary)
+            let aligned_end = range.end.div_ceil(SYSTEM_PAGE_SIZE) * SYSTEM_PAGE_SIZE;
+
+            // Ensure aligned_end does not exceed the mmap bounds
+            let mmap_len = self.mmap.len();
+            let aligned_end = std::cmp::min(aligned_end, mmap_len);
+
+            // Ensure aligned_start is not past aligned_end after adjustments
+            if aligned_start >= aligned_end {
+                panic!("The adjusted range is empty or invalid");
+            }
+
+            let aligned_range = aligned_start..aligned_end;
+
+            // Flush the aligned range
+            self.mmap
+                .flush(aligned_range)
+                .expect("mmap can validly msync with aligned range");
         }
     }
 
@@ -96,8 +128,14 @@ impl Mmap {
                 mmap
             }
             Some(f) => {
+                f.borrow_mut()
+                    .seek(std::io::SeekFrom::End(0))
+                    .expect("seeking to the end of file is valid");
+                f.borrow_mut()
+                    .write_all(vec![0u8; new_len - self.mmap.len()].as_ref())
+                    .expect("writing to the end of file is valid");
                 // Safety: it is assumed that no other process has a mutable mapping to the same file.
-                mmap_opts = unsafe { mmap_opts.with_file(f, 0) };
+                mmap_opts = unsafe { mmap_opts.with_file(&*f.as_ptr(), 0) };
                 mmap_opts.map_mut().expect("mmap is correctly created")
             }
         };
@@ -379,14 +417,22 @@ impl DerefMut for Page<'_, '_> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::path::Path;
+    use tempfile::NamedTempFile;
+
     use crate::consts;
 
-    #[test]
-    fn test_store_can_read_after_flush() {
-        let mmap = Mmap::new_anonymous(1);
-        let store = Store::new(mmap).expect("Failed to create store");
+    use super::*;
 
+    fn new_file_mmap() -> (Store, NamedTempFile) {
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path();
+        let mmap = Mmap::open_or_create(path).unwrap();
+        let store = Store::new(mmap).unwrap();
+        (store, temp_file)
+    }
+
+    fn run_test_store_can_read_after_flush(store: Store) {
         let writer = store.writer();
         let mut page = writer.new_page();
         assert_eq!(page.len(), consts::PAGE_SIZE);
@@ -418,10 +464,18 @@ mod tests {
     }
 
     #[test]
-    fn test_store_cannot_read_before_flush() {
-        let mmap = Mmap::new_anonymous(1);
-        let store = Store::new(mmap).expect("Failed to create store");
+    fn test_anonymous_store_can_read_after_flush() {
+        let store = Store::new(Mmap::new_anonymous(1)).unwrap();
+        run_test_store_can_read_after_flush(store);
+    }
 
+    #[test]
+    fn test_file_store_can_read_after_flush() {
+        let (store, _temp_file) = new_file_mmap();
+        run_test_store_can_read_after_flush(store);
+    }
+
+    fn run_test_store_cannot_read_before_flush(store: Store) {
         let writer = store.writer();
         let page = writer.new_page();
         let page_num = writer.write_page(page);
@@ -451,10 +505,18 @@ mod tests {
     }
 
     #[test]
-    fn test_store_flush_increases_sequence() {
-        let mmap = Mmap::new_anonymous(0);
-        let store = Store::new(mmap).expect("Failed to create store");
+    fn test_anonymous_store_cannot_read_before_flush() {
+        let store = Store::new(Mmap::new_anonymous(1)).unwrap();
+        run_test_store_cannot_read_before_flush(store);
+    }
 
+    #[test]
+    fn test_file_store_cannot_read_before_flush() {
+        let (store, _temp_file) = new_file_mmap();
+        run_test_store_cannot_read_before_flush(store);
+    }
+
+    fn run_test_store_flush_increases_sequence(store: Store) {
         let dummy_root_ptr = 0;
         let seq0 = store.reader().sequence();
         let mut prev_reader_seq = seq0;
@@ -486,9 +548,18 @@ mod tests {
     }
 
     #[test]
-    fn test_store_new_page_address_always_increases() {
-        let mmap = Mmap::new_anonymous(0);
-        let store = Store::new(mmap).expect("Failed to create store");
+    fn test_anonymous_store_flush_increases_sequence() {
+        let store = Store::new(Mmap::new_anonymous(0)).unwrap();
+        run_test_store_flush_increases_sequence(store);
+    }
+
+    #[test]
+    fn test_file_store_flush_increases_sequence() {
+        let (store, _temp_file) = new_file_mmap();
+        run_test_store_flush_increases_sequence(store);
+    }
+
+    fn run_test_store_new_page_address_always_increases(store: Store) {
         let writer = store.writer();
         let mut last_page_ptr = usize::MAX;
         let mut last_page_num = usize::MAX;
@@ -528,5 +599,17 @@ mod tests {
             last_page_ptr = current_page_ptr;
             last_page_num = current_page_num;
         }
+    }
+
+    #[test]
+    fn test_anonymous_store_new_page_address_always_increases() {
+        let store = Store::new(Mmap::new_anonymous(0)).unwrap();
+        run_test_store_new_page_address_always_increases(store);
+    }
+
+    #[test]
+    fn test_file_store_new_page_address_always_increases() {
+        let (store, _temp_file) = new_file_mmap();
+        run_test_store_new_page_address_always_increases(store);
     }
 }
