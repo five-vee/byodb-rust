@@ -100,19 +100,13 @@ impl MetaNode {
         Ok((node, pos))
     }
 
-    pub fn copy_to_slice(&self, slice: &mut [u8], pos: Position) -> Result<()> {
-        if slice.len() < META_OFFSET {
-            return Err(PageError::InvalidFile(
-                "file isn't large enough to contain 2 meta nodes".into(),
-            ));
-        }
+    pub fn copy_to_slice(&self, slice: &mut [u8], pos: Position) {
         let offset: usize = match pos {
             Position::A => 0,
             Position::B => META_PAGE_SIZE,
         };
         let page: [u8; META_PAGE_SIZE] = self.into();
         slice[offset..offset + META_PAGE_SIZE].copy_from_slice(&page);
-        Ok(())
     }
 }
 

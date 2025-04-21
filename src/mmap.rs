@@ -50,9 +50,7 @@ impl Mmap {
             .expect("len > 0")
             .map_mut()
             .expect("mmap is correctly created");
-        MetaNode::new()
-            .copy_to_slice(mmap.deref_mut(), meta_node::Position::A)
-            .expect("mmap is already large enough to hold 2 meta nodes");
+        MetaNode::new().copy_to_slice(mmap.deref_mut(), meta_node::Position::A);
         Mmap { file: None, mmap }
     }
 
@@ -66,7 +64,7 @@ impl Mmap {
         let mut file_len = file.metadata()?.len() as usize;
         if file_len == 0 {
             let mut meta_prelude = [0u8; meta_node::META_OFFSET];
-            MetaNode::new().copy_to_slice(&mut meta_prelude, meta_node::Position::A)?;
+            MetaNode::new().copy_to_slice(&mut meta_prelude, meta_node::Position::A);
             file.write_all(&meta_prelude)?;
             file_len = file.metadata()?.len() as usize;
             // Don't need to sync until a write happens later.
@@ -243,8 +241,7 @@ impl WriterState {
             checksum: 0,
         };
         curr.checksum = curr.checksum();
-        curr.copy_to_slice(m.deref_mut(), prev_pos.next())
-            .expect("mmap is already large enough to hold 2 meta nodes");
+        curr.copy_to_slice(m.deref_mut(), prev_pos.next());
         m.flush(0..meta_node::META_OFFSET);
     }
 }
@@ -611,5 +608,61 @@ mod tests {
     fn test_file_store_new_page_address_always_increases() {
         let (store, _temp_file) = new_file_mmap();
         run_test_store_new_page_address_always_increases(store);
+    }
+
+    // Test if the following compiles: concurrent readers and writers.
+    fn run_test_store_reader_writer_isolation(store: Store) {
+        use std::thread;
+
+        let mut threads = vec![];
+
+        // Write a page and flush it. Drop the writer.
+        let page_num = {
+            let writer = store.writer();
+            let mut page = writer.new_page();
+            page[0] = 1;
+            let page_num = writer.write_page(page);
+            writer.flush(page_num);
+            page_num
+        };
+
+        // Get another writer via Store::writer() and write + flush another page.
+        // Do NOT drop the writer.
+        let writer = store.writer();
+        let mut page = writer.new_page();
+        page[0] = 2;
+        writer.flush(writer.write_page(page));
+
+        // Save a handle on that page via Store::reader() and Reader::read_page().
+        threads.push(thread::spawn({
+            let reader = store.reader();
+            move || {
+                let page = reader.read_page(page_num).unwrap();
+                assert_eq!(page[0], 1);
+            }
+        }));
+        threads.push(thread::spawn({
+            let reader = store.reader();
+            move || {
+                let page = reader.read_page(page_num).unwrap();
+                assert_eq!(page[0], 1);
+            }
+        }));
+
+        for t in threads {
+            let _ = t.join();
+        }
+    }
+
+    #[test]
+    fn test_anonymous_store_reader_writer_isolation() {
+        let store = Store::new(Mmap::new_anonymous(0)).unwrap();
+        run_test_store_reader_writer_isolation(store);
+    }
+
+    #[test]
+    fn test_file_store_reader_writer_isolation() {
+        let (store, _temp_file) = new_file_mmap();
+        run_test_store_reader_writer_isolation(store);
     }
 }
