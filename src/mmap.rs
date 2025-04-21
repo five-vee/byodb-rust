@@ -247,8 +247,8 @@ impl WriterState {
 }
 
 pub struct Store {
-    reader: Arc<ArcSwap<ReaderState>>,
-    writer: Arc<Mutex<WriterState>>,
+    reader: ArcSwap<ReaderState>,
+    writer: Mutex<WriterState>,
 }
 
 impl Store {
@@ -260,16 +260,16 @@ impl Store {
         #[allow(clippy::arc_with_non_send_sync)]
         let mmap = Arc::new(UnsafeCell::new(mmap));
         Ok(Store {
-            reader: Arc::new(ArcSwap::from_pointee(ReaderState {
+            reader: ArcSwap::from_pointee(ReaderState {
                 mmap: mmap.clone(),
                 flush_offset: offset,
-            })),
-            writer: Arc::new(Mutex::new(WriterState {
+            }),
+            writer: Mutex::new(WriterState {
                 mmap: mmap.clone(),
                 flush_offset: offset,
                 write_offset: offset,
                 new_offset: offset,
-            })),
+            }),
         })
     }
 
@@ -312,6 +312,7 @@ impl Reader {
                     .pages_ptr()
                     .add(page_num * consts::PAGE_SIZE)
             },
+            page_num,
         })
     }
 
@@ -342,10 +343,15 @@ impl<'s> Writer<'s> {
         page
     }
 
-    pub fn write_page<'w>(&'w self, page: Page<'s, 'w>) -> usize {
+    pub fn write_page<'w>(&'w self, page: Page<'s, 'w>) -> ReadOnlyPage<'w> {
         let mut guard = self.guard.borrow_mut();
         guard.write_offset += consts::PAGE_SIZE;
-        (page.page_ptr as usize - guard.mmap().pages_ptr() as usize) / consts::PAGE_SIZE
+        ReadOnlyPage {
+            _phantom: PhantomData,
+            page_ptr: page.page_ptr,
+            page_num: (page.page_ptr as usize - guard.mmap().pages_ptr() as usize)
+                / consts::PAGE_SIZE,
+        }
     }
 
     pub fn flush(&self, new_root_ptr: usize) {
@@ -369,9 +375,10 @@ impl<'s> Writer<'s> {
     }
 }
 
-pub struct ReadOnlyPage<'r> {
-    _phantom: PhantomData<&'r Reader>,
+pub struct ReadOnlyPage<'rw> {
+    _phantom: PhantomData<&'rw ()>,
     page_ptr: *const u8,
+    pub page_num: usize,
 }
 
 impl Deref for ReadOnlyPage<'_> {
@@ -439,8 +446,10 @@ mod tests {
         let pattern = [0xAA, 0xBB, 0xCC];
         page[edit_offset..edit_offset + pattern.len()].copy_from_slice(&pattern);
 
-        let page_num = writer.write_page(page);
+        let page = writer.write_page(page);
+        let page_num = page.page_num;
         writer.flush(page_num);
+        drop(page);
         drop(writer);
 
         let reader = store.reader();
@@ -475,7 +484,7 @@ mod tests {
     fn run_test_store_cannot_read_before_flush(store: Store) {
         let writer = store.writer();
         let page = writer.new_page();
-        let page_num = writer.write_page(page);
+        let page_num = writer.write_page(page).page_num;
         // DON'T flush. Drop the writer instead.
         drop(writer);
 
@@ -517,8 +526,8 @@ mod tests {
         let dummy_root_ptr = 0;
         let seq0 = store.reader().sequence();
         let mut prev_reader_seq = seq0;
-        let writer = store.writer();
         for i in 1..=2 {
+            let writer = store.writer();
             let writer_seq = writer.sequence();
             assert_eq!(
                 writer_seq, prev_reader_seq,
@@ -557,11 +566,11 @@ mod tests {
     }
 
     fn run_test_store_new_page_address_always_increases(store: Store) {
-        let writer = store.writer();
         let mut last_page_ptr = usize::MAX;
         let mut last_page_num = usize::MAX;
 
         for i in 0..2 {
+            let writer = store.writer();
             let pages_ptr = writer.guard.borrow().mmap().pages_ptr() as usize;
 
             let page = writer.new_page();
@@ -575,7 +584,7 @@ mod tests {
                 );
             }
 
-            let current_page_num = writer.write_page(page);
+            let current_page_num = writer.write_page(page).page_num;
             if i > 0 {
                 assert_eq!(
                     current_page_num,
@@ -621,7 +630,7 @@ mod tests {
             let writer = store.writer();
             let mut page = writer.new_page();
             page[0] = 1;
-            let page_num = writer.write_page(page);
+            let page_num = writer.write_page(page).page_num;
             writer.flush(page_num);
             page_num
         };
@@ -631,7 +640,7 @@ mod tests {
         let writer = store.writer();
         let mut page = writer.new_page();
         page[0] = 2;
-        writer.flush(writer.write_page(page));
+        writer.flush(writer.write_page(page).page_num);
 
         // Save a handle on that page via Store::reader() and Reader::read_page().
         threads.push(thread::spawn({

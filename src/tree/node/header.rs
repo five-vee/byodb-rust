@@ -4,7 +4,7 @@ type Result<T> = std::result::Result<T, NodeError>;
 
 /// An enum representing a page's node type.
 #[repr(u16)]
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum NodeType {
     Leaf = 0b01u16,
     Internal = 0b10u16,
