@@ -49,9 +49,9 @@ impl<'a> Leaf<'a> {
         let itr_func = || self.insert_iter(key, val);
         let num_keys = self.get_num_keys() + 1;
         if self.get_num_bytes() + 6 + key.len() + val.len() > consts::PAGE_SIZE {
-            return build_split(writer, &itr_func, num_keys);
+            return Ok(build_split(writer, &itr_func, num_keys));
         }
-        build(writer, itr_func(), num_keys)
+        Ok(build(writer, itr_func(), num_keys))
     }
 
     /// Updates the value corresponding to a key.
@@ -70,9 +70,9 @@ impl<'a> Leaf<'a> {
         let itr_func = || self.update_iter(key, val);
         let num_keys = self.get_num_keys();
         if self.get_num_bytes() - old_val.len() + val.len() > consts::PAGE_SIZE {
-            return build_split(writer, &itr_func, num_keys);
+            return Ok(build_split(writer, &itr_func, num_keys));
         }
-        build(writer, itr_func(), num_keys)
+        Ok(build(writer, itr_func(), num_keys))
     }
 
     /// Deletes a key and its corresponding value.
@@ -98,7 +98,7 @@ impl<'a> Leaf<'a> {
             }
             b = b.add_key_value(k, v);
         }
-        Ok(LeafEffect::Intact(b.build()?))
+        Ok(LeafEffect::Intact(b.build()))
     }
 
     /// Finds the value corresponding to the queried key.
@@ -108,9 +108,9 @@ impl<'a> Leaf<'a> {
 
     /// Creates the leaf (or leaves) resulting from either left stealing from
     /// right, or left merging with right.
-    pub fn steal_or_merge<'l, 'r, 'w>(
-        left: &'l Leaf<'r>,
-        right: &'l Leaf<'r>,
+    pub fn steal_or_merge<'l, 'w>(
+        left: &'l Leaf<'a>,
+        right: &'l Leaf<'a>,
         writer: &'w Writer,
     ) -> Result<LeafEffect<'w>> {
         let itr_func = || left.iter().chain(right.iter());
@@ -118,10 +118,10 @@ impl<'a> Leaf<'a> {
         let overflow = left.get_num_bytes() + right.get_num_bytes() - 4 > consts::PAGE_SIZE;
         if overflow {
             // Steal
-            return build_split(writer, &itr_func, num_keys);
+            return Ok(build_split(writer, &itr_func, num_keys));
         }
         // Merge
-        build(writer, itr_func(), num_keys)
+        Ok(build(writer, itr_func(), num_keys))
     }
 
     /// Gets the `i`th key.
@@ -179,9 +179,9 @@ impl<'a> Leaf<'a> {
     }
 }
 
-impl<'rw> TryFrom<ReadOnlyPage<'rw>> for Leaf<'rw> {
+impl<'a> TryFrom<ReadOnlyPage<'a>> for Leaf<'a> {
     type Error = NodeError;
-    fn try_from(page: ReadOnlyPage<'rw>) -> Result<Self> {
+    fn try_from(page: ReadOnlyPage<'a>) -> Result<Self> {
         let node_type = header::get_node_type(page.deref())?;
         if node_type != NodeType::Leaf {
             return Err(NodeError::UnexpectedNodeType(node_type as u16));
@@ -267,7 +267,7 @@ impl<'s, 'w> Builder<'s, 'w> {
     }
 
     /// Builds a leaf.
-    fn build(self) -> Result<Leaf<'w>> {
+    fn build(self) -> Leaf<'w> {
         let n = header::get_num_keys(&self.page);
         assert!(
             self.i == n,
@@ -277,7 +277,163 @@ impl<'s, 'w> Builder<'s, 'w> {
         );
         assert_ne!(n, 0, "This case should be handled by Leaf::delete instead.");
         let page = self.writer.write_page(self.page);
-        page.try_into()
+        page.try_into().unwrap()
+    }
+}
+
+/// Finds the split point of an overflow leaf node that is accessed via
+/// an iterator of key-value pairs.
+fn find_split<'l, I>(itr: I, num_keys: usize) -> usize
+where
+    I: Iterator<Item = (&'l [u8], &'l [u8])>,
+{
+    assert!(num_keys >= 2);
+
+    // Try to split such that both splits are sufficient
+    // (i.e. have at least 2 keys).
+    if num_keys < 4 {
+        // Relax the sufficiency requirement if impossible to meet.
+        return itr
+            .scan(4usize, |size, (k, v)| {
+                *size += 6 + k.len() + v.len();
+                if *size > consts::PAGE_SIZE {
+                    return None;
+                }
+                Some(())
+            })
+            .count();
+    }
+    itr.enumerate()
+        .scan(4usize, |size, (i, (k, v))| {
+            *size += 6 + k.len() + v.len();
+            if i < 2 {
+                return Some(());
+            }
+            if *size > consts::PAGE_SIZE || i >= num_keys - 2 {
+                return None;
+            }
+            Some(())
+        })
+        .count()
+}
+
+/// Builds a new leaf from the provided iterator of key-value pairs.
+fn build<'l, 's, 'w, I>(writer: &'w Writer<'s>, itr: I, num_keys: usize) -> LeafEffect<'w>
+where
+    I: Iterator<Item = (&'l [u8], &'l [u8])>,
+{
+    let mut b = Builder::new(writer, num_keys);
+    for (k, v) in itr {
+        b = b.add_key_value(k, v);
+    }
+    LeafEffect::Intact(b.build())
+}
+
+/// Builds two leaves by finding the split point from the provided iterator of
+/// key-value pairs.
+fn build_split<'l, 's, 'w, I, F>(
+    writer: &'w Writer<'s>,
+    itr_func: &'l F,
+    num_keys: usize,
+) -> LeafEffect<'w>
+where
+    I: Iterator<Item = (&'l [u8], &'l [u8])>,
+    F: Fn() -> I,
+{
+    let split_at = find_split(itr_func(), num_keys);
+    let itr = itr_func();
+    let (mut lb, mut rb) = (
+        Builder::new(writer, split_at),
+        Builder::new(writer, num_keys - split_at),
+    );
+    for (i, (k, v)) in itr.enumerate() {
+        if i < split_at {
+            lb = lb.add_key_value(k, v);
+        } else {
+            rb = rb.add_key_value(k, v);
+        }
+    }
+    let (left, right) = (lb.build(), rb.build());
+    LeafEffect::Split { left, right }
+}
+
+/// A key-value iterator for a leaf node.
+pub struct LeafIterator<'l, 'a> {
+    node: &'l Leaf<'a>,
+    i: usize,
+    n: usize,
+}
+
+impl<'l> Iterator for LeafIterator<'l, '_> {
+    type Item = (&'l [u8], &'l [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.i >= self.n {
+            return None;
+        }
+        let item = Some((self.node.get_key(self.i), self.node.get_value(self.i)));
+        self.i += 1;
+        item
+    }
+}
+
+/// A key-value iterator for a leaf node that has inserted a new key-value.
+struct InsertIterator<'l, 'a> {
+    leaf_itr: Peekable<LeafIterator<'l, 'a>>,
+    key: &'l [u8],
+    val: &'l [u8],
+    added: bool,
+}
+
+impl<'l> Iterator for InsertIterator<'l, '_> {
+    type Item = (&'l [u8], &'l [u8]);
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.added {
+            return self.leaf_itr.next();
+        }
+        match self.leaf_itr.peek() {
+            None => {
+                self.added = true;
+                Some((self.key, self.val))
+            }
+            Some(&(leaf_key, _)) => {
+                if self.key < leaf_key {
+                    self.added = true;
+                    Some((self.key, self.val))
+                } else {
+                    self.leaf_itr.next()
+                }
+            }
+        }
+    }
+}
+
+/// A key-value iterator for a leaf node that has updated a key-value.
+struct UpdateIterator<'l, 'a> {
+    leaf_itr: Peekable<LeafIterator<'l, 'a>>,
+    key: &'l [u8],
+    val: &'l [u8],
+    skip: bool,
+}
+
+impl<'l> Iterator for UpdateIterator<'l, '_> {
+    type Item = (&'l [u8], &'l [u8]);
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.leaf_itr.peek() {
+            None => None,
+            Some(&(leaf_key, _)) => {
+                if self.skip {
+                    self.skip = false;
+                    self.leaf_itr.next();
+                    return self.leaf_itr.next();
+                }
+                if self.key == leaf_key {
+                    self.skip = true;
+                    return Some((self.key, self.val));
+                }
+                self.leaf_itr.next()
+            }
+        }
     }
 }
 
@@ -330,162 +486,6 @@ fn set_next_offset(page: &mut [u8], i: usize, key: &[u8], val: &[u8]) -> usize {
     let next_i = i + 1;
     page[4 + 2 * (next_i - 1)..4 + 2 * next_i].copy_from_slice(&(next_offset as u16).to_le_bytes());
     curr_offset
-}
-
-/// Finds the split point of an overflow leaf node that is accessed via
-/// an iterator of key-value pairs.
-fn find_split<'l, I>(itr: I, num_keys: usize) -> usize
-where
-    I: Iterator<Item = (&'l [u8], &'l [u8])>,
-{
-    assert!(num_keys >= 2);
-
-    // Try to split such that both splits are sufficient
-    // (i.e. have at least 2 keys).
-    if num_keys < 4 {
-        // Relax the sufficiency requirement if impossible to meet.
-        return itr
-            .scan(4usize, |size, (k, v)| {
-                *size += 6 + k.len() + v.len();
-                if *size > consts::PAGE_SIZE {
-                    return None;
-                }
-                Some(())
-            })
-            .count();
-    }
-    itr.enumerate()
-        .scan(4usize, |size, (i, (k, v))| {
-            *size += 6 + k.len() + v.len();
-            if i < 2 {
-                return Some(());
-            }
-            if *size > consts::PAGE_SIZE || i >= num_keys - 2 {
-                return None;
-            }
-            Some(())
-        })
-        .count()
-}
-
-/// Builds a new leaf from the provided iterator of key-value pairs.
-fn build<'l, 's, 'w, I>(writer: &'w Writer<'s>, itr: I, num_keys: usize) -> Result<LeafEffect<'w>>
-where
-    I: Iterator<Item = (&'l [u8], &'l [u8])>,
-{
-    let mut b = Builder::new(writer, num_keys);
-    for (k, v) in itr {
-        b = b.add_key_value(k, v);
-    }
-    Ok(LeafEffect::Intact(b.build()?))
-}
-
-/// Builds two leaves by finding the split point from the provided iterator of
-/// key-value pairs.
-fn build_split<'l, 's, 'w, I, F>(
-    writer: &'w Writer<'s>,
-    itr_func: &'l F,
-    num_keys: usize,
-) -> Result<LeafEffect<'w>>
-where
-    I: Iterator<Item = (&'l [u8], &'l [u8])>,
-    F: Fn() -> I,
-{
-    let split_at = find_split(itr_func(), num_keys);
-    let itr = itr_func();
-    let (mut lb, mut rb) = (
-        Builder::new(writer, split_at),
-        Builder::new(writer, num_keys - split_at),
-    );
-    for (i, (k, v)) in itr.enumerate() {
-        if i < split_at {
-            lb = lb.add_key_value(k, v);
-        } else {
-            rb = rb.add_key_value(k, v);
-        }
-    }
-    let (left, right) = (lb.build()?, rb.build()?);
-    Ok(LeafEffect::Split { left, right })
-}
-
-/// A key-value iterator for a leaf node.
-pub struct LeafIterator<'l, 'r> {
-    node: &'l Leaf<'r>,
-    i: usize,
-    n: usize,
-}
-
-impl<'l> Iterator for LeafIterator<'l, '_> {
-    type Item = (&'l [u8], &'l [u8]);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.i >= self.n {
-            return None;
-        }
-        let item = Some((self.node.get_key(self.i), self.node.get_value(self.i)));
-        self.i += 1;
-        item
-    }
-}
-
-/// A key-value iterator for a leaf node that has inserted a new key-value.
-struct InsertIterator<'l, 'r> {
-    leaf_itr: Peekable<LeafIterator<'l, 'r>>,
-    key: &'l [u8],
-    val: &'l [u8],
-    added: bool,
-}
-
-impl<'l> Iterator for InsertIterator<'l, '_> {
-    type Item = (&'l [u8], &'l [u8]);
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.added {
-            return self.leaf_itr.next();
-        }
-        match self.leaf_itr.peek() {
-            None => {
-                self.added = true;
-                Some((self.key, self.val))
-            }
-            Some(&(leaf_key, _)) => {
-                if self.key < leaf_key {
-                    self.added = true;
-                    Some((self.key, self.val))
-                } else {
-                    self.leaf_itr.next()
-                }
-            }
-        }
-    }
-}
-
-/// A key-value iterator for a leaf node that has updated a key-value.
-struct UpdateIterator<'l, 'r> {
-    leaf_itr: Peekable<LeafIterator<'l, 'r>>,
-    key: &'l [u8],
-    val: &'l [u8],
-    skip: bool,
-}
-
-impl<'l> Iterator for UpdateIterator<'l, '_> {
-    type Item = (&'l [u8], &'l [u8]);
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.leaf_itr.peek() {
-            None => None,
-            Some(&(leaf_key, _)) => {
-                if self.skip {
-                    self.skip = false;
-                    self.leaf_itr.next();
-                    return self.leaf_itr.next();
-                }
-                if self.key == leaf_key {
-                    self.skip = true;
-                    return Some((self.key, self.val));
-                }
-                self.leaf_itr.next()
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -581,8 +581,7 @@ mod tests {
 
         let leaf = Builder::new(&writer, 1)
             .add_key_value("key".as_bytes(), "val".as_bytes())
-            .build()
-            .unwrap();
+            .build();
         assert!(matches!(leaf.find("key".as_bytes()), Some(v) if v == "val".as_bytes()));
     }
 
@@ -603,8 +602,7 @@ mod tests {
         let leaf = Builder::new(&writer, 2)
             .add_key_value("key1".as_bytes(), "val1".as_bytes())
             .add_key_value("key2".as_bytes(), "val2".as_bytes())
-            .build()
-            .unwrap();
+            .build();
         let got = leaf.iter().collect::<Vec<_>>();
         assert_eq!(
             got,
@@ -632,8 +630,7 @@ mod tests {
         let leaf = Builder::new(&writer, 2)
             .add_key_value("key1".as_bytes(), "val1".as_bytes())
             .add_key_value("key2".as_bytes(), "val2".as_bytes())
-            .build()
-            .unwrap();
+            .build();
 
         let leaf = leaf
             .update(&writer, "key1".as_bytes(), "val1_new".as_bytes())
@@ -658,8 +655,7 @@ mod tests {
         let leaf = Builder::new(&writer, 2)
             .add_key_value(&[0u8; consts::MAX_KEY_SIZE], &[0u8; consts::MAX_VALUE_SIZE])
             .add_key_value("1".as_bytes(), "1".as_bytes())
-            .build()
-            .unwrap();
+            .build();
 
         // Update with a huge value to trigger splitting.
         let (left, right) = leaf
@@ -699,8 +695,7 @@ mod tests {
 
         let leaf = Builder::new(&writer, 1)
             .add_key_value("key".as_bytes(), "val".as_bytes())
-            .build()
-            .unwrap();
+            .build();
 
         let val = &[0u8; consts::MAX_VALUE_SIZE + 1];
         let result = leaf.update(&writer, "key".as_bytes(), val);
@@ -731,8 +726,7 @@ mod tests {
         let leaf = Builder::new(&writer, 2)
             .add_key_value("key1".as_bytes(), "val1".as_bytes())
             .add_key_value("key2".as_bytes(), "val2".as_bytes())
-            .build()
-            .unwrap();
+            .build();
 
         let leaf = leaf
             .delete(&writer, "key1".as_bytes())
@@ -753,8 +747,7 @@ mod tests {
 
         let leaf = Builder::new(&writer, 1)
             .add_key_value("key".as_bytes(), "val".as_bytes())
-            .build()
-            .unwrap();
+            .build();
 
         let effect = leaf.delete(&writer, "key".as_bytes()).unwrap();
         assert!(matches!(effect, LeafEffect::Empty));
@@ -779,15 +772,13 @@ mod tests {
 
         let left = Builder::new(&writer, 1)
             .add_key_value(&[1; consts::MAX_KEY_SIZE], &[1; consts::MAX_VALUE_SIZE])
-            .build()
-            .unwrap();
+            .build();
 
         let right = Builder::new(&writer, 3)
             .add_key_value(&[2], &[2])
             .add_key_value(&[3], &[3])
             .add_key_value(&[4; consts::MAX_KEY_SIZE], &[4; consts::MAX_VALUE_SIZE])
-            .build()
-            .unwrap();
+            .build();
 
         let (left, right) = Leaf::steal_or_merge(&left, &right, &writer)
             .unwrap()
@@ -817,14 +808,12 @@ mod tests {
 
         let left = Builder::new(&writer, 1)
             .add_key_value(&[1], &[1])
-            .build()
-            .unwrap();
+            .build();
 
         let right = Builder::new(&writer, 2)
             .add_key_value(&[2], &[2])
             .add_key_value(&[3], &[3])
-            .build()
-            .unwrap();
+            .build();
 
         let merged = Leaf::steal_or_merge(&left, &right, &writer)
             .unwrap()

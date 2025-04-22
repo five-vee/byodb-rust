@@ -339,7 +339,7 @@ impl<P: PageStore> Internal<P> {
     }
 }
 
-/// A key-value iterator of an internal node.
+/// A child-entry iterator of an internal node.
 pub struct InternalIterator<'a, P: PageStore> {
     node: &'a Internal<P>,
     i: usize,
