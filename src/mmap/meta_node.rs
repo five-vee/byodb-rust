@@ -53,6 +53,7 @@ impl MetaNode {
     pub fn new() -> Self {
         let mut node = Self::default();
         node.signature = DB_SIG;
+        node.num_pages = 1;
         node.checksum = node.checksum();
         node
     }
@@ -73,15 +74,13 @@ impl MetaNode {
         self.signature == DB_SIG && self.checksum == self.checksum()
     }
 
-    pub fn read_last_valid_meta_node(slice: &[u8]) -> Result<(Self, Position)> {
-        if slice.len() < META_OFFSET {
-            return Err(PageError::EmptyFile);
-        }
-        let node_a: MetaNode = slice[..META_PAGE_SIZE].try_into()?;
-        let node_b: MetaNode = slice[META_PAGE_SIZE..META_OFFSET].try_into()?;
+    pub fn read_last_valid_meta_node(slice: &[u8]) -> (Self, Position) {
+        assert!(slice.len() >= META_OFFSET, "no valid meta node found");
+        let node_a: MetaNode = slice[..META_PAGE_SIZE].try_into().unwrap();
+        let node_b: MetaNode = slice[META_PAGE_SIZE..META_OFFSET].try_into().unwrap();
         let (node, pos) = match (node_a, node_b) {
             (a, b) if !a.valid() && !b.valid() => {
-                return Err(PageError::InvalidFile("no valid meta node found".into()))
+                panic!("no valid meta node found")
             }
             (a, b) if a.valid() && !b.valid() => (a, Position::A),
             (a, b) if !a.valid() && b.valid() => (b, Position::B),
@@ -95,7 +94,7 @@ impl MetaNode {
                 }
             }
         };
-        Ok((node, pos))
+        (node, pos)
     }
 
     pub fn copy_to_slice(&self, slice: &mut [u8], pos: Position) {
@@ -160,7 +159,6 @@ impl<'a> From<&'a MetaNode> for [u8; META_PAGE_SIZE] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::PageError;
     use std::convert::TryInto;
 
     #[test]
@@ -188,7 +186,7 @@ mod tests {
         // Check default values and signature
         assert_eq!(node.signature, DB_SIG);
         assert_eq!(node.root_ptr, 0);
-        assert_eq!(node.num_pages, 0);
+        assert_eq!(node.num_pages, 1);
         assert_eq!(node.sequence, 0);
         // Checksum should be calculated correctly, making the node valid
         assert!(node.valid());
@@ -236,13 +234,14 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
     fn test_read_last_valid_meta_node_too_small() {
         let buffer = [0u8; META_OFFSET - 1];
-        let result = MetaNode::read_last_valid_meta_node(&buffer);
-        assert!(matches!(result, Err(PageError::EmptyFile)));
+        let _ = MetaNode::read_last_valid_meta_node(&buffer);
     }
 
     #[test]
+    #[should_panic]
     fn test_read_last_valid_meta_node_none_valid() {
         let mut buffer = [0u8; META_OFFSET];
         let invalid_node_a = create_invalid_node(1);
@@ -251,12 +250,7 @@ mod tests {
         buffer[META_PAGE_SIZE..META_OFFSET]
             .copy_from_slice(&<[u8; META_PAGE_SIZE]>::from(&invalid_node_b));
 
-        let result = MetaNode::read_last_valid_meta_node(&buffer);
-        assert!(result.is_err());
-        assert!(
-            matches!(result, Err(PageError::InvalidFile(_))),
-            "result: {result:?}"
-        );
+        let _ = MetaNode::read_last_valid_meta_node(&buffer);
     }
 
     #[test]
@@ -269,8 +263,7 @@ mod tests {
             .copy_from_slice(&<[u8; META_PAGE_SIZE]>::from(&invalid_node_b));
 
         let result = MetaNode::read_last_valid_meta_node(&buffer);
-        assert!(result.is_ok(), "result: {result:?}");
-        assert_eq!(result.unwrap(), (valid_node_a, Position::A));
+        assert_eq!(result, (valid_node_a, Position::A));
     }
 
     #[test]
@@ -283,8 +276,7 @@ mod tests {
             .copy_from_slice(&<[u8; META_PAGE_SIZE]>::from(&valid_node_b));
 
         let result = MetaNode::read_last_valid_meta_node(&buffer);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), (valid_node_b, Position::B));
+        assert_eq!(result, (valid_node_b, Position::B));
     }
 
     #[test]
@@ -297,8 +289,7 @@ mod tests {
             .copy_from_slice(&<[u8; META_PAGE_SIZE]>::from(&valid_node_b));
 
         let result = MetaNode::read_last_valid_meta_node(&buffer);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), (valid_node_a, Position::A));
+        assert_eq!(result, (valid_node_a, Position::A));
     }
 
     #[test]
@@ -311,8 +302,7 @@ mod tests {
             .copy_from_slice(&<[u8; META_PAGE_SIZE]>::from(&valid_node_b));
 
         let result = MetaNode::read_last_valid_meta_node(&buffer);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), (valid_node_b, Position::B));
+        assert_eq!(result, (valid_node_b, Position::B));
     }
 
     #[test]
@@ -325,9 +315,8 @@ mod tests {
             .copy_from_slice(&<[u8; META_PAGE_SIZE]>::from(&valid_node_b));
 
         let result = MetaNode::read_last_valid_meta_node(&buffer);
-        assert!(result.is_ok());
         // Node A should be preferred when sequences are equal
-        assert_eq!(result.unwrap(), (valid_node_a, Position::A));
+        assert_eq!(result, (valid_node_a, Position::A));
     }
 
     #[test]

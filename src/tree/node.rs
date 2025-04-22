@@ -93,17 +93,14 @@
 //! The node format is just an implementation detail. The B+tree will work as
 //! long as nodes contain the necessary information.
 
-mod header;
 mod internal;
 mod leaf;
-mod leaf2;
-mod internal2;
 
 use std::rc::Rc;
 
-use crate::consts;
 use crate::error::NodeError;
-use crate::tree::page_store::PageStore;
+use crate::mmap::{Guard, ReadOnlyPage, Writer};
+use crate::{consts, header};
 use header::NodeType;
 pub(crate) use internal::ChildEntry;
 pub(crate) use internal::Internal;
@@ -114,24 +111,17 @@ use leaf::LeafEffect;
 type Result<T> = std::result::Result<T, NodeError>;
 
 /// An enum representing the type of B+ tree node.
-pub enum Node<P: PageStore> {
+pub enum Node<'a> {
     /// A B+ tree leaf node.
-    Leaf(Leaf<P>),
+    Leaf(Leaf<'a>),
     /// A B+ tree internal node.
-    Internal(Internal<P>),
+    Internal(Internal<'a>),
 }
 
-impl<P: PageStore> Node<P> {
-    fn from_page(store: P, page: P::ReadOnlyPage) -> Result<Self> {
-        match header::get_node_type(&page)? {
-            NodeType::Leaf => Ok(Node::Leaf(Leaf::from_page(store, page))),
-            NodeType::Internal => Ok(Node::Internal(Internal::from_page(store, page))),
-        }
-    }
-
-    pub fn read(store: P, page_num: usize) -> Result<Self> {
-        let page = store.read_page(page_num)?;
-        Self::from_page(store, page)
+impl<'a> Node<'a> {
+    pub fn read<G: Guard>(guard: &'a G, page_num: usize) -> Node<'a> {
+        let page = guard.read_page(page_num);
+        Self::try_from(page).unwrap()
     }
 
     pub fn page_num(&self) -> usize {
@@ -164,21 +154,32 @@ impl<P: PageStore> Node<P> {
     }
 }
 
+impl<'a> TryFrom<ReadOnlyPage<'a>> for Node<'a> {
+    type Error = NodeError;
+
+    fn try_from(page: ReadOnlyPage<'a>) -> Result<Self> {
+        match header::get_node_type(&page)? {
+            NodeType::Leaf => Ok(Node::Leaf(Leaf::try_from(page)?)),
+            NodeType::Internal => Ok(Node::Internal(Internal::try_from(page)?)),
+        }
+    }
+}
+
 /// An enum representing the effect of a node operation.
-pub enum NodeEffect<P: PageStore> {
+pub enum NodeEffect<'a> {
     /// A node without 0 keys after a delete was performed on it.
     /// This is a special-case of `Underflow` done to avoid unnecessary
     /// page allocations, since empty non-root nodes aren't allowed.
     Empty,
     /// A newly created node that remained  "intact", i.e. it did not split.
-    Intact(Node<P>),
+    Intact(Node<'a>),
     /// The left and right splits of a node that was created.
     ///
     /// The left and right nodes are the same type.
-    Split { left: Node<P>, right: Node<P> },
+    Split { left: Node<'a>, right: Node<'a> },
 }
 
-impl<P: PageStore> NodeEffect<P> {
+impl NodeEffect<'_> {
     /// Converts the node(s) created during an operation into child
     /// entries of a B+ tree internal node.
     ///
@@ -208,8 +209,8 @@ impl<P: PageStore> NodeEffect<P> {
     }
 }
 
-impl<P: PageStore> From<LeafEffect<P>> for NodeEffect<P> {
-    fn from(value: LeafEffect<P>) -> Self {
+impl<'a> From<LeafEffect<'a>> for NodeEffect<'a> {
+    fn from(value: LeafEffect<'a>) -> Self {
         match value {
             LeafEffect::Empty => NodeEffect::Empty,
             LeafEffect::Intact(leaf) => NodeEffect::Intact(Node::Leaf(leaf)),
@@ -221,8 +222,8 @@ impl<P: PageStore> From<LeafEffect<P>> for NodeEffect<P> {
     }
 }
 
-impl<P: PageStore> From<InternalEffect<P>> for NodeEffect<P> {
-    fn from(value: InternalEffect<P>) -> Self {
+impl<'a> From<InternalEffect<'a>> for NodeEffect<'a> {
+    fn from(value: InternalEffect<'a>) -> Self {
         match value {
             InternalEffect::Intact(internal) => NodeEffect::Intact(Node::Internal(internal)),
             InternalEffect::Split { left, right } => NodeEffect::Split {
@@ -249,7 +250,7 @@ pub enum Sufficiency {
 }
 
 // Returns how sufficient a node is.
-pub fn sufficiency<P: PageStore>(n: &Node<P>) -> Sufficiency {
+pub fn sufficiency(n: &Node) -> Sufficiency {
     match n.get_num_keys() {
         0 => Sufficiency::Empty,
         1 => Sufficiency::Underflow,
@@ -260,11 +261,11 @@ pub fn sufficiency<P: PageStore>(n: &Node<P>) -> Sufficiency {
 /// Merges `left` and `right` into a possibly-overflowed node and splits if
 /// needed. This is modeled as a Deletion b/c it is (so far) only useful in the
 /// context of deletion.
-pub fn steal_or_merge<P: PageStore>(left: &Node<P>, right: &Node<P>) -> Result<NodeEffect<P>> {
+pub fn steal_or_merge<'w>(left: &'w Node, right: &'w Node, writer: &'w Writer) -> NodeEffect<'w> {
     match (left, right) {
-        (Node::Leaf(left), Node::Leaf(right)) => Ok(Leaf::steal_or_merge(left, right)?.into()),
+        (Node::Leaf(left), Node::Leaf(right)) => Leaf::steal_or_merge(left, right, writer).into(),
         (Node::Internal(left), Node::Internal(right)) => {
-            Ok(Internal::steal_or_merge(left, right)?.into())
+            Internal::steal_or_merge(left, right, writer).into()
         }
         _ => unreachable!("It is assumed that both are the same node type."),
     }
@@ -273,7 +274,7 @@ pub fn steal_or_merge<P: PageStore>(left: &Node<P>, right: &Node<P>) -> Result<N
 /// Checks whether `to` can steal a key from `from`.
 /// `steal_end` determines whether to steal the end key of `from`,
 /// otherwise the beginning key.
-pub fn can_steal<P: PageStore>(from: &Node<P>, to: &Node<P>, steal_end: bool) -> bool {
+pub fn can_steal(from: &Node, to: &Node, steal_end: bool) -> bool {
     if from.get_num_keys() <= 2 {
         return false;
     }
@@ -295,6 +296,6 @@ pub fn can_steal<P: PageStore>(from: &Node<P>, to: &Node<P>, steal_end: bool) ->
 }
 
 /// Checks whether the merging of `left` and `right` doesn't overflow.
-pub fn can_merge<P: PageStore>(left: &Node<P>, right: &Node<P>) -> bool {
+pub fn can_merge(left: &Node, right: &Node) -> bool {
     left.get_num_bytes() + right.get_num_bytes() - 4 < consts::PAGE_SIZE
 }

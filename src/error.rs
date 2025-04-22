@@ -42,6 +42,4 @@ pub enum PageError {
     MmapError(#[from] mmap_rs::Error),
     #[error("Invalid file: {0}")]
     InvalidFile(Rc<str>),
-    #[error("File is empty")]
-    EmptyFile,
 }
