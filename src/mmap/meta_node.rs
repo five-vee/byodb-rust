@@ -75,9 +75,7 @@ impl MetaNode {
 
     pub fn read_last_valid_meta_node(slice: &[u8]) -> Result<(Self, Position)> {
         if slice.len() < META_OFFSET {
-            return Err(PageError::InvalidFile(
-                "file isn't large enough to contain 2 meta nodes".into(),
-            ));
+            return Err(PageError::EmptyFile);
         }
         let node_a: MetaNode = slice[..META_PAGE_SIZE].try_into()?;
         let node_b: MetaNode = slice[META_PAGE_SIZE..META_OFFSET].try_into()?;
@@ -241,13 +239,7 @@ mod tests {
     fn test_read_last_valid_meta_node_too_small() {
         let buffer = [0u8; META_OFFSET - 1];
         let result = MetaNode::read_last_valid_meta_node(&buffer);
-        assert!(result.is_err());
-        match result.err().unwrap() {
-            PageError::InvalidFile(msg) => {
-                assert!(msg.contains("file isn't large enough"));
-            }
-            _ => panic!("Expected InvalidFile error"),
-        }
+        assert!(matches!(result, Err(PageError::EmptyFile)));
     }
 
     #[test]

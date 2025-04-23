@@ -225,23 +225,20 @@ impl WriterState {
 
     fn flush_new_meta_node(&mut self, new_root_ptr: usize) {
         let m = self.mmap_mut();
-        let (
-            MetaNode {
-                sequence: prev_sequence,
-                ..
-            },
-            prev_pos,
-        ) = MetaNode::read_last_valid_meta_node(m.deref())
-            .expect("there exists at least 1 valid meta node");
+        let (seq, pos) = match MetaNode::read_last_valid_meta_node(m.deref()) {
+            Ok((node, pos)) => (node.sequence + 1, pos.next()),
+            Err(PageError::EmptyFile) => (0, meta_node::Position::A),
+            Err(err) => panic!("error reading meta node from mmap: {err}"),
+        };
         let mut curr = MetaNode {
             signature: meta_node::DB_SIG,
             root_ptr: new_root_ptr,
             num_pages: self.flush_offset / consts::PAGE_SIZE,
-            sequence: prev_sequence + 1,
+            sequence: seq,
             checksum: 0,
         };
         curr.checksum = curr.checksum();
-        curr.copy_to_slice(m.deref_mut(), prev_pos.next());
+        curr.copy_to_slice(m.deref_mut(), pos);
         m.flush(0..meta_node::META_OFFSET);
     }
 }
@@ -252,14 +249,18 @@ pub struct Store {
 }
 
 impl Store {
-    pub fn new(mmap: Mmap) -> Result<Self> {
-        let (MetaNode { num_pages, .. }, _) = MetaNode::read_last_valid_meta_node(mmap.deref())?;
+    pub fn new(mmap: Mmap) -> Self {
+        let num_pages = match MetaNode::read_last_valid_meta_node(mmap.deref()) {
+            Ok((MetaNode { num_pages, .. }, _)) => num_pages,
+            Err(PageError::EmptyFile) => 0,
+            Err(err) => panic!("error reading meta node from mmap: {err}"),
+        };
         let offset = num_pages * consts::PAGE_SIZE;
 
         // We manually ensure thread-safety via Mutex/ArcSwap.
         #[allow(clippy::arc_with_non_send_sync)]
         let mmap = Arc::new(UnsafeCell::new(mmap));
-        Ok(Store {
+        Store {
             reader: ArcSwap::from_pointee(ReaderState {
                 mmap: mmap.clone(),
                 flush_offset: offset,
@@ -270,7 +271,7 @@ impl Store {
                 write_offset: offset,
                 new_offset: offset,
             }),
-        })
+        }
     }
 
     pub fn reader(&self) -> Reader {
@@ -285,6 +286,11 @@ impl Store {
             store: self,
         }
     }
+}
+
+pub trait Viewer {
+    fn view_page(&self, page_num: usize) -> Result<ReadOnlyPage<'_>>;
+    fn view_last_valid_meta_node(&self) -> Result<MetaNode>;
 }
 
 pub struct Reader {
@@ -317,10 +323,24 @@ impl Reader {
     }
 
     pub fn sequence(&self) -> u64 {
-        MetaNode::read_last_valid_meta_node(self.guard.mmap().deref())
-            .expect("there exists at least 1 valid meta node")
-            .0
-            .sequence
+        match self.read_last_valid_meta_node() {
+            Ok(node) => node.sequence,
+            Err(PageError::EmptyFile) => 0,
+            Err(err) => panic!("error reading meta node from mmap: {err}"),
+        }
+    }
+
+    pub fn read_last_valid_meta_node(&self) -> Result<MetaNode> {
+        MetaNode::read_last_valid_meta_node(self.guard.mmap().deref()).map(|(node, _)| node)
+    }
+}
+
+impl Viewer for Reader {
+    fn view_page(&self, page_num: usize) -> Result<ReadOnlyPage<'_>> {
+        self.read_page(page_num)
+    }
+    fn view_last_valid_meta_node(&self) -> Result<MetaNode> {
+        self.read_last_valid_meta_node()
     }
 }
 
@@ -375,15 +395,42 @@ impl<'s> Writer<'s> {
     }
 }
 
-pub struct ReadOnlyPage<'rw> {
-    _phantom: PhantomData<&'rw ()>,
+impl Viewer for Writer<'_> {
+    fn view_page(&self, page_num: usize) -> Result<ReadOnlyPage<'_>> {
+        let guard = self.guard.borrow();
+        if page_num * consts::PAGE_SIZE >= guard.write_offset {
+            return Err(PageError::Read(
+                format!(
+                    "page_num = {} must be < {}",
+                    page_num,
+                    guard.write_offset / consts::PAGE_SIZE
+                )
+                .into(),
+            ));
+        }
+        Ok(ReadOnlyPage {
+            _phantom: PhantomData,
+            // Safety: pages_ptr + page_num * PAGE_SIZE <= mmap_end
+            page_ptr: unsafe { guard.mmap().pages_ptr().add(page_num * consts::PAGE_SIZE) },
+            page_num,
+        })
+    }
+
+    fn view_last_valid_meta_node(&self) -> Result<MetaNode> {
+        MetaNode::read_last_valid_meta_node(self.guard.borrow().mmap().deref())
+            .map(|(node, _)| node)
+    }
+}
+
+pub struct ReadOnlyPage<'a> {
+    _phantom: PhantomData<&'a ()>,
     page_ptr: *const u8,
     pub page_num: usize,
 }
 
-impl Deref for ReadOnlyPage<'_> {
+impl<'a> Deref for ReadOnlyPage<'a> {
     type Target = [u8];
-    fn deref(&self) -> &Self::Target {
+    fn deref(&self) -> &'a [u8] {
         // Safety: [page_ptr, page_ptr + PAGE_SIZE) is a guaranteed valid region in the mmap.
         // It is guaranteed that no writers can touch this region (since it's already flushed).
         // page_ptr cannot dangle b/c the mmap is never dropped/realloc'ed so long as
@@ -432,7 +479,7 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let path = temp_file.path();
         let mmap = Mmap::open_or_create(path).unwrap();
-        let store = Store::new(mmap).unwrap();
+        let store = Store::new(mmap);
         (store, temp_file)
     }
 
@@ -471,7 +518,7 @@ mod tests {
 
     #[test]
     fn test_anonymous_store_can_read_after_flush() {
-        let store = Store::new(Mmap::new_anonymous(1)).unwrap();
+        let store = Store::new(Mmap::new_anonymous(1));
         run_test_store_can_read_after_flush(store);
     }
 
@@ -512,7 +559,7 @@ mod tests {
 
     #[test]
     fn test_anonymous_store_cannot_read_before_flush() {
-        let store = Store::new(Mmap::new_anonymous(1)).unwrap();
+        let store = Store::new(Mmap::new_anonymous(1));
         run_test_store_cannot_read_before_flush(store);
     }
 
@@ -555,7 +602,7 @@ mod tests {
 
     #[test]
     fn test_anonymous_store_flush_increases_sequence() {
-        let store = Store::new(Mmap::new_anonymous(0)).unwrap();
+        let store = Store::new(Mmap::new_anonymous(0));
         run_test_store_flush_increases_sequence(store);
     }
 
@@ -609,7 +656,7 @@ mod tests {
 
     #[test]
     fn test_anonymous_store_new_page_address_always_increases() {
-        let store = Store::new(Mmap::new_anonymous(0)).unwrap();
+        let store = Store::new(Mmap::new_anonymous(0));
         run_test_store_new_page_address_always_increases(store);
     }
 
@@ -665,7 +712,7 @@ mod tests {
 
     #[test]
     fn test_anonymous_store_reader_writer_isolation() {
-        let store = Store::new(Mmap::new_anonymous(0)).unwrap();
+        let store = Store::new(Mmap::new_anonymous(0));
         run_test_store_reader_writer_isolation(store);
     }
 

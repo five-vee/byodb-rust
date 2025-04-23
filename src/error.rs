@@ -36,12 +36,12 @@ pub enum PageError {
     Read(Rc<str>),
     #[error("Page write error: {0}")]
     Write(Rc<str>),
-    #[error("Page not found: {0}")]
-    NotFound(usize),
     #[error(transparent)]
     IOError(#[from] io::Error),
     #[error(transparent)]
     MmapError(#[from] mmap_rs::Error),
     #[error("Invalid file: {0}")]
     InvalidFile(Rc<str>),
+    #[error("File is empty")]
+    EmptyFile,
 }
