@@ -1,5 +1,4 @@
 use std::{io, rc::Rc};
-use thiserror;
 
 /// An error type for `mod tree`.
 #[derive(thiserror::Error, Debug)]

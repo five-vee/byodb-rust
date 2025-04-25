@@ -1,3 +1,46 @@
+//! # Mmap format
+//!
+//! The store is the storage layer for the copy-on-write B+ tree. It is a
+//! memory-mapped region that can be backed by a file.
+//! The mmap has the following structure:
+//!
+//! ```ignore
+//! | meta page A | meta_page B |   pages   |
+//! |     64B     |     64B     | N * 4096B |
+//! ```
+//!
+//! where `N` is the number of pages utilized so far by the B+ tree.
+//!
+//! At the moment, the mmap can only grow in size. In the future, we will
+//! implement a free-list for garbage collection + space efficiency.
+//!
+//! # Meta page double buffering
+//!
+//! Two meta pages are used due to the double buffer technique: writes to the
+//! meta page must be atomic, if the writes to a meta page fails, one can
+//! recover from the other meta page, which is the last known valid meta page.
+//! When flushing/committing, writers will overwrite the meta page with the
+//! smaller sequence. Readers will read the meta page with the larger sequence.
+//! Even if writes and reads of the meta pages are concurrent, the reader will
+//! always read a valid meta page; there can only be one writer at a time.
+//!
+//! # Snapshot isolation
+//!
+//! There can be multiple concurrent readers of a store. Readers do not block
+//! each other.
+//!
+//! There can be only 1 writer of a store at a time. However, readers do not
+//! block the writer, and the writer does not block readers.
+//!
+//! Readers can only read pages once they're flushed: no dirty reads allowed.
+//! Writers can allocate new pages and can even read non-flushed pages.
+//! Of course, if one wants the page to be visible to future reader, it MUST
+//! be flushed first.
+//!
+//! # Building MVCC transactions
+//!
+//! Though this module doesn't support MVCC transactions out of the box,
+//! the abstractions provided can be used to build transactions.
 mod meta_node;
 
 use std::{
@@ -22,14 +65,18 @@ use crate::{
 };
 use meta_node::MetaNode;
 
+// Mmap flushes must be aligned to SYSTEM_PAGE_SIZE.
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 const SYSTEM_PAGE_SIZE: usize = 16384;
 
+// Mmap flushes must be aligned to SYSTEM_PAGE_SIZE.
 #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
 const SYSTEM_PAGE_SIZE: usize = unimplemented!("I don't know yet");
 
 type Result<T> = std::result::Result<T, PageError>;
 
+/// A wrapper around a memory-mapped region (mmap).
+/// It is optionally backed by a file.
 pub struct Mmap {
     file: Option<Rc<RefCell<File>>>,
     mmap: MmapMut,
@@ -49,6 +96,8 @@ impl DerefMut for Mmap {
 }
 
 impl Mmap {
+    /// Creates an anonymous mmap (i.e. not backed by file).
+    /// `num_pages` must be at least 1.
     pub fn new_anonymous(num_pages: usize) -> Self {
         let num_pages = if num_pages == 0 { 1 } else { num_pages };
         let mut mmap = MmapOptions::new(meta_node::META_OFFSET + num_pages * consts::PAGE_SIZE)
@@ -62,6 +111,7 @@ impl Mmap {
         Mmap { file: None, mmap }
     }
 
+    /// Opens or creates (if not exists) a file that holds a B+ tree.
     pub fn open_or_create<P: AsRef<Path>>(path: P) -> Result<Self> {
         let mut file = OpenOptions::new()
             .read(true)
@@ -100,36 +150,38 @@ impl Mmap {
         })
     }
 
+    /// Flushes all written pages to the file (if exists), thereby making them
+    /// available to read by new readers.
     fn flush(&self, range: Range<usize>) {
-        if self.file.is_some() {
-            if range.is_empty() {
-                return; // Nothing to flush
-            }
-
-            // Calculate aligned start (floor to page boundary)
-            let aligned_start = range.start - (range.start % SYSTEM_PAGE_SIZE);
-
-            // Calculate aligned end (ceiling to page boundary)
-            let aligned_end = range.end.div_ceil(SYSTEM_PAGE_SIZE) * SYSTEM_PAGE_SIZE;
-
-            // Ensure aligned_end does not exceed the mmap bounds
-            let mmap_len = self.mmap.len();
-            let aligned_end = std::cmp::min(aligned_end, mmap_len);
-
-            // Ensure aligned_start is not past aligned_end after adjustments
-            if aligned_start >= aligned_end {
-                panic!("The adjusted range is empty or invalid");
-            }
-
-            let aligned_range = aligned_start..aligned_end;
-
-            // Flush the aligned range
-            self.mmap
-                .flush(aligned_range)
-                .expect("mmap can validly msync with aligned range");
+        if self.file.is_none() || range.is_empty() {
+            return; // Nothing to flush
         }
+
+        // Calculate aligned start (floor to page boundary)
+        let aligned_start = range.start - (range.start % SYSTEM_PAGE_SIZE);
+
+        // Calculate aligned end (ceiling to page boundary)
+        let aligned_end = range.end.div_ceil(SYSTEM_PAGE_SIZE) * SYSTEM_PAGE_SIZE;
+
+        // Ensure aligned_end does not exceed the mmap bounds
+        let mmap_len = self.mmap.len();
+        let aligned_end = std::cmp::min(aligned_end, mmap_len);
+
+        // Ensure aligned_start is not past aligned_end after adjustments
+        if aligned_start >= aligned_end {
+            panic!("The adjusted range is empty or invalid");
+        }
+
+        let aligned_range = aligned_start..aligned_end;
+
+        // Flush the aligned range
+        self.mmap
+            .flush(aligned_range)
+            .expect("mmap can validly msync with aligned range");
     }
 
+    /// Grows the mmap region (and file, if exists) to `new_len`.
+    /// This is needed if the mmap cannot allocate more new pages.
     fn grow(&self, new_len: usize) -> Self {
         let mut mmap_opts = MmapOptions::new(new_len).expect("new_len > 0");
         let mmap = match &self.file {
@@ -156,12 +208,15 @@ impl Mmap {
         }
     }
 
+    /// A pointer into the mmap region that represents the start of where all
+    /// the B+ tree pages live.
     fn pages_ptr(&self) -> *mut u8 {
         // Safety: ptr + META_OFFSET is a valid pointer into the mmap region.
         unsafe { self.mmap.as_ptr().add(meta_node::META_OFFSET) as *mut u8 }
     }
 }
 
+/// Container of data needed by Readers.
 struct ReaderState {
     mmap: Arc<UnsafeCell<Mmap>>,
     flush_offset: usize,
@@ -176,6 +231,8 @@ unsafe impl Send for ReaderState {}
 unsafe impl Sync for ReaderState {}
 
 impl ReaderState {
+    /// A convenient method to retrieve the Mmap
+    /// since it's guarded by UnsafeCell.
     fn mmap(&self) -> &Mmap {
         // Safety: ReaderState guarantees that immutable references of the mmap
         // only read [pages_ptr, pages_ptr + flush_offset * PAGE_SIZE), which never overlaps
@@ -184,6 +241,7 @@ impl ReaderState {
     }
 }
 
+/// Container of data needed by Writer.
 struct WriterState {
     mmap: Arc<UnsafeCell<Mmap>>,
     flush_offset: usize,
@@ -199,6 +257,8 @@ unsafe impl Send for WriterState {}
 unsafe impl Sync for WriterState {}
 
 impl WriterState {
+    /// A convenient method to retrieve the Mmap
+    /// since it's guarded by UnsafeCell.
     #[allow(clippy::mut_from_ref)] // This is the same as if inlined.
     fn mmap_mut(&self) -> &mut Mmap {
         // Safety: WriterState guarantees that mutable references of the mmap
@@ -207,10 +267,13 @@ impl WriterState {
         unsafe { &mut *self.mmap.get() }
     }
 
+    /// A convenient method to retrieve the Mmap
+    /// since it's guarded by UnsafeCell.
     fn mmap(&self) -> &Mmap {
         self.mmap_mut()
     }
 
+    /// Flushes only the B+ tree pages portion of the mmap.
     fn flush_pages(&mut self) {
         let m = self.mmap_mut();
         let range =
@@ -219,6 +282,7 @@ impl WriterState {
         self.flush_offset = self.write_offset;
     }
 
+    /// Grows the underlying mmap only if there's no more space for new pages.
     #[allow(clippy::arc_with_non_send_sync)] // We manually ensure thread-safety via Mutex/ArcSwap.
     fn grow_if_needed(&mut self) -> bool {
         let m = self.mmap();
@@ -235,6 +299,7 @@ impl WriterState {
         true
     }
 
+    /// Flushes only the meta node double buffer of the mmap.
     fn flush_new_meta_node(&mut self, new_root_ptr: usize) {
         let m = self.mmap_mut();
         let (MetaNode { sequence, .. }, pos) = MetaNode::read_last_valid_meta_node(m.deref());
@@ -251,12 +316,26 @@ impl WriterState {
     }
 }
 
+/// The store is the storage layer for the copy-on-write B+ tree.
+/// It is an abstraction to allow for multi-version-concurrency control (MVCC).
+///
+/// There can be multiple concurrent readers of a store. Readers do not block
+/// each other.
+///
+/// There can be only 1 writer of a store at a time. However, readers do not
+/// block the writer, and the writer does not block readers.
+///
+/// Readers can only read pages once they're flushed: no dirty reads allowed.
+/// Writers can allocate new pages and can even read non-flushed pages.
+/// Of course, if one wants the page to be visible to future reader, it MUST
+/// be flushed first.
 pub struct Store {
     reader: ArcSwap<ReaderState>,
     writer: Mutex<WriterState>,
 }
 
 impl Store {
+    /// Creates a new store from a specified `Mmap`.
     pub fn new(mmap: Mmap) -> Self {
         let num_pages = MetaNode::read_last_valid_meta_node(mmap.deref())
             .0
@@ -280,12 +359,15 @@ impl Store {
         }
     }
 
+    /// Obtains a Reader guard.
     pub fn reader(&self) -> Reader {
         Reader {
             guard: self.reader.load(),
         }
     }
 
+    /// Obtains a Writer guard. This will block so long as a Writer
+    /// was previously obtained and not yet dropped.
     pub fn writer(&self) -> Writer<'_> {
         Writer {
             guard: RefCell::new(self.writer.lock().unwrap()),
@@ -294,16 +376,33 @@ impl Store {
     }
 }
 
+/// Guard is a trait common to both Reader and Writer.
+/// It provides guarded read-only access to the mmap region.
 pub trait Guard {
+    /// Reads a page at `page_num`.
+    /// Note: If the implementing type is Reader, only flushed pages can be
+    /// read.
+    ///
+    /// If it's a Writer, then either flushed or written pages can be read.
+    /// Newly allocated pages must be written first before they can be read.
+    /// Remember to flush pages to make them available to future readers.
     fn read_page(&self, page_num: usize) -> ReadOnlyPage<'_>;
+
+    /// Reads the last (flushed) valid meta node from the double buffer.
     fn read_last_valid_meta_node(&self) -> MetaNode;
 }
 
+/// A Reader that provides safe read-only concurrent access to the flushed
+/// B+ tree nodes and flushed meta nodes.
+/// Readers don't block each other.
+/// Readers and the Writer don't block each other, but Readers are isolated
+/// from the Writer via the flushing mechanism.
 pub struct Reader {
     guard: ArcSwapGuard<Arc<ReaderState>>,
 }
 
 impl Reader {
+    /// Reads a page at `page_num`. Only flushed pages can be read.
     pub fn read_page(&self, page_num: usize) -> ReadOnlyPage<'_> {
         let guard = &self.guard;
         assert!(
@@ -323,6 +422,7 @@ impl Reader {
         self.read_last_valid_meta_node().sequence
     }
 
+    /// Reads the last (flushed) valid meta node from the double buffer.
     pub fn read_last_valid_meta_node(&self) -> MetaNode {
         MetaNode::read_last_valid_meta_node(self.guard.mmap().deref()).0
     }
@@ -337,13 +437,19 @@ impl Guard for Reader {
     }
 }
 
+/// A Writer that provides safe read+write serialized access to the flushed
+/// B+ tree nodes and flushed meta nodes.
+/// Only 1 Writer is allowed access at a time.
+/// Readers and the Writer don't block each other, but Readers are isolated
+/// from the Writer via the flushing mechanism.
 pub struct Writer<'s> {
     guard: RefCell<MutexGuard<'s, WriterState>>,
     store: &'s Store,
 }
 
-impl<'s> Writer<'s> {
-    pub fn new_page<'w>(&'w self) -> Page<'w> {
+impl Writer<'_> {
+    /// Allocates a new page for write.
+    pub fn new_page(&self) -> Page<'_> {
         let mut guard = self.guard.borrow_mut();
         guard.grow_if_needed();
         let page = Page {
@@ -355,6 +461,8 @@ impl<'s> Writer<'s> {
         page
     }
 
+    /// Finalizes a page, marking it read-only.
+    /// This does NOT make the page available to readers; it must be flushed first.
     pub fn write_page<'w>(&'w self, page: Page<'w>) -> ReadOnlyPage<'w> {
         let mut guard = self.guard.borrow_mut();
         guard.write_offset += consts::PAGE_SIZE;
@@ -365,6 +473,8 @@ impl<'s> Writer<'s> {
         }
     }
 
+    /// Flushes all written pages and update the meta node root pointer.
+    /// Every new page must first be written before calling `flush`.
     pub fn flush(&self, new_root_ptr: usize) {
         let mut guard = self.guard.borrow_mut();
         if guard.write_offset < guard.new_offset {
@@ -404,6 +514,11 @@ impl Guard for Writer<'_> {
     }
 }
 
+/// A page inside the mmap region that allows only for reads.
+/// The lifetime 'a is tied to either a Reader or Writer:
+/// * if a Reader, then it represents a flushed page.
+/// * if a Writer, then it can represent either a flushed or
+///   written (but not yet flushed) page.
 pub struct ReadOnlyPage<'a> {
     _phantom: PhantomData<&'a ()>,
     mmap: Arc<UnsafeCell<Mmap>>,
@@ -423,6 +538,9 @@ impl<'a> Deref for ReadOnlyPage<'a> {
     }
 }
 
+/// A page inside the mmap region that allows for reads and writes.
+/// A page is not accessible to readers until flushed.
+/// Nor can it be read by a writer until written.
 pub struct Page<'w> {
     _phantom: PhantomData<&'w ()>,
     mmap: Arc<UnsafeCell<Mmap>>,
@@ -432,11 +550,11 @@ pub struct Page<'w> {
 impl Deref for Page<'_> {
     type Target = [u8];
     fn deref(&self) -> &Self::Target {
-        // // Safety: [page_ptr, page_ptr + PAGE_SIZE) is a guaranteed valid region in the mmap.
-        // // Due to the mutex guard in Writer, at most one mutable reference can
-        // // touch this region at a time.
-        // // page_ptr cannot dangle b/c the mmap is never dropped/realloc'ed so long as
-        // // the writer mutex guard (&'w Writer<'s>) exists.
+        // Safety: [page_ptr, page_ptr + PAGE_SIZE) is a guaranteed valid region in the mmap.
+        // Due to the mutex guard in Writer, at most one mutable reference can
+        // touch this region at a time.
+        // page_ptr cannot dangle b/c the mmap is never dropped/realloc'ed so long as
+        // the writer mutex guard (&'w Writer<'s>) exists.
         &unsafe { &*self.mmap.get() }.mmap[meta_node::META_OFFSET
             + self.page_num * consts::PAGE_SIZE
             ..meta_node::META_OFFSET + (self.page_num + 1) * consts::PAGE_SIZE]
@@ -484,9 +602,14 @@ mod tests {
         (store, temp_file)
     }
 
-    // TODO: add tests of writer reading non-dirty and dirty pages.
-    // TODO: test validity of writer (non-flushed) page after growing.
-    // TODO: test validity of reader (flushed) page after growing.
+    // TODO: test: create a mmap on an empty file, write new pages to grow it, close the file (drop it), then reopen it with open_or_create, and make sure the opened file is valid.
+    // TODO: test: create invalid file(s) and make sure open_or_create fails as expected.
+    // TODO: test that writer can read flushed pages and written pages.
+    // TODO: test that writer cannot read non-flushed pages and non-written pages.
+    // TODO: test that reader can read flushed pages.
+    // TODO: test that writer cannot read non-flushed pages, written pages, nor non-written pages.
+    // TODO: test validity of writer's written but non-flushed page after growing.
+    // TODO: test validity of reader's read page after growing.
 
     fn run_test_store_can_read_after_flush(store: Store) {
         let writer = store.writer();

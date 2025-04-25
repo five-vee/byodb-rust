@@ -1,55 +1,76 @@
+//! The meta node is special node that is not part of the B+ tree.
+//! Rather, it contains metadata about the B+ tree, including where
+//! the root node is located, how many nodes/pages are currently
+//! there (including those not yet reclaimed into the free list), etc.
+//!
+//! The meta node has the following format on disk:
+//!
 //! ```ignore
-//! | sig | root_ptr | num_pages |
-//! | 16B |    8B    |     8B    |
+//! | signature | root_ptr | num_pages | sequence | checksum | unused |
+//! |    16B    |    8B    |     8B    |    8B    |    4B    |   20B  |
 //! ```
 use crate::error::PageError;
 use std::{convert::TryFrom, ptr, rc::Rc, sync::OnceLock};
 
 use crc::Crc;
 
+// A Crc singleton to avoid creating a new Crc everytime a checksum calculation
+// is needed.
 static CRC_32_CKSUM: OnceLock<Crc<u32>> = OnceLock::new();
 
+/// Size of a meta node as stored on disk.
 pub(crate) const META_PAGE_SIZE: usize = 64;
+/// The space in the front of the mmap that is reserved for double buffering
+/// of meta pages.
 pub(crate) const META_OFFSET: usize = META_PAGE_SIZE * 2;
 pub(crate) const DB_SIG: [u8; 16] = *b"BuildYourOwnDB06";
 const META_NODE_SIZE: usize = std::mem::size_of::<MetaNode>();
 
 const _: () = {
     assert!(META_NODE_SIZE <= META_PAGE_SIZE);
+    assert!(META_PAGE_SIZE * 2 <= META_OFFSET);
 };
 
 type Result<T> = std::result::Result<T, PageError>;
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum Position {
-    A,
-    B,
-}
-
-impl Position {
-    pub fn next(&self) -> Self {
-        match self {
-            Position::A => Position::B,
-            _ => Position::A,
-        }
-    }
-}
-
+/// The meta node is special node that is not part of the B+ tree.
+/// Rather, it contains metadata about the B+ tree, including where
+/// the root node is located, how many nodes/pages are currently
+/// there (including those not yet reclaimed into the free list), etc.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct MetaNode {
+    /// A signature to version a meta node as the data format may change over
+    /// time.
     pub signature: [u8; 16],
+
+    /// Which page represents the root of the B+ tree.
     pub root_ptr: usize,
+
+    /// How many pages are utilized by the memory map.
+    /// Note that `num_pages` is NOT the number of nodes/pages in the B+ tree.
+    /// Rather, it is a sort of watermark that monotonically increases over
+    /// time with new write operations on the B+ tree, as it grows. If there
+    /// are no free nodes in the free list, a new page can be allocated, and so
+    /// will the `num_pages` counter.
     pub num_pages: usize,
+
+    /// Used to determine the winner in a last-write-wins scenario.
+    /// In the mmap file, there are two meta nodes: the one that has a higher
+    /// sequence is the latest one.
     pub sequence: u64,
 
-    // THIS MUST BE THE LAST FIELD.
-    pub checksum: u32,
+    /// Used to verify the validity of the meta node. This is for
+    /// atomicity of writes. The checksum is used to check if a write of a meta
+    /// node succeeded or failed (e.g. a partial write).
+    pub checksum: u32, // THIS MUST BE THE LAST FIELD.
 }
 
 impl MetaNode {
     const CHECKSUM_FIELD_OFFSET: usize = memoffset::offset_of!(MetaNode, checksum);
 
+    /// Creates a new meta node representing a completely empty mmap file that
+    /// has 1 page, the B+ tree as a leaf node with no key-values.
     pub fn new() -> Self {
         let mut node = Self::default();
         node.signature = DB_SIG;
@@ -70,10 +91,12 @@ impl MetaNode {
             .checksum(bytes_to_checksum)
     }
 
+    /// Determines if the meta node has a valid signature and checksum.
     pub fn valid(&self) -> bool {
         self.signature == DB_SIG && self.checksum == self.checksum()
     }
 
+    /// Reads the last (flushed) valid meta node from the double buffer.
     pub fn read_last_valid_meta_node(slice: &[u8]) -> (Self, Position) {
         assert!(slice.len() >= META_OFFSET, "no valid meta node found");
         let node_a: MetaNode = slice[..META_PAGE_SIZE].try_into().unwrap();
@@ -97,6 +120,7 @@ impl MetaNode {
         (node, pos)
     }
 
+    /// Writes a meta node to the double buffer at the specified position.
     pub fn copy_to_slice(&self, slice: &mut [u8], pos: Position) {
         let offset: usize = match pos {
             Position::A => 0,
@@ -153,6 +177,25 @@ impl<'a> From<&'a MetaNode> for [u8; META_PAGE_SIZE] {
         // The rest of the buffer (buffer[node_size..]) remains zeroed
         // as initialized, fulfilling the requirement to fill META_SIZE.
         buffer
+    }
+}
+
+/// Position into the meta node double buffer.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Position {
+    /// Position "A", i.e. the first position.
+    A,
+    /// Position "B", i.e. the second position.
+    B,
+}
+
+impl Position {
+    /// Return the next position: `A -> B`, `B -> A`.
+    pub fn next(&self) -> Self {
+        match self {
+            Position::A => Position::B,
+            _ => Position::A,
+        }
     }
 }
 
