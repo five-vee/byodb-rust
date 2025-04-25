@@ -6,10 +6,6 @@ use thiserror;
 pub enum TreeError {
     #[error("Node error: {0}")]
     Node(#[from] NodeError),
-    #[error("Page store error: {0}")]
-    Page(#[from] PageError),
-    #[error("Key not found")]
-    KeyNotFound,
 }
 
 /// An error type for `mod node`.
@@ -25,17 +21,11 @@ pub enum NodeError {
     AlreadyExists,
     #[error("Key not found")]
     KeyNotFound,
-    #[error("Page store error: {0}")]
-    Page(#[from] PageError),
 }
 
 /// An error type for `mod page_store`.
 #[derive(thiserror::Error, Debug)]
 pub enum PageError {
-    #[error("Page read error: {0}")]
-    Read(Rc<str>),
-    #[error("Page write error: {0}")]
-    Write(Rc<str>),
     #[error(transparent)]
     IOError(#[from] io::Error),
     #[error(transparent)]
