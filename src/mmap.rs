@@ -47,7 +47,7 @@ use std::{
     cell::{RefCell, UnsafeCell},
     cmp::max,
     fs::{File, OpenOptions},
-    io::{Seek, Write as _},
+    io::{Read, Seek, Write as _},
     marker::PhantomData,
     ops::{Deref, DerefMut, Range},
     path::Path,
@@ -56,7 +56,7 @@ use std::{
 };
 
 use arc_swap::{ArcSwap, Guard as ArcSwapGuard};
-use mmap_rs::{MmapMut, MmapOptions};
+use memmap2::{MmapMut, MmapOptions};
 
 use crate::{
     consts,
@@ -64,14 +64,6 @@ use crate::{
     header::{self, NodeType},
 };
 use meta_node::MetaNode;
-
-// Mmap flushes must be aligned to SYSTEM_PAGE_SIZE.
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-const SYSTEM_PAGE_SIZE: usize = 16384;
-
-// Mmap flushes must be aligned to SYSTEM_PAGE_SIZE.
-#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
-const SYSTEM_PAGE_SIZE: usize = unimplemented!("I don't know yet");
 
 type Result<T> = std::result::Result<T, PageError>;
 
@@ -100,10 +92,10 @@ impl Mmap {
     /// `num_pages` must be at least 1.
     pub fn new_anonymous(num_pages: usize) -> Self {
         let num_pages = if num_pages == 0 { 1 } else { num_pages };
-        let mut mmap = MmapOptions::new(meta_node::META_OFFSET + num_pages * consts::PAGE_SIZE)
-            .expect("len > 0")
-            .map_mut()
-            .expect("mmap is correctly created");
+        let mut mmap = MmapOptions::new()
+            .len(meta_node::META_OFFSET + num_pages * consts::PAGE_SIZE)
+            .map_anon()
+            .unwrap();
         MetaNode::new().copy_to_slice(mmap.deref_mut(), meta_node::Position::A);
         init_empty_leaf(
             &mut mmap[meta_node::META_OFFSET..meta_node::META_OFFSET + consts::PAGE_SIZE],
@@ -128,7 +120,8 @@ impl Mmap {
             init_empty_leaf(page.as_mut_slice());
             file.write_all(page.as_slice())?;
             file_len = file.metadata()?.len() as usize;
-            // Don't need to sync until a write happens later.
+            file.sync_all()?;
+            file.seek(std::io::SeekFrom::Start(0))?;
         }
         let file_len = file_len;
         if file_len < meta_node::META_OFFSET + consts::PAGE_SIZE {
@@ -142,8 +135,16 @@ impl Mmap {
                     .into(),
             ));
         }
+        // There must be at least 1 valid meta node.
+        {
+            let mut buf = [0u8; meta_node::META_OFFSET];
+            let _ = file.read(&mut buf)?;
+            let _ = MetaNode::read_last_valid_meta_node(&buf);
+        }
+
         // Safety: it is assumed that no other process has a mutable mapping to the same file.
-        let mmap = unsafe { MmapOptions::new(file_len)?.with_file(&file, 0).map_mut()? };
+        let mmap = unsafe { MmapOptions::new().map_mut(&file).unwrap() };
+
         Ok(Mmap {
             file: Some(Rc::new(RefCell::new(file))),
             mmap,
@@ -156,50 +157,30 @@ impl Mmap {
         if self.file.is_none() || range.is_empty() {
             return; // Nothing to flush
         }
-
-        // Calculate aligned start (floor to page boundary)
-        let aligned_start = range.start - (range.start % SYSTEM_PAGE_SIZE);
-
-        // Calculate aligned end (ceiling to page boundary)
-        let aligned_end = range.end.div_ceil(SYSTEM_PAGE_SIZE) * SYSTEM_PAGE_SIZE;
-
-        // Ensure aligned_end does not exceed the mmap bounds
-        let mmap_len = self.mmap.len();
-        let aligned_end = std::cmp::min(aligned_end, mmap_len);
-
-        // Ensure aligned_start is not past aligned_end after adjustments
-        if aligned_start >= aligned_end {
-            panic!("The adjusted range is empty or invalid");
-        }
-
-        let aligned_range = aligned_start..aligned_end;
-
         // Flush the aligned range
         self.mmap
-            .flush(aligned_range)
+            .flush()
             .expect("mmap can validly msync with aligned range");
     }
 
     /// Grows the mmap region (and file, if exists) to `new_len`.
     /// This is needed if the mmap cannot allocate more new pages.
     fn grow(&self, new_len: usize) -> Self {
-        let mut mmap_opts = MmapOptions::new(new_len).expect("new_len > 0");
+        // let mut mmap_opts = MmapOptions::new(new_len).expect("new_len > 0");
+        let mut mmap_opts = MmapOptions::new();
+
         let mmap = match &self.file {
             None => {
-                let mut mmap = mmap_opts.map_mut().expect("mmap is correctly created");
+                let mut mmap = mmap_opts.len(new_len).map_anon().unwrap();
                 mmap[..self.mmap.len()].copy_from_slice(self.mmap.deref());
                 mmap
             }
             Some(f) => {
-                f.borrow_mut()
-                    .seek(std::io::SeekFrom::End(0))
-                    .expect("seeking to the end of file is valid");
-                f.borrow_mut()
-                    .write_all(vec![0u8; new_len - self.mmap.len()].as_ref())
-                    .expect("writing to the end of file is valid");
+                f.borrow()
+                    .set_len(new_len as u64)
+                    .expect("file can grow in size");
                 // Safety: it is assumed that no other process has a mutable mapping to the same file.
-                mmap_opts = unsafe { mmap_opts.with_file(&*f.as_ptr(), 0) };
-                mmap_opts.map_mut().expect("mmap is correctly created")
+                unsafe { mmap_opts.map_mut(&*f.as_ptr()) }.expect("mmap is correctly created")
             }
         };
         Mmap {
@@ -311,7 +292,7 @@ impl WriterState {
             checksum: 0,
         };
         curr.checksum = curr.checksum();
-        curr.copy_to_slice(m.deref_mut(), pos);
+        curr.copy_to_slice(m.deref_mut(), pos.next());
         m.flush(0..meta_node::META_OFFSET);
     }
 }
@@ -597,12 +578,58 @@ mod tests {
     fn new_file_mmap() -> (Store, NamedTempFile) {
         let temp_file = NamedTempFile::new().unwrap();
         let path = temp_file.path();
+        println!("Created temporary file {path:?}");
         let mmap = Mmap::open_or_create(path).unwrap();
         let store = Store::new(mmap);
         (store, temp_file)
     }
 
-    // TODO: test: create a mmap on an empty file, write new pages to grow it, close the file (drop it), then reopen it with open_or_create, and make sure the opened file is valid.
+    #[test]
+    fn test_open_file() {
+        let page_num;
+        let pattern = [0xDE, 0xAD, 0xBE, 0xEF];
+        let edit_offset = 50;
+
+        // Scope 1: Create, write, flush, close
+        let (store, temp_file) = new_file_mmap();
+        let path = temp_file.path();
+        {
+            let writer = store.writer();
+            let mut page = writer.new_page();
+
+            page[edit_offset..edit_offset + pattern.len()].copy_from_slice(&pattern);
+
+            let written_page = writer.write_page(page);
+            page_num = written_page.page_num;
+            // Flush with the root pointer as the new page number for simplicity
+            writer.flush(page_num);
+        }
+        drop(store);
+
+        // Scope 2: Reopen and verify
+        {
+            let mmap = Mmap::open_or_create(path).unwrap();
+            let store = Store::new(mmap);
+            let reader = store.reader();
+
+            // Verify the meta node
+            assert_eq!(reader.sequence(), 1, "Sequence should be 1 after one flush");
+            let meta = reader.read_last_valid_meta_node();
+            assert_eq!(
+                meta.root_ptr, page_num,
+                "Root pointer should match the flushed page number"
+            );
+
+            // Verify the page
+            let read_page = reader.read_page(page_num);
+            assert_eq!(
+                &read_page[edit_offset..edit_offset + pattern.len()],
+                &pattern,
+                "Data read should match data written after reopening"
+            );
+        }
+    }
+
     // TODO: test: create invalid file(s) and make sure open_or_create fails as expected.
     // TODO: test that writer can read flushed pages and written pages.
     // TODO: test that writer cannot read non-flushed pages and non-written pages.

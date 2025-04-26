@@ -27,8 +27,6 @@ pub enum NodeError {
 pub enum PageError {
     #[error(transparent)]
     IOError(#[from] io::Error),
-    #[error(transparent)]
-    MmapError(#[from] mmap_rs::Error),
     #[error("Invalid file: {0}")]
     InvalidFile(Rc<str>),
 }
