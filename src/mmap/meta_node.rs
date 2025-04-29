@@ -97,13 +97,13 @@ impl MetaNode {
     }
 
     /// Reads the last (flushed) valid meta node from the double buffer.
-    pub fn read_last_valid_meta_node(slice: &[u8]) -> (Self, Position) {
+    pub fn read_last_valid_meta_node(slice: &[u8]) -> Result<(Self, Position)> {
         assert!(slice.len() >= META_OFFSET, "no valid meta node found");
         let node_a: MetaNode = slice[..META_PAGE_SIZE].try_into().unwrap();
         let node_b: MetaNode = slice[META_PAGE_SIZE..META_OFFSET].try_into().unwrap();
         let (node, pos) = match (node_a, node_b) {
             (a, b) if !a.valid() && !b.valid() => {
-                panic!("no valid meta node found")
+                return Err(PageError::InvalidFile("no valid meta node found".into()))
             }
             (a, b) if a.valid() && !b.valid() => (a, Position::A),
             (a, b) if !a.valid() && b.valid() => (b, Position::B),
@@ -117,7 +117,7 @@ impl MetaNode {
                 }
             }
         };
-        (node, pos)
+        Ok((node, pos))
     }
 
     /// Writes a meta node to the double buffer at the specified position.
@@ -305,7 +305,7 @@ mod tests {
         buffer[META_PAGE_SIZE..META_OFFSET]
             .copy_from_slice(&<[u8; META_PAGE_SIZE]>::from(&invalid_node_b));
 
-        let result = MetaNode::read_last_valid_meta_node(&buffer);
+        let result = MetaNode::read_last_valid_meta_node(&buffer).unwrap();
         assert_eq!(result, (valid_node_a, Position::A));
     }
 
@@ -318,7 +318,7 @@ mod tests {
         buffer[META_PAGE_SIZE..META_OFFSET]
             .copy_from_slice(&<[u8; META_PAGE_SIZE]>::from(&valid_node_b));
 
-        let result = MetaNode::read_last_valid_meta_node(&buffer);
+        let result = MetaNode::read_last_valid_meta_node(&buffer).unwrap();
         assert_eq!(result, (valid_node_b, Position::B));
     }
 
@@ -331,7 +331,7 @@ mod tests {
         buffer[META_PAGE_SIZE..META_OFFSET]
             .copy_from_slice(&<[u8; META_PAGE_SIZE]>::from(&valid_node_b));
 
-        let result = MetaNode::read_last_valid_meta_node(&buffer);
+        let result = MetaNode::read_last_valid_meta_node(&buffer).unwrap();
         assert_eq!(result, (valid_node_a, Position::A));
     }
 
@@ -344,7 +344,7 @@ mod tests {
         buffer[META_PAGE_SIZE..META_OFFSET]
             .copy_from_slice(&<[u8; META_PAGE_SIZE]>::from(&valid_node_b));
 
-        let result = MetaNode::read_last_valid_meta_node(&buffer);
+        let result = MetaNode::read_last_valid_meta_node(&buffer).unwrap();
         assert_eq!(result, (valid_node_b, Position::B));
     }
 
@@ -357,7 +357,7 @@ mod tests {
         buffer[META_PAGE_SIZE..META_OFFSET]
             .copy_from_slice(&<[u8; META_PAGE_SIZE]>::from(&valid_node_b));
 
-        let result = MetaNode::read_last_valid_meta_node(&buffer);
+        let result = MetaNode::read_last_valid_meta_node(&buffer).unwrap();
         // Node A should be preferred when sequences are equal
         assert_eq!(result, (valid_node_a, Position::A));
     }

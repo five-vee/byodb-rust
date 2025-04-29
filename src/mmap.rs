@@ -65,6 +65,12 @@ use crate::{
 };
 use meta_node::MetaNode;
 
+#[cfg(not(test))]
+const MIN_UNALIGNED_EXPAND_SIZE: usize = (1 << 14) * consts::PAGE_SIZE;
+
+#[cfg(test)]
+const MIN_UNALIGNED_EXPAND_SIZE: usize = 2 * consts::PAGE_SIZE;
+
 type Result<T> = std::result::Result<T, PageError>;
 
 /// A wrapper around a memory-mapped region (mmap).
@@ -139,7 +145,7 @@ impl Mmap {
         {
             let mut buf = [0u8; meta_node::META_OFFSET];
             let _ = file.read(&mut buf)?;
-            let _ = MetaNode::read_last_valid_meta_node(&buf);
+            let _ = MetaNode::read_last_valid_meta_node(&buf)?;
         }
 
         // Safety: it is assumed that no other process has a mutable mapping to the same file.
@@ -274,8 +280,16 @@ impl WriterState {
             meta_node::META_OFFSET + self.new_offset + consts::PAGE_SIZE - m.len(),
             m.len(),
         );
-        let expand = max(expand, 1 << 26 /* 64MB */);
+        let expand = max(expand, MIN_UNALIGNED_EXPAND_SIZE);
         let new_len = m.len() + expand;
+
+        // Align new_len such that (new_len - META_OFFSET - PAGE_SIZE) % PAGE_SIZE == 0.
+        let new_len = {
+            let x =
+                (new_len - meta_node::META_OFFSET - consts::PAGE_SIZE).div_ceil(consts::PAGE_SIZE);
+            meta_node::META_OFFSET + (x + 1) * consts::PAGE_SIZE
+        };
+
         self.mmap = Arc::new(UnsafeCell::new(m.grow(new_len)));
         true
     }
@@ -283,7 +297,8 @@ impl WriterState {
     /// Flushes only the meta node double buffer of the mmap.
     fn flush_new_meta_node(&mut self, new_root_ptr: usize) {
         let m = self.mmap_mut();
-        let (MetaNode { sequence, .. }, pos) = MetaNode::read_last_valid_meta_node(m.deref());
+        let (MetaNode { sequence, .. }, pos) = MetaNode::read_last_valid_meta_node(m.deref())
+            .expect("there should exist a valid meta node");
         let mut curr = MetaNode {
             signature: meta_node::DB_SIG,
             root_ptr: new_root_ptr,
@@ -319,6 +334,7 @@ impl Store {
     /// Creates a new store from a specified `Mmap`.
     pub fn new(mmap: Mmap) -> Self {
         let num_pages = MetaNode::read_last_valid_meta_node(mmap.deref())
+            .expect("there should exist a valid meta node")
             .0
             .num_pages;
         let offset = num_pages * consts::PAGE_SIZE;
@@ -405,7 +421,9 @@ impl Reader {
 
     /// Reads the last (flushed) valid meta node from the double buffer.
     pub fn read_last_valid_meta_node(&self) -> MetaNode {
-        MetaNode::read_last_valid_meta_node(self.guard.mmap().deref()).0
+        MetaNode::read_last_valid_meta_node(self.guard.mmap().deref())
+            .expect("there should exist a valid meta node")
+            .0
     }
 }
 
@@ -413,6 +431,7 @@ impl Guard for Reader {
     fn read_page(&self, page_num: usize) -> ReadOnlyPage<'_> {
         self.read_page(page_num)
     }
+
     fn read_last_valid_meta_node(&self) -> MetaNode {
         self.read_last_valid_meta_node()
     }
@@ -491,7 +510,9 @@ impl Guard for Writer<'_> {
     }
 
     fn read_last_valid_meta_node(&self) -> MetaNode {
-        MetaNode::read_last_valid_meta_node(self.guard.borrow().mmap().deref()).0
+        MetaNode::read_last_valid_meta_node(self.guard.borrow().mmap().deref())
+            .expect("there should exist a valid meta node")
+            .0
     }
 }
 
@@ -630,13 +651,300 @@ mod tests {
         }
     }
 
-    // TODO: test: create invalid file(s) and make sure open_or_create fails as expected.
-    // TODO: test that writer can read flushed pages and written pages.
-    // TODO: test that writer cannot read non-flushed pages and non-written pages.
-    // TODO: test that reader can read flushed pages.
-    // TODO: test that writer cannot read non-flushed pages, written pages, nor non-written pages.
-    // TODO: test validity of writer's written but non-flushed page after growing.
-    // TODO: test validity of reader's read page after growing.
+    #[test]
+    fn test_open_invalid_file() {
+        use std::io::Write;
+
+        // Test case 1: File too small
+        {
+            let temp_file = NamedTempFile::new().unwrap();
+            let mut file = std::fs::File::create(temp_file.path()).unwrap();
+            // Write less than the minimum required size
+            let small_data = vec![0u8; meta_node::META_OFFSET + consts::PAGE_SIZE - 1];
+            file.write_all(&small_data).unwrap();
+            file.sync_all().unwrap();
+
+            let result = Mmap::open_or_create(temp_file.path());
+            assert!(matches!(result, Err(PageError::InvalidFile(_))));
+        }
+
+        // Test case 2: Incorrect page alignment
+        {
+            let temp_file = NamedTempFile::new().unwrap();
+            let mut file = std::fs::File::create(temp_file.path()).unwrap();
+            let misaligned_data = vec![0u8; meta_node::META_OFFSET + consts::PAGE_SIZE + 1]; // 1 extra byte
+            file.write_all(&misaligned_data).unwrap();
+            file.sync_all().unwrap();
+
+            let result = Mmap::open_or_create(temp_file.path());
+            assert!(matches!(result, Err(PageError::InvalidFile(_))));
+        }
+
+        // Test case 3: Invalid meta node (e.g., zeroed out)
+        {
+            let temp_file = NamedTempFile::new().unwrap();
+            let mut file = std::fs::File::create(temp_file.path()).unwrap();
+            // Write the correct size, but with invalid meta node data (all zeros)
+            let invalid_meta_data = vec![0u8; meta_node::META_OFFSET + consts::PAGE_SIZE];
+            file.write_all(&invalid_meta_data).unwrap();
+            file.sync_all().unwrap();
+
+            let result = Mmap::open_or_create(temp_file.path());
+            assert!(matches!(result, Err(PageError::InvalidFile(_))));
+        }
+    }
+
+    fn run_test_writer_can_read_written_pages(store: Store) {
+        let writer = store.writer();
+        let pattern1 = [0xAA, 0xBB, 0xCC];
+        let edit_offset1 = 10;
+
+        // 1. Test writer can read a page it just wrote (but hasn't flushed).
+        let page1_num = {
+            let mut page = writer.new_page();
+            page[edit_offset1..edit_offset1 + pattern1.len()].copy_from_slice(&pattern1);
+            writer.write_page(page).page_num
+        };
+
+        // Read the written page using the same writer
+        let read_page1 = writer.read_page(page1_num);
+        assert_eq!(
+            &read_page1[edit_offset1..edit_offset1 + pattern1.len()],
+            &pattern1,
+            "Writer should be able to read its own written (but not flushed) page"
+        );
+        drop(read_page1); // Drop the read guard
+
+        // 2. Test writer can read a flushed page.
+        let pattern2 = [0xDD, 0xEE, 0xFF];
+        let edit_offset2 = 20;
+        let page2_num = {
+            let mut page = writer.new_page();
+            page[edit_offset2..edit_offset2 + pattern2.len()].copy_from_slice(&pattern2);
+            let page_num = writer.write_page(page).page_num;
+            writer.flush(page_num); // Flush this page
+            page_num
+        };
+
+        // Read the flushed page using the same writer
+        let read_page2 = writer.read_page(page2_num);
+        assert_eq!(
+            &read_page2[edit_offset2..edit_offset2 + pattern2.len()],
+            &pattern2,
+            "Writer should be able to read a flushed page"
+        );
+        drop(read_page2);
+
+        // 3. Test writer CANNOT read a newly allocated page that hasn't been written yet.
+        let page3 = writer.new_page();
+        drop(page3); // Drop the mutable page guard
+    }
+
+    #[test]
+    fn test_anonymous_writer_can_read_written_pages() {
+        let store = Store::new(Mmap::new_anonymous(1));
+        run_test_writer_can_read_written_pages(store);
+    }
+
+    #[test]
+    fn test_file_writer_can_read_written_pages() {
+        let (store, _temp_file) = new_file_mmap();
+        run_test_writer_can_read_written_pages(store);
+    }
+
+    fn run_test_reader_can_only_read_flushed_pages(store: Store) {
+        let pattern1 = [0x11, 0x22, 0x33];
+        let edit_offset1 = 5;
+        let page1_num;
+
+        // 1. Write and flush a page.
+        {
+            let writer = store.writer();
+            let mut page = writer.new_page();
+            page[edit_offset1..edit_offset1 + pattern1.len()].copy_from_slice(&pattern1);
+            page1_num = writer.write_page(page).page_num;
+            writer.flush(page1_num);
+        } // Writer dropped here
+
+        // 2. Get a reader and verify it can read the flushed page.
+        {
+            let reader1 = store.reader();
+            let read_page1 = reader1.read_page(page1_num);
+            assert_eq!(
+                &read_page1[edit_offset1..edit_offset1 + pattern1.len()],
+                &pattern1,
+                "Reader should be able to read the flushed page"
+            );
+        } // Reader1 dropped here
+
+        // 3. Write another page but DO NOT flush it.
+        let pattern2 = [0x44, 0x55, 0x66];
+        let edit_offset2 = 15;
+        {
+            let writer = store.writer();
+            let mut page = writer.new_page();
+            page[edit_offset2..edit_offset2 + pattern2.len()].copy_from_slice(&pattern2);
+            // No flush here!
+        } // Writer dropped here
+
+        // 4. Get another reader. Verify it can still read the first page,
+        //    but panics when trying to read the second (non-flushed) page.
+        {
+            let reader2 = store.reader();
+            // Can still read the first flushed page
+            let read_page1_again = reader2.read_page(page1_num);
+            assert_eq!(
+                &read_page1_again[edit_offset1..edit_offset1 + pattern1.len()],
+                &pattern1,
+                "Second reader should still be able to read the first flushed page"
+            );
+            drop(read_page1_again);
+        }
+    }
+
+    #[test]
+    fn test_anonymous_reader_can_only_read_flushed_pages() {
+        let store = Store::new(Mmap::new_anonymous(1));
+        run_test_reader_can_only_read_flushed_pages(store);
+    }
+
+    #[test]
+    fn test_file_reader_can_only_read_flushed_pages() {
+        let (store, _temp_file) = new_file_mmap();
+        run_test_reader_can_only_read_flushed_pages(store);
+    }
+
+    fn run_test_writer_can_read_written_page_even_after_growing(store: Store) {
+        let writer = store.writer();
+        let pattern = [0xBE, 0xEF, 0xCA, 0xFE];
+        let edit_offset = 30;
+
+        // 1. Write a page and keep the ReadOnlyPage handle.
+        let page1 = {
+            let mut page = writer.new_page();
+            page[edit_offset..edit_offset + pattern.len()].copy_from_slice(&pattern);
+            writer.write_page(page) // Keep the ReadOnlyPage handle
+        };
+
+        // Verify initial read is okay
+        assert_eq!(
+            &page1[edit_offset..edit_offset + pattern.len()],
+            &pattern,
+            "Initial read of written page should work"
+        );
+
+        // 2. Allocate enough new pages to trigger growth.
+        // Assuming the store starts with 1 page, the second new_page call should trigger growth.
+        // Let's allocate a few more just to be sure, depending on initial size.
+        let initial_len = writer.guard.borrow().mmap().len();
+        let mut pages_allocated = 0;
+        loop {
+            let current_len = writer.guard.borrow().mmap().len();
+            if current_len > initial_len {
+                println!(
+                    "Growth triggered after allocating {} pages. Initial len: {}, Current len: {}",
+                    pages_allocated, initial_len, current_len
+                );
+                break; // Growth occurred
+            }
+            if pages_allocated > 10 {
+                // Safety break
+                panic!("Growth did not trigger after allocating 10 pages. Initial len: {}, Current len: {}", initial_len, current_len);
+            }
+            let _ = writer.new_page(); // Allocate a new page
+            pages_allocated += 1;
+        }
+
+        // 3. Verify that the original ReadOnlyPage handle is still valid and readable.
+        // Accessing page1.deref() implicitly checks if the pointer is still valid.
+        assert_eq!(
+            &page1[edit_offset..edit_offset + pattern.len()],
+            &pattern,
+            "Read after growth should still work and match the original pattern"
+        );
+    }
+
+    #[test]
+    fn test_anonymous_writer_can_read_written_page_even_after_growing() {
+        let store = Store::new(Mmap::new_anonymous(1));
+        run_test_writer_can_read_written_page_even_after_growing(store);
+    }
+
+    #[test]
+    fn test_file_writer_can_read_written_page_even_after_growing() {
+        let (store, _temp_file) = new_file_mmap();
+        run_test_writer_can_read_written_page_even_after_growing(store);
+    }
+
+    fn run_test_reader_can_read_flushed_page_even_after_growing(store: Store) {
+        let pattern = [0xFA, 0xCE, 0xB0, 0x0C];
+        let edit_offset = 40;
+        let page1_num;
+
+        // 1. Write and flush a page.
+        {
+            let writer = store.writer();
+            let mut page = writer.new_page();
+            page[edit_offset..edit_offset + pattern.len()].copy_from_slice(&pattern);
+            page1_num = writer.write_page(page).page_num;
+            writer.flush(page1_num);
+        } // Writer dropped here
+
+        // 2. Get a reader and obtain a ReadOnlyPage handle for the flushed page.
+        let reader = store.reader();
+        let page1_handle = reader.read_page(page1_num);
+
+        // Verify initial read is okay
+        assert_eq!(
+            &page1_handle[edit_offset..edit_offset + pattern.len()],
+            &pattern,
+            "Initial read of flushed page by reader should work"
+        );
+
+        // 3. Get another writer and trigger growth by allocating new pages.
+        {
+            let writer2 = store.writer();
+            let initial_len = writer2.guard.borrow().mmap().len();
+            let mut pages_allocated = 0;
+            loop {
+                let current_len = writer2.guard.borrow().mmap().len();
+                if current_len > initial_len {
+                    println!(
+                        "Growth triggered after allocating {} pages. Initial len: {}, Current len: {}",
+                        pages_allocated, initial_len, current_len
+                    );
+                    break; // Growth occurred
+                }
+                if pages_allocated > 10 {
+                    // Safety break
+                    panic!("Growth did not trigger after allocating 10 pages. Initial len: {}, Current len: {}", initial_len, current_len);
+                }
+                let _ = writer2.new_page(); // Allocate a new page
+                pages_allocated += 1;
+            }
+            // Writer2 is dropped here, potentially releasing the lock
+        }
+
+        // 4. Verify that the original reader's ReadOnlyPage handle is still valid and readable.
+        // Accessing page1_handle.deref() implicitly checks if the pointer is still valid.
+        assert_eq!(
+            &page1_handle[edit_offset..edit_offset + pattern.len()],
+            &pattern,
+            "Reader's handle read after growth should still work and match the original pattern"
+        );
+    }
+
+    #[test]
+    fn test_anonymous_reader_can_read_flushed_page_even_after_growing() {
+        let store = Store::new(Mmap::new_anonymous(1));
+        run_test_reader_can_read_flushed_page_even_after_growing(store);
+    }
+
+    #[test]
+    fn test_file_reader_can_read_flushed_page_even_after_growing() {
+        let (store, _temp_file) = new_file_mmap();
+        run_test_reader_can_read_flushed_page_even_after_growing(store);
+    }
 
     fn run_test_store_can_read_after_flush(store: Store) {
         let writer = store.writer();
