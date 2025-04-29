@@ -25,8 +25,15 @@ https://build-your-own.org/database/, but instead of Go, use Rust. This a person
 
 ## [06. Append-Only KV Store](https://build-your-own.org/database/06_btree_disk)
 
-* [ ] 6.2 Two-phase update
-* [ ] 6.3 Database on a file
-* [ ] 6.4 Manage disk pages
-* [ ] 6.5 The meta page
-* [ ] 6.6 Error handling
+* [x] 6.2 Two-phase update
+* [x] 6.3 Database on a file
+* [x] 6.4 Manage disk pages
+* [x] 6.5 The meta page
+* [x] 6.6 Error handling
+
+## [0.7 Free List: Recyle & Reuse](https://build-your-own.org/database/07_free_list)
+
+* [ ] 7.1 Memory management techniques
+* [ ] 7.2 Linked list on disk
+* [ ] 7.3 Free list implementation
+* [ ] 7.4 KV with a free list
