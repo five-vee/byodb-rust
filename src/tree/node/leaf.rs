@@ -3,7 +3,7 @@ use std::ops::Deref as _;
 
 use crate::consts;
 use crate::error::NodeError;
-use crate::mmap::{Guard, Page, ReadOnlyPage, Reader, Writer};
+use crate::mmap::{Guard, Page, ReadOnlyPage, Writer};
 
 use super::header::{self, NodeType};
 

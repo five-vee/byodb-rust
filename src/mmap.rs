@@ -41,6 +41,7 @@
 //!
 //! Though this module doesn't support MVCC transactions out of the box,
 //! the abstractions provided can be used to build transactions.
+mod free_list;
 mod meta_node;
 
 use std::{
@@ -258,8 +259,9 @@ impl WriterState {
         let m = self.mmap_mut();
         let curr = MetaNode {
             signature: meta_node::DB_SIG,
-            root_ptr: new_root_ptr,
+            root_page: new_root_ptr,
             num_pages: self.flush_offset / consts::PAGE_SIZE,
+            ..Default::default()
         };
         curr.copy_to_slice(m.deref_mut());
         m.flush();
@@ -321,7 +323,7 @@ impl Store {
     pub fn writer(&self) -> Writer<'_> {
         Writer {
             guard: RefCell::new(self.writer.lock().unwrap()),
-            store: self,
+            reader: &self.reader,
         }
     }
 }
@@ -391,7 +393,7 @@ impl Guard for Reader {
 /// from the Writer via the flushing mechanism.
 pub struct Writer<'s> {
     guard: RefCell<MutexGuard<'s, WriterState>>,
-    store: &'s Store,
+    reader: &'s ArcSwap<ReaderState>,
 }
 
 impl Writer<'_> {
@@ -409,10 +411,13 @@ impl Writer<'_> {
     }
 
     /// Finalizes a page, marking it read-only.
-    /// This does NOT make the page available to readers; it must be flushed first.
+    /// This does NOT guarantee to make the page available to readers;
+    /// the page must be flushed first.
     pub fn write_page<'w>(&'w self, page: Page<'w>) -> ReadOnlyPage<'w> {
         let mut guard = self.guard.borrow_mut();
-        guard.write_offset += consts::PAGE_SIZE;
+        if page.page_num * consts::PAGE_SIZE >= guard.write_offset {
+            guard.write_offset += consts::PAGE_SIZE;
+        }
         ReadOnlyPage {
             _phantom: PhantomData,
             mmap: page.mmap,
@@ -429,10 +434,25 @@ impl Writer<'_> {
         }
         guard.flush_pages();
         guard.flush_new_meta_node(new_root_ptr);
-        self.store.reader.store(Arc::new(ReaderState {
+        self.reader.store(Arc::new(ReaderState {
             mmap: guard.mmap.clone(),
             flush_offset: guard.flush_offset,
         }));
+    }
+
+    /// Retrieves an existing page and allows the user to write to it.
+    /// This is unsafe b/c it can allow overwriting data that is assumed to be
+    /// immutable. As such, please only use this on non-B+-tree pages,
+    /// i.e. free list pages.
+    pub unsafe fn overwrite_page(&self, page_num: usize) -> Page<'_> {
+        let guard = self.guard.borrow();
+        // The requested page must already been flushed or written already.
+        assert!(page_num * consts::PAGE_SIZE < guard.write_offset);
+        Page {
+            _phantom: PhantomData,
+            mmap: guard.mmap.clone(),
+            page_num,
+        }
     }
 }
 
@@ -578,7 +598,7 @@ mod tests {
             // Verify the meta node
             let meta = reader.read_meta_node();
             assert_eq!(
-                meta.root_ptr, page_num,
+                meta.root_page, page_num,
                 "Root pointer should match the flushed page number"
             );
 

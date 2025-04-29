@@ -5,9 +5,18 @@
 //!
 //! The meta node has the following format on disk:
 //!
+//! Old format:
+//!
 //! ```ignore
-//! | signature | root_ptr | num_pages | sequence | checksum | unused |
-//! |    16B    |    8B    |     8B    |    8B    |    4B    |   20B  |
+//! | signature | root_page | num_pages |
+//! |    16B    |     8B    |     8B    |
+//! ```
+//!
+//! New format:
+//!
+//! ```ignore
+//! | signature | root_page | num_pages | head_page | head_seq | tail_page | tail_seq |
+//! |    16B    |     8B    |     8B    |    8B     |    8B    |     8B    |    8B    |
 //! ```
 use crate::error::PageError;
 use std::{convert::TryFrom, ptr, rc::Rc};
@@ -37,7 +46,7 @@ pub struct MetaNode {
     pub signature: [u8; 16],
 
     /// Which page represents the root of the B+ tree.
-    pub root_ptr: usize,
+    pub root_page: usize,
 
     /// How many pages are utilized by the memory map.
     /// Note that `num_pages` is NOT the number of nodes/pages in the B+ tree.
@@ -46,19 +55,36 @@ pub struct MetaNode {
     /// are no free nodes in the free list, a new page can be allocated, and so
     /// will the `num_pages` counter.
     pub num_pages: usize,
+
+    /// Which page represents the head node of the free list.
+    pub head_page: usize,
+
+    /// A monotonically increasing sequence number representing the index into
+    /// the free list that represents the first free page pointed to by the
+    /// head node.
+    pub head_seq: usize,
+
+    /// Which page represents the tail node of the free list.
+    pub tail_page: usize,
+
+    /// A monotonically increasing sequence number representing the index into
+    /// the free list that represents the last free page pointed to by the
+    /// tail node.
+    pub tail_seq: usize,
 }
 
 impl MetaNode {
     /// Creates a new meta node representing a completely empty mmap file that
     /// has 1 page, the B+ tree as a leaf node with no key-values.
     pub fn new() -> Self {
-        let mut node = Self::default();
-        node.signature = DB_SIG;
-        node.num_pages = 1;
-        node
+        MetaNode {
+            signature: DB_SIG,
+            num_pages: 1,
+            ..Default::default()
+        }
     }
 
-    /// Determines if the meta node has a valid signature and checksum.
+    /// Determines if the meta node has a valid signature.
     pub fn valid(&self) -> bool {
         self.signature == DB_SIG
     }
@@ -66,7 +92,7 @@ impl MetaNode {
     /// Writes a meta node to beginning of the slice.
     pub fn copy_to_slice(&self, slice: &mut [u8]) {
         let page: [u8; META_PAGE_SIZE] = self.into();
-        slice[0..0 + META_PAGE_SIZE].copy_from_slice(&page);
+        slice[0..META_PAGE_SIZE].copy_from_slice(&page);
     }
 }
 
@@ -131,12 +157,12 @@ mod tests {
 
     // Helper to create a valid node with a specific sequence number
     fn create_valid_node() -> MetaNode {
-        let mut node = MetaNode {
+        MetaNode {
             signature: DB_SIG,
-            root_ptr: 1,
+            root_page: 1,
             num_pages: 1,
-        };
-        node
+            ..Default::default()
+        }
     }
 
     // Helper to create an invalid node (bad signature)
@@ -150,8 +176,9 @@ mod tests {
     fn test_meta_node_try_from_valid() {
         let original_meta = MetaNode {
             signature: DB_SIG,
-            root_ptr: 1024,
+            root_page: 1024,
             num_pages: 5,
+            ..Default::default()
         };
         // Create the buffer using the From implementation
         let buffer: [u8; META_PAGE_SIZE] = (&original_meta).into();
@@ -168,7 +195,7 @@ mod tests {
         let node = MetaNode::new();
         // Check default values and signature
         assert_eq!(node.signature, DB_SIG);
-        assert_eq!(node.root_ptr, 0);
+        assert_eq!(node.root_page, 0);
         assert_eq!(node.num_pages, 1);
         assert!(node.valid());
     }
@@ -181,7 +208,7 @@ mod tests {
 
     #[test]
     fn test_meta_node_valid_false_sig() {
-        let mut node = create_invalid_node();
+        let node = create_invalid_node();
         assert!(!node.valid());
     }
 

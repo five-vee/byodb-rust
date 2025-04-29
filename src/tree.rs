@@ -50,7 +50,7 @@ pub struct Tree<'g, G: Guard> {
 impl<'g, G: Guard> Tree<'g, G> {
     /// Loads the root of the tree found in the store.
     pub fn new(guard: &'g G) -> Self {
-        let root_ptr = guard.read_meta_node().root_ptr;
+        let root_ptr = guard.read_meta_node().root_page;
         Tree {
             page_num: root_ptr,
             guard,
@@ -426,7 +426,10 @@ impl<'g, G: Guard> Iterator for InOrder<'g, G> {
 mod tests {
     use tempfile::NamedTempFile;
 
-    use crate::{consts, mmap::{Mmap, Store}};
+    use crate::{
+        consts,
+        mmap::{Mmap, Store},
+    };
 
     use super::*;
 
