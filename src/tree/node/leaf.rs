@@ -502,19 +502,24 @@ fn set_next_offset(page: &mut [u8], i: usize, key: &[u8], val: &[u8]) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::NamedTempFile;
+
     use crate::mmap::{Mmap, Store};
 
     use super::*;
 
-    fn new_test_store() -> (Store, usize) {
-        let store = Store::new(Mmap::new_anonymous(1));
-        let root_ptr = 0;
-        (store, root_ptr)
+    fn new_test_store() -> (Store, NamedTempFile, usize) {
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path();
+        println!("Created temporary file {path:?}");
+        let mmap = Mmap::open_or_create(path).unwrap();
+        let store = Store::new(mmap);
+        (store, temp_file, 0)
     }
 
     #[test]
     fn test_insert_intact() {
-        let (store, root_ptr) = new_test_store();
+        let (store, _temp_file, root_ptr) = new_test_store();
         let reader = store.reader();
         let writer = store.writer();
 
@@ -531,7 +536,7 @@ mod tests {
 
     #[test]
     fn test_insert_max_key_size() {
-        let (store, root_ptr) = new_test_store();
+        let (store, _temp_file, root_ptr) = new_test_store();
         let reader = store.reader();
         let writer = store.writer();
 
@@ -542,7 +547,7 @@ mod tests {
 
     #[test]
     fn test_insert_max_value_size() {
-        let (store, root_ptr) = new_test_store();
+        let (store, _temp_file, root_ptr) = new_test_store();
         let reader = store.reader();
         let writer = store.writer();
 
@@ -555,7 +560,7 @@ mod tests {
 
     #[test]
     fn test_insert_split() {
-        let (store, root_ptr) = new_test_store();
+        let (store, _temp_file, root_ptr) = new_test_store();
         let reader = store.reader();
         let writer = store.writer();
 
@@ -580,7 +585,7 @@ mod tests {
 
     #[test]
     fn test_find_some() {
-        let (store, _) = new_test_store();
+        let (store, _temp_file, _root_ptr) = new_test_store();
         let writer = store.writer();
 
         let leaf = Builder::new(&writer, 1)
@@ -591,7 +596,7 @@ mod tests {
 
     #[test]
     fn test_find_none() {
-        let (store, root_ptr) = new_test_store();
+        let (store, _temp_file, root_ptr) = new_test_store();
         let reader = store.reader();
 
         let leaf = Leaf::read(&reader, root_ptr);
@@ -600,7 +605,7 @@ mod tests {
 
     #[test]
     fn test_iter() {
-        let (store, _) = new_test_store();
+        let (store, _temp_file, _root_ptr) = new_test_store();
         let writer = store.writer();
 
         let leaf = Builder::new(&writer, 2)
@@ -619,7 +624,7 @@ mod tests {
 
     #[test]
     fn test_iter_empty() {
-        let (store, root_ptr) = new_test_store();
+        let (store, _temp_file, root_ptr) = new_test_store();
         let reader = store.reader();
 
         let leaf = Leaf::read(&reader, root_ptr);
@@ -628,7 +633,7 @@ mod tests {
 
     #[test]
     fn test_update_intact() {
-        let (store, _) = new_test_store();
+        let (store, _temp_file, _root_ptr) = new_test_store();
         let writer = store.writer();
 
         let leaf = Builder::new(&writer, 2)
@@ -653,7 +658,7 @@ mod tests {
 
     #[test]
     fn test_update_split() {
-        let (store, _) = new_test_store();
+        let (store, _temp_file, _root_ptr) = new_test_store();
         let writer = store.writer();
 
         let leaf = Builder::new(&writer, 2)
@@ -681,7 +686,7 @@ mod tests {
 
     #[test]
     fn test_update_max_key_size() {
-        let (store, root_ptr) = new_test_store();
+        let (store, _temp_file, root_ptr) = new_test_store();
         let reader = store.reader();
         let writer = store.writer();
 
@@ -692,7 +697,7 @@ mod tests {
 
     #[test]
     fn test_update_max_value_size() {
-        let (store, _) = new_test_store();
+        let (store, _temp_file, _root_ptr) = new_test_store();
         let writer = store.writer();
 
         let leaf = Builder::new(&writer, 1)
@@ -708,7 +713,7 @@ mod tests {
 
     #[test]
     fn test_update_non_existent() {
-        let (store, root_ptr) = new_test_store();
+        let (store, _temp_file, root_ptr) = new_test_store();
         let reader = store.reader();
         let writer = store.writer();
 
@@ -719,7 +724,7 @@ mod tests {
 
     #[test]
     fn test_delete_intact() {
-        let (store, _) = new_test_store();
+        let (store, _temp_file, _root_ptr) = new_test_store();
         let writer = store.writer();
 
         let leaf = Builder::new(&writer, 2)
@@ -741,7 +746,7 @@ mod tests {
 
     #[test]
     fn test_delete_empty() {
-        let (store, _) = new_test_store();
+        let (store, _temp_file, _root_ptr) = new_test_store();
         let writer = store.writer();
 
         let leaf = Builder::new(&writer, 1)
@@ -754,7 +759,7 @@ mod tests {
 
     #[test]
     fn test_delete_non_existent() {
-        let (store, root_ptr) = new_test_store();
+        let (store, _temp_file, root_ptr) = new_test_store();
         let reader = store.reader();
         let writer = store.writer();
 
@@ -764,7 +769,7 @@ mod tests {
 
     #[test]
     fn test_steal_or_merge_steal() {
-        let (store, _) = new_test_store();
+        let (store, _temp_file, _root_ptr) = new_test_store();
         let writer = store.writer();
 
         let left = Builder::new(&writer, 1)
@@ -798,7 +803,7 @@ mod tests {
 
     #[test]
     fn test_steal_or_merge_merge() {
-        let (store, _) = new_test_store();
+        let (store, _temp_file, _root_ptr) = new_test_store();
         let writer = store.writer();
 
         let left = Builder::new(&writer, 1).add_key_value(&[1], &[1]).build();

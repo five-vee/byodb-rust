@@ -462,17 +462,24 @@ fn get_num_bytes(page: &[u8]) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::NamedTempFile;
+
     use crate::mmap::{Mmap, Store};
 
     use super::*;
 
-    fn new_test_store() -> Store {
-        Store::new(Mmap::new_anonymous(1))
+    fn new_test_store() -> (Store, NamedTempFile) {
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path();
+        println!("Created temporary file {path:?}");
+        let mmap = Mmap::open_or_create(path).unwrap();
+        let store = Store::new(mmap);
+        (store, temp_file)
     }
 
     #[test]
     fn test_parent_of_split() {
-        let store = new_test_store();
+        let (store, _temp_file) = new_test_store();
         let writer = store.writer();
         let parent =
             Internal::parent_of_split(&writer, ["key1".as_bytes(), "key2".as_bytes()], [111, 222]);
@@ -484,7 +491,7 @@ mod tests {
 
     #[test]
     fn test_merge_child_entries_intact() {
-        let store = new_test_store();
+        let (store, _temp_file) = new_test_store();
         let writer = store.writer();
         let node =
             Internal::parent_of_split(&writer, ["key1".as_bytes(), "key2".as_bytes()], [111, 222]);
@@ -521,7 +528,7 @@ mod tests {
 
     #[test]
     fn test_merge_child_entries_insert_split() {
-        let store = new_test_store();
+        let (store, _temp_file) = new_test_store();
         let writer = store.writer();
         let node = Builder::new(&writer, 4)
             .add_child_entry(&[0; consts::MAX_KEY_SIZE], 0)
@@ -555,7 +562,7 @@ mod tests {
 
     #[test]
     fn test_merge_child_entries_update_split() {
-        let store = new_test_store();
+        let (store, _temp_file) = new_test_store();
         let writer = store.writer();
         let node = Builder::new(&writer, 5)
             .add_child_entry(&[0; consts::MAX_KEY_SIZE], 0)
@@ -591,7 +598,7 @@ mod tests {
 
     #[test]
     fn test_steal_or_merge_steal() {
-        let store = new_test_store();
+        let (store, _temp_file) = new_test_store();
         let writer = store.writer();
         let left = Builder::new(&writer, 1)
             .add_child_entry(&[1; consts::MAX_KEY_SIZE], 1)
@@ -622,7 +629,7 @@ mod tests {
 
     #[test]
     fn test_steal_or_merge_merge() {
-        let store = new_test_store();
+        let (store, _temp_file) = new_test_store();
         let writer = store.writer();
         let left = Builder::new(&writer, 1).add_child_entry(&[1], 1).build();
         let right = Builder::new(&writer, 2)
@@ -639,7 +646,7 @@ mod tests {
 
     #[test]
     fn test_find() {
-        let store = new_test_store();
+        let (store, _temp_file) = new_test_store();
         let writer = store.writer();
         let node = Builder::new(&writer, 2)
             .add_child_entry(&[1], 1)

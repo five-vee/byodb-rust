@@ -98,7 +98,12 @@ impl MetaNode {
 
     /// Reads the last (flushed) valid meta node from the double buffer.
     pub fn read_last_valid_meta_node(slice: &[u8]) -> Result<(Self, Position)> {
-        assert!(slice.len() >= META_OFFSET, "no valid meta node found");
+        // assert!(slice.len() >= META_OFFSET, "no valid meta node found");
+        if slice.len() < META_OFFSET {
+            return Err(PageError::InvalidFile(
+                format!("meta node prelude is too short: {}", slice.len()).into(),
+            ));
+        }
         let node_a: MetaNode = slice[..META_PAGE_SIZE].try_into().unwrap();
         let node_b: MetaNode = slice[META_PAGE_SIZE..META_OFFSET].try_into().unwrap();
         let (node, pos) = match (node_a, node_b) {
@@ -277,14 +282,15 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
     fn test_read_last_valid_meta_node_too_small() {
         let buffer = [0u8; META_OFFSET - 1];
-        let _ = MetaNode::read_last_valid_meta_node(&buffer);
+        assert!(matches!(
+            MetaNode::read_last_valid_meta_node(&buffer),
+            Err(PageError::InvalidFile(_))
+        ));
     }
 
     #[test]
-    #[should_panic]
     fn test_read_last_valid_meta_node_none_valid() {
         let mut buffer = [0u8; META_OFFSET];
         let invalid_node_a = create_invalid_node(1);
@@ -292,8 +298,10 @@ mod tests {
         buffer[..META_PAGE_SIZE].copy_from_slice(&<[u8; META_PAGE_SIZE]>::from(&invalid_node_a));
         buffer[META_PAGE_SIZE..META_OFFSET]
             .copy_from_slice(&<[u8; META_PAGE_SIZE]>::from(&invalid_node_b));
-
-        let _ = MetaNode::read_last_valid_meta_node(&buffer);
+        assert!(matches!(
+            MetaNode::read_last_valid_meta_node(&buffer),
+            Err(PageError::InvalidFile(_))
+        ));
     }
 
     #[test]

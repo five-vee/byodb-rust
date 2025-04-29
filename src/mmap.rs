@@ -49,7 +49,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{Read, Seek, Write as _},
     marker::PhantomData,
-    ops::{Deref, DerefMut, Range},
+    ops::{Deref, DerefMut},
     path::Path,
     rc::Rc,
     sync::{Arc, Mutex, MutexGuard},
@@ -66,17 +66,17 @@ use crate::{
 use meta_node::MetaNode;
 
 #[cfg(not(test))]
-const MIN_UNALIGNED_EXPAND_SIZE: usize = (1 << 14) * consts::PAGE_SIZE;
+const MIN_FILE_GROWTH_SIZE: usize = (1 << 14) * consts::PAGE_SIZE;
 
 #[cfg(test)]
-const MIN_UNALIGNED_EXPAND_SIZE: usize = 2 * consts::PAGE_SIZE;
+const MIN_FILE_GROWTH_SIZE: usize = 2 * consts::PAGE_SIZE;
 
 type Result<T> = std::result::Result<T, PageError>;
 
 /// A wrapper around a memory-mapped region (mmap).
 /// It is optionally backed by a file.
 pub struct Mmap {
-    file: Option<Rc<RefCell<File>>>,
+    file: Rc<RefCell<File>>,
     mmap: MmapMut,
 }
 
@@ -94,21 +94,6 @@ impl DerefMut for Mmap {
 }
 
 impl Mmap {
-    /// Creates an anonymous mmap (i.e. not backed by file).
-    /// `num_pages` must be at least 1.
-    pub fn new_anonymous(num_pages: usize) -> Self {
-        let num_pages = if num_pages == 0 { 1 } else { num_pages };
-        let mut mmap = MmapOptions::new()
-            .len(meta_node::META_OFFSET + num_pages * consts::PAGE_SIZE)
-            .map_anon()
-            .unwrap();
-        MetaNode::new().copy_to_slice(mmap.deref_mut(), meta_node::Position::A);
-        init_empty_leaf(
-            &mut mmap[meta_node::META_OFFSET..meta_node::META_OFFSET + consts::PAGE_SIZE],
-        );
-        Mmap { file: None, mmap }
-    }
-
     /// Opens or creates (if not exists) a file that holds a B+ tree.
     pub fn open_or_create<P: AsRef<Path>>(path: P) -> Result<Self> {
         let mut file = OpenOptions::new()
@@ -135,12 +120,6 @@ impl Mmap {
                 "file must be at least 2 meta page sizes + 1 page".into(),
             ));
         }
-        if (file_len - meta_node::META_OFFSET - consts::PAGE_SIZE) % consts::PAGE_SIZE != 0 {
-            return Err(PageError::InvalidFile(
-                "file size must be 2 meta pages + 1 page, plus another multiple of page size"
-                    .into(),
-            ));
-        }
         // There must be at least 1 valid meta node.
         {
             let mut buf = [0u8; meta_node::META_OFFSET];
@@ -152,17 +131,14 @@ impl Mmap {
         let mmap = unsafe { MmapOptions::new().map_mut(&file).unwrap() };
 
         Ok(Mmap {
-            file: Some(Rc::new(RefCell::new(file))),
+            file: Rc::new(RefCell::new(file)),
             mmap,
         })
     }
 
     /// Flushes all written pages to the file (if exists), thereby making them
     /// available to read by new readers.
-    fn flush(&self, range: Range<usize>) {
-        if self.file.is_none() || range.is_empty() {
-            return; // Nothing to flush
-        }
+    fn flush(&self) {
         // Flush the aligned range
         self.mmap
             .flush()
@@ -172,21 +148,16 @@ impl Mmap {
     /// Grows the mmap region (and file, if exists) to `new_len`.
     /// This is needed if the mmap cannot allocate more new pages.
     fn grow(&self, new_len: usize) -> Self {
-        // let mut mmap_opts = MmapOptions::new(new_len).expect("new_len > 0");
-        let mut mmap_opts = MmapOptions::new();
-
-        let mmap = match &self.file {
-            None => {
-                let mut mmap = mmap_opts.len(new_len).map_anon().unwrap();
-                mmap[..self.mmap.len()].copy_from_slice(self.mmap.deref());
-                mmap
-            }
-            Some(f) => {
-                f.borrow()
-                    .set_len(new_len as u64)
-                    .expect("file can grow in size");
-                // Safety: it is assumed that no other process has a mutable mapping to the same file.
-                unsafe { mmap_opts.map_mut(&*f.as_ptr()) }.expect("mmap is correctly created")
+        let mmap = {
+            self.file
+                .borrow()
+                .set_len(new_len as u64)
+                .expect("file can grow in size");
+            // Safety: it is assumed that no other process has a mutable mapping to the same file.
+            unsafe {
+                MmapOptions::new()
+                    .map_mut(&*self.file.as_ptr())
+                    .expect("mmap is correctly created")
             }
         };
         Mmap {
@@ -263,9 +234,7 @@ impl WriterState {
     /// Flushes only the B+ tree pages portion of the mmap.
     fn flush_pages(&mut self) {
         let m = self.mmap_mut();
-        let range =
-            meta_node::META_OFFSET + self.flush_offset..meta_node::META_OFFSET + self.write_offset;
-        m.flush(range);
+        m.flush();
         self.flush_offset = self.write_offset;
     }
 
@@ -276,20 +245,10 @@ impl WriterState {
         if meta_node::META_OFFSET + self.new_offset + consts::PAGE_SIZE <= m.len() {
             return false;
         }
-        let expand = max(
-            meta_node::META_OFFSET + self.new_offset + consts::PAGE_SIZE - m.len(),
-            m.len(),
-        );
-        let expand = max(expand, MIN_UNALIGNED_EXPAND_SIZE);
+        let expand = max(m.len(), MIN_FILE_GROWTH_SIZE);
         let new_len = m.len() + expand;
 
-        // Align new_len such that (new_len - META_OFFSET - PAGE_SIZE) % PAGE_SIZE == 0.
-        let new_len = {
-            let x =
-                (new_len - meta_node::META_OFFSET - consts::PAGE_SIZE).div_ceil(consts::PAGE_SIZE);
-            meta_node::META_OFFSET + (x + 1) * consts::PAGE_SIZE
-        };
-
+        m.flush();
         self.mmap = Arc::new(UnsafeCell::new(m.grow(new_len)));
         true
     }
@@ -308,7 +267,7 @@ impl WriterState {
         };
         curr.checksum = curr.checksum();
         curr.copy_to_slice(m.deref_mut(), pos.next());
-        m.flush(0..meta_node::META_OFFSET);
+        m.flush();
     }
 }
 
@@ -694,7 +653,9 @@ mod tests {
         }
     }
 
-    fn run_test_writer_can_read_written_pages(store: Store) {
+    #[test]
+    fn test_writer_can_read_written_pages() {
+        let (store, _temp_file) = new_file_mmap();
         let writer = store.writer();
         let pattern1 = [0xAA, 0xBB, 0xCC];
         let edit_offset1 = 10;
@@ -741,18 +702,8 @@ mod tests {
     }
 
     #[test]
-    fn test_anonymous_writer_can_read_written_pages() {
-        let store = Store::new(Mmap::new_anonymous(1));
-        run_test_writer_can_read_written_pages(store);
-    }
-
-    #[test]
-    fn test_file_writer_can_read_written_pages() {
+    fn test_reader_can_only_read_flushed_pages() {
         let (store, _temp_file) = new_file_mmap();
-        run_test_writer_can_read_written_pages(store);
-    }
-
-    fn run_test_reader_can_only_read_flushed_pages(store: Store) {
         let pattern1 = [0x11, 0x22, 0x33];
         let edit_offset1 = 5;
         let page1_num;
@@ -803,18 +754,8 @@ mod tests {
     }
 
     #[test]
-    fn test_anonymous_reader_can_only_read_flushed_pages() {
-        let store = Store::new(Mmap::new_anonymous(1));
-        run_test_reader_can_only_read_flushed_pages(store);
-    }
-
-    #[test]
-    fn test_file_reader_can_only_read_flushed_pages() {
+    fn test_writer_can_read_written_page_even_after_growing() {
         let (store, _temp_file) = new_file_mmap();
-        run_test_reader_can_only_read_flushed_pages(store);
-    }
-
-    fn run_test_writer_can_read_written_page_even_after_growing(store: Store) {
         let writer = store.writer();
         let pattern = [0xBE, 0xEF, 0xCA, 0xFE];
         let edit_offset = 30;
@@ -865,18 +806,8 @@ mod tests {
     }
 
     #[test]
-    fn test_anonymous_writer_can_read_written_page_even_after_growing() {
-        let store = Store::new(Mmap::new_anonymous(1));
-        run_test_writer_can_read_written_page_even_after_growing(store);
-    }
-
-    #[test]
-    fn test_file_writer_can_read_written_page_even_after_growing() {
+    fn test_reader_can_read_flushed_page_even_after_growing() {
         let (store, _temp_file) = new_file_mmap();
-        run_test_writer_can_read_written_page_even_after_growing(store);
-    }
-
-    fn run_test_reader_can_read_flushed_page_even_after_growing(store: Store) {
         let pattern = [0xFA, 0xCE, 0xB0, 0x0C];
         let edit_offset = 40;
         let page1_num;
@@ -935,18 +866,8 @@ mod tests {
     }
 
     #[test]
-    fn test_anonymous_reader_can_read_flushed_page_even_after_growing() {
-        let store = Store::new(Mmap::new_anonymous(1));
-        run_test_reader_can_read_flushed_page_even_after_growing(store);
-    }
-
-    #[test]
-    fn test_file_reader_can_read_flushed_page_even_after_growing() {
+    fn test_store_can_read_after_flush() {
         let (store, _temp_file) = new_file_mmap();
-        run_test_reader_can_read_flushed_page_even_after_growing(store);
-    }
-
-    fn run_test_store_can_read_after_flush(store: Store) {
         let writer = store.writer();
         let mut page = writer.new_page();
         assert_eq!(page.len(), consts::PAGE_SIZE);
@@ -975,18 +896,9 @@ mod tests {
     }
 
     #[test]
-    fn test_anonymous_store_can_read_after_flush() {
-        let store = Store::new(Mmap::new_anonymous(1));
-        run_test_store_can_read_after_flush(store);
-    }
-
-    #[test]
-    fn test_file_store_can_read_after_flush() {
+    #[should_panic]
+    fn test_store_cannot_read_before_flush() {
         let (store, _temp_file) = new_file_mmap();
-        run_test_store_can_read_after_flush(store);
-    }
-
-    fn run_test_store_cannot_read_before_flush(store: Store) {
         let writer = store.writer();
         let page = writer.new_page();
         let page_num = writer.write_page(page).page_num;
@@ -1000,20 +912,8 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
-    fn test_anonymous_store_cannot_read_before_flush() {
-        let store = Store::new(Mmap::new_anonymous(1));
-        run_test_store_cannot_read_before_flush(store);
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_file_store_cannot_read_before_flush() {
+    fn test_store_flush_increases_sequence() {
         let (store, _temp_file) = new_file_mmap();
-        run_test_store_cannot_read_before_flush(store);
-    }
-
-    fn run_test_store_flush_increases_sequence(store: Store) {
         let dummy_root_ptr = 0;
         let seq0 = store.reader().sequence();
         let mut prev_reader_seq = seq0;
@@ -1045,19 +945,8 @@ mod tests {
     }
 
     #[test]
-    fn test_anonymous_store_flush_increases_sequence() {
-        let store = Store::new(Mmap::new_anonymous(1));
-        run_test_store_flush_increases_sequence(store);
-    }
-
-    #[test]
-    fn test_file_store_flush_increases_sequence() {
+    fn test_store_reader_writer_isolation() {
         let (store, _temp_file) = new_file_mmap();
-        run_test_store_flush_increases_sequence(store);
-    }
-
-    // Test if the following compiles: concurrent readers and writers.
-    fn run_test_store_reader_writer_isolation(store: Store) {
         use std::thread;
 
         let mut threads = vec![];
@@ -1098,17 +987,5 @@ mod tests {
         for t in threads {
             let _ = t.join();
         }
-    }
-
-    #[test]
-    fn test_anonymous_store_reader_writer_isolation() {
-        let store = Store::new(Mmap::new_anonymous(1));
-        run_test_store_reader_writer_isolation(store);
-    }
-
-    #[test]
-    fn test_file_store_reader_writer_isolation() {
-        let (store, _temp_file) = new_file_mmap();
-        run_test_store_reader_writer_isolation(store);
     }
 }
