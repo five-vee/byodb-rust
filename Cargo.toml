@@ -5,7 +5,6 @@ edition = "2021"
 
 [dependencies]
 arc-swap = "1.7.1"
-crc = "3.2.1"
 memmap2 = "0.9.5"
 memoffset = "0.9.1"
 rand = "0.9.1"

@@ -104,8 +104,8 @@ impl Mmap {
             .open(path)?;
         let mut file_len = file.metadata()?.len() as usize;
         if file_len == 0 {
-            let mut meta_prelude = [0u8; meta_node::META_OFFSET];
-            MetaNode::new().copy_to_slice(&mut meta_prelude, meta_node::Position::A);
+            let mut meta_prelude = [0u8; meta_node::META_PAGE_SIZE];
+            MetaNode::new().copy_to_slice(&mut meta_prelude);
             file.write_all(&meta_prelude)?;
             let mut page = Box::new([0u8; consts::PAGE_SIZE]);
             init_empty_leaf(page.as_mut_slice());
@@ -115,16 +115,16 @@ impl Mmap {
             file.seek(std::io::SeekFrom::Start(0))?;
         }
         let file_len = file_len;
-        if file_len < meta_node::META_OFFSET + consts::PAGE_SIZE {
+        if file_len < meta_node::META_PAGE_SIZE + consts::PAGE_SIZE {
             return Err(PageError::InvalidFile(
                 "file must be at least 2 meta page sizes + 1 page".into(),
             ));
         }
         // There must be at least 1 valid meta node.
         {
-            let mut buf = [0u8; meta_node::META_OFFSET];
+            let mut buf = [0u8; meta_node::META_PAGE_SIZE];
             let _ = file.read(&mut buf)?;
-            let _ = MetaNode::read_last_valid_meta_node(&buf)?;
+            let _ = MetaNode::try_from(&buf[..])?;
         }
 
         // Safety: it is assumed that no other process has a mutable mapping to the same file.
@@ -169,8 +169,8 @@ impl Mmap {
     /// A pointer into the mmap region that represents the start of where all
     /// the B+ tree pages live.
     fn pages_ptr(&self) -> *mut u8 {
-        // Safety: ptr + META_OFFSET is a valid pointer into the mmap region.
-        unsafe { self.mmap.as_ptr().add(meta_node::META_OFFSET) as *mut u8 }
+        // Safety: ptr + META_PAGE_SIZE is a valid pointer into the mmap region.
+        unsafe { self.mmap.as_ptr().add(meta_node::META_PAGE_SIZE) as *mut u8 }
     }
 }
 
@@ -242,7 +242,7 @@ impl WriterState {
     #[allow(clippy::arc_with_non_send_sync)] // We manually ensure thread-safety via Mutex/ArcSwap.
     fn grow_if_needed(&mut self) -> bool {
         let m = self.mmap();
-        if meta_node::META_OFFSET + self.new_offset + consts::PAGE_SIZE <= m.len() {
+        if meta_node::META_PAGE_SIZE + self.new_offset + consts::PAGE_SIZE <= m.len() {
             return false;
         }
         let expand = max(m.len(), MIN_FILE_GROWTH_SIZE);
@@ -256,17 +256,12 @@ impl WriterState {
     /// Flushes only the meta node double buffer of the mmap.
     fn flush_new_meta_node(&mut self, new_root_ptr: usize) {
         let m = self.mmap_mut();
-        let (MetaNode { sequence, .. }, pos) = MetaNode::read_last_valid_meta_node(m.deref())
-            .expect("there should exist a valid meta node");
-        let mut curr = MetaNode {
+        let curr = MetaNode {
             signature: meta_node::DB_SIG,
             root_ptr: new_root_ptr,
             num_pages: self.flush_offset / consts::PAGE_SIZE,
-            sequence: sequence + 1,
-            checksum: 0,
         };
-        curr.checksum = curr.checksum();
-        curr.copy_to_slice(m.deref_mut(), pos.next());
+        curr.copy_to_slice(m.deref_mut());
         m.flush();
     }
 }
@@ -292,9 +287,8 @@ pub struct Store {
 impl Store {
     /// Creates a new store from a specified `Mmap`.
     pub fn new(mmap: Mmap) -> Self {
-        let num_pages = MetaNode::read_last_valid_meta_node(mmap.deref())
+        let num_pages = MetaNode::try_from(mmap.deref())
             .expect("there should exist a valid meta node")
-            .0
             .num_pages;
         let offset = num_pages * consts::PAGE_SIZE;
 
@@ -345,7 +339,7 @@ pub trait Guard {
     fn read_page(&self, page_num: usize) -> ReadOnlyPage<'_>;
 
     /// Reads the last (flushed) valid meta node from the double buffer.
-    fn read_last_valid_meta_node(&self) -> MetaNode;
+    fn read_meta_node(&self) -> MetaNode;
 }
 
 /// A Reader that provides safe read-only concurrent access to the flushed
@@ -374,15 +368,9 @@ impl Reader {
         }
     }
 
-    pub fn sequence(&self) -> u64 {
-        self.read_last_valid_meta_node().sequence
-    }
-
     /// Reads the last (flushed) valid meta node from the double buffer.
-    pub fn read_last_valid_meta_node(&self) -> MetaNode {
-        MetaNode::read_last_valid_meta_node(self.guard.mmap().deref())
-            .expect("there should exist a valid meta node")
-            .0
+    pub fn read_meta_node(&self) -> MetaNode {
+        MetaNode::try_from(self.guard.mmap().deref()).expect("there should exist a valid meta node")
     }
 }
 
@@ -391,8 +379,8 @@ impl Guard for Reader {
         self.read_page(page_num)
     }
 
-    fn read_last_valid_meta_node(&self) -> MetaNode {
-        self.read_last_valid_meta_node()
+    fn read_meta_node(&self) -> MetaNode {
+        self.read_meta_node()
     }
 }
 
@@ -446,10 +434,6 @@ impl Writer<'_> {
             flush_offset: guard.flush_offset,
         }));
     }
-
-    pub fn sequence(&self) -> u64 {
-        self.read_last_valid_meta_node().sequence
-    }
 }
 
 impl Guard for Writer<'_> {
@@ -468,10 +452,9 @@ impl Guard for Writer<'_> {
         }
     }
 
-    fn read_last_valid_meta_node(&self) -> MetaNode {
-        MetaNode::read_last_valid_meta_node(self.guard.borrow().mmap().deref())
+    fn read_meta_node(&self) -> MetaNode {
+        MetaNode::try_from(self.guard.borrow().mmap().deref())
             .expect("there should exist a valid meta node")
-            .0
     }
 }
 
@@ -493,9 +476,9 @@ impl<'a> Deref for ReadOnlyPage<'a> {
         // It is guaranteed that no writers can touch this region (since it's already flushed).
         // page_ptr cannot dangle b/c the mmap is never dropped/realloc'ed so long as
         // the reader guard (&'r Reader) exists.
-        &unsafe { &*self.mmap.get() }.mmap[meta_node::META_OFFSET
+        &unsafe { &*self.mmap.get() }.mmap[meta_node::META_PAGE_SIZE
             + self.page_num * consts::PAGE_SIZE
-            ..meta_node::META_OFFSET + (self.page_num + 1) * consts::PAGE_SIZE]
+            ..meta_node::META_PAGE_SIZE + (self.page_num + 1) * consts::PAGE_SIZE]
     }
 }
 
@@ -516,9 +499,9 @@ impl Deref for Page<'_> {
         // touch this region at a time.
         // page_ptr cannot dangle b/c the mmap is never dropped/realloc'ed so long as
         // the writer mutex guard (&'w Writer<'s>) exists.
-        &unsafe { &*self.mmap.get() }.mmap[meta_node::META_OFFSET
+        &unsafe { &*self.mmap.get() }.mmap[meta_node::META_PAGE_SIZE
             + self.page_num * consts::PAGE_SIZE
-            ..meta_node::META_OFFSET + (self.page_num + 1) * consts::PAGE_SIZE]
+            ..meta_node::META_PAGE_SIZE + (self.page_num + 1) * consts::PAGE_SIZE]
     }
 }
 
@@ -529,9 +512,9 @@ impl DerefMut for Page<'_> {
         // touch this region at a time.
         // page_ptr cannot dangle b/c the mmap is never dropped/realloc'ed so long as
         // the writer mutex guard (&'w Writer<'s>) exists.
-        &mut unsafe { &mut *self.mmap.get() }.mmap[meta_node::META_OFFSET
+        &mut unsafe { &mut *self.mmap.get() }.mmap[meta_node::META_PAGE_SIZE
             + self.page_num * consts::PAGE_SIZE
-            ..meta_node::META_OFFSET + (self.page_num + 1) * consts::PAGE_SIZE]
+            ..meta_node::META_PAGE_SIZE + (self.page_num + 1) * consts::PAGE_SIZE]
     }
 }
 
@@ -593,8 +576,7 @@ mod tests {
             let reader = store.reader();
 
             // Verify the meta node
-            assert_eq!(reader.sequence(), 1, "Sequence should be 1 after one flush");
-            let meta = reader.read_last_valid_meta_node();
+            let meta = reader.read_meta_node();
             assert_eq!(
                 meta.root_ptr, page_num,
                 "Root pointer should match the flushed page number"
@@ -619,7 +601,7 @@ mod tests {
             let temp_file = NamedTempFile::new().unwrap();
             let mut file = std::fs::File::create(temp_file.path()).unwrap();
             // Write less than the minimum required size
-            let small_data = vec![0u8; meta_node::META_OFFSET + consts::PAGE_SIZE - 1];
+            let small_data = vec![0u8; meta_node::META_PAGE_SIZE + consts::PAGE_SIZE - 1];
             file.write_all(&small_data).unwrap();
             file.sync_all().unwrap();
 
@@ -631,7 +613,7 @@ mod tests {
         {
             let temp_file = NamedTempFile::new().unwrap();
             let mut file = std::fs::File::create(temp_file.path()).unwrap();
-            let misaligned_data = vec![0u8; meta_node::META_OFFSET + consts::PAGE_SIZE + 1]; // 1 extra byte
+            let misaligned_data = vec![0u8; meta_node::META_PAGE_SIZE + consts::PAGE_SIZE + 1]; // 1 extra byte
             file.write_all(&misaligned_data).unwrap();
             file.sync_all().unwrap();
 
@@ -644,7 +626,7 @@ mod tests {
             let temp_file = NamedTempFile::new().unwrap();
             let mut file = std::fs::File::create(temp_file.path()).unwrap();
             // Write the correct size, but with invalid meta node data (all zeros)
-            let invalid_meta_data = vec![0u8; meta_node::META_OFFSET + consts::PAGE_SIZE];
+            let invalid_meta_data = vec![0u8; meta_node::META_PAGE_SIZE + consts::PAGE_SIZE];
             file.write_all(&invalid_meta_data).unwrap();
             file.sync_all().unwrap();
 
@@ -909,39 +891,6 @@ mod tests {
         // Try to read the recently written page via Reader::read_page(page_num).
         // This should fail b/c not flushed yet.
         let _ = reader.read_page(page_num);
-    }
-
-    #[test]
-    fn test_store_flush_increases_sequence() {
-        let (store, _temp_file) = new_file_mmap();
-        let dummy_root_ptr = 0;
-        let seq0 = store.reader().sequence();
-        let mut prev_reader_seq = seq0;
-        for i in 1..=2 {
-            let writer = store.writer();
-            let writer_seq = writer.sequence();
-            assert_eq!(
-                writer_seq, prev_reader_seq,
-                "Writer sequence should match previous reader sequence (Iteration {})",
-                i
-            );
-            writer.flush(dummy_root_ptr);
-
-            let reader = store.reader();
-            let reader_seq = reader.sequence();
-            assert_eq!(
-                reader_seq,
-                writer_seq + 1,
-                "Reader sequence should be writer sequence + 1 (Iteration {})",
-                i
-            );
-            assert_eq!(
-                reader_seq, i,
-                "Reader sequence should be {} after iteration {}",
-                i, i
-            );
-            prev_reader_seq = reader_seq;
-        }
     }
 
     #[test]

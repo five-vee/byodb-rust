@@ -50,7 +50,7 @@ pub struct Tree<'g, G: Guard> {
 impl<'g, G: Guard> Tree<'g, G> {
     /// Loads the root of the tree found in the store.
     pub fn new(guard: &'g G) -> Self {
-        let root_ptr = guard.read_last_valid_meta_node().root_ptr;
+        let root_ptr = guard.read_meta_node().root_ptr;
         Tree {
             page_num: root_ptr,
             guard,
