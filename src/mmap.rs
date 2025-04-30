@@ -2,27 +2,16 @@
 //!
 //! The store is the storage layer for the copy-on-write B+ tree. It is a
 //! memory-mapped region that can be backed by a file.
+//!
 //! The mmap has the following structure:
 //!
 //! ```ignore
-//! | meta page A | meta_page B |   pages   |
-//! |     64B     |     64B     | N * 4096B |
+//! | meta page |   pages   |
+//! |    64B    | N * 4096B |
 //! ```
 //!
-//! where `N` is the number of pages utilized so far by the B+ tree.
-//!
-//! At the moment, the mmap can only grow in size. In the future, we will
-//! implement a free-list for garbage collection + space efficiency.
-//!
-//! # Meta page double buffering
-//!
-//! Two meta pages are used due to the double buffer technique: writes to the
-//! meta page must be atomic, if the writes to a meta page fails, one can
-//! recover from the other meta page, which is the last known valid meta page.
-//! When flushing/committing, writers will overwrite the meta page with the
-//! smaller sequence. Readers will read the meta page with the larger sequence.
-//! Even if writes and reads of the meta pages are concurrent, the reader will
-//! always read a valid meta page; there can only be one writer at a time.
+//! where `N` is the number of pages utilized so far by the B+ tree
+//! and free list.
 //!
 //! # Snapshot isolation
 //!
@@ -48,7 +37,7 @@ use std::{
     cell::{RefCell, UnsafeCell},
     cmp::max,
     fs::{File, OpenOptions},
-    io::{Read, Seek, Write as _},
+    io::{Seek, Write as _},
     marker::PhantomData,
     ops::{Deref, DerefMut},
     path::Path,
@@ -332,9 +321,10 @@ pub trait Guard {
     /// If it's a Writer, then either flushed or written pages can be read.
     /// Newly allocated pages must be written first before they can be read.
     /// Remember to flush pages to make them available to future readers.
+    /// TODO: make this unsafe.
     fn read_page(&self, page_num: usize) -> ReadOnlyPage<'_>;
 
-    /// Reads the last (flushed) valid meta node from the double buffer.
+    /// Reads the meta node from the underlying mmap.
     fn read_meta_node(&self) -> MetaNode;
 }
 
@@ -347,9 +337,8 @@ pub struct Reader {
     guard: ArcSwapGuard<Arc<ReaderState>>,
 }
 
-impl Reader {
-    /// Reads a page at `page_num`. Only flushed pages can be read.
-    pub fn read_page(&self, page_num: usize) -> ReadOnlyPage<'_> {
+impl Guard for Reader {
+    fn read_page(&self, page_num: usize) -> ReadOnlyPage<'_> {
         let guard = &self.guard;
         assert!(
             page_num * consts::PAGE_SIZE < guard.flush_offset,
@@ -364,19 +353,8 @@ impl Reader {
         }
     }
 
-    /// Reads the last (flushed) valid meta node from the double buffer.
-    pub fn read_meta_node(&self) -> MetaNode {
-        MetaNode::try_from(self.guard.mmap().deref()).expect("there should exist a valid meta node")
-    }
-}
-
-impl Guard for Reader {
-    fn read_page(&self, page_num: usize) -> ReadOnlyPage<'_> {
-        self.read_page(page_num)
-    }
-
     fn read_meta_node(&self) -> MetaNode {
-        self.read_meta_node()
+        MetaNode::try_from(self.guard.mmap().deref()).expect("there should exist a valid meta node")
     }
 }
 
@@ -392,7 +370,7 @@ pub struct Writer<'s> {
 
 impl Writer<'_> {
     /// Allocates a new page for write.
-    pub fn new_page(&self) -> Page<'_> {
+    pub fn new_page(&self) -> Page<'_, NewPageType> {
         let mut guard = self.guard.borrow_mut();
         guard.grow_if_needed();
         let page = Page {
@@ -405,13 +383,11 @@ impl Writer<'_> {
     }
 
     /// Finalizes a page, marking it read-only.
-    /// This does NOT guarantee to make the page available to readers;
+    /// This does NOT make the page available to readers;
     /// the page must be flushed first.
-    pub fn write_page<'w>(&'w self, page: Page<'w>) -> ReadOnlyPage<'w> {
+    pub fn write_page<'w>(&'w self, page: Page<'w, NewPageType>) -> ReadOnlyPage<'w> {
         let mut guard = self.guard.borrow_mut();
-        if page.page_num * consts::PAGE_SIZE >= guard.write_offset {
-            guard.write_offset += consts::PAGE_SIZE;
-        }
+        guard.write_offset += consts::PAGE_SIZE;
         ReadOnlyPage {
             _phantom: PhantomData,
             mmap: page.mmap,
@@ -438,7 +414,7 @@ impl Writer<'_> {
     /// This is unsafe b/c it can allow overwriting data that is assumed to be
     /// immutable. As such, please only use this on non-B+-tree pages,
     /// i.e. free list pages.
-    pub unsafe fn overwrite_page(&self, page_num: usize) -> Page<'_> {
+    pub unsafe fn overwrite_page(&self, page_num: usize) -> Page<'_, ReusedPageType> {
         let guard = self.guard.borrow();
         // The requested page must already been flushed or written already.
         assert!(page_num * consts::PAGE_SIZE < guard.write_offset);
@@ -496,16 +472,24 @@ impl<'a> Deref for ReadOnlyPage<'a> {
     }
 }
 
+pub trait PageType {}
+
+pub struct NewPageType;
+impl PageType for NewPageType {}
+
+pub struct ReusedPageType;
+impl PageType for ReusedPageType {}
+
 /// A page inside the mmap region that allows for reads and writes.
 /// A page is not accessible to readers until flushed.
 /// Nor can it be read by a writer until written.
-pub struct Page<'w> {
-    _phantom: PhantomData<&'w ()>,
+pub struct Page<'w, T: PageType = NewPageType> {
+    _phantom: PhantomData<&'w T>,
     mmap: Arc<UnsafeCell<Mmap>>,
     page_num: usize,
 }
 
-impl Deref for Page<'_> {
+impl<T: PageType> Deref for Page<'_, T> {
     type Target = [u8];
     fn deref(&self) -> &Self::Target {
         // Safety: [page_ptr, page_ptr + PAGE_SIZE) is a guaranteed valid region in the mmap.
@@ -519,7 +503,7 @@ impl Deref for Page<'_> {
     }
 }
 
-impl DerefMut for Page<'_> {
+impl<T: PageType> DerefMut for Page<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         // Safety: [page_ptr, page_ptr + PAGE_SIZE) is a guaranteed valid region in the mmap.
         // Due to the mutex guard in Writer, at most one mutable reference can

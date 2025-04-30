@@ -85,7 +85,7 @@ impl<'g> Tree<'g, Writer<'_>> {
     /// Inserts a key-value pair. The resulting tree won't be visible to
     /// readers until the writer is externally flushed.
     pub fn insert(self, key: &[u8], val: &[u8]) -> Result<Self> {
-        let new_page_num = match self.insert_helper(key, val)? {
+        let new_page_num = match &self.insert_helper(key, val)? {
             NodeEffect::Intact(new_root) => new_root.page_num(),
             NodeEffect::Split { left, right } => self.parent_of_split(left, right).page_num(),
             _ => unreachable!(),
@@ -102,7 +102,7 @@ impl<'g> Tree<'g, Writer<'_>> {
     /// This is a recursive implementation of `insert`.
     fn insert_helper(&self, key: &'g [u8], val: &'g [u8]) -> Result<NodeEffect<'g>> {
         let node = Node::read(self.guard, self.page_num);
-        match node {
+        match &node {
             // Base case
             Node::Leaf(leaf) => Ok(leaf.insert(self.guard, key, val)?.into()),
             // Recursive case
@@ -123,7 +123,7 @@ impl<'g> Tree<'g, Writer<'_>> {
 
     /// Updates the value corresponding to a key.
     pub fn update(self, key: &[u8], val: &[u8]) -> Result<Self> {
-        let new_page_num = match self.update_helper(key, val)? {
+        let new_page_num = match &self.update_helper(key, val)? {
             NodeEffect::Intact(root) => root.page_num(),
             NodeEffect::Split { left, right } => self.parent_of_split(left, right).page_num(),
             _ => unreachable!(),
@@ -161,7 +161,7 @@ impl<'g> Tree<'g, Writer<'_>> {
 
     /// Deletes a key and its corresponding value.
     pub fn delete(self, key: &[u8]) -> Result<Self> {
-        let new_page_num = match self.delete_helper(key)? {
+        let new_page_num = match &self.delete_helper(key)? {
             NodeEffect::Empty => mmap::write_empty_leaf(self.guard),
             NodeEffect::Intact(root) => match node::sufficiency(&root) {
                 Sufficiency::Empty => unreachable!(),
@@ -197,7 +197,7 @@ impl<'g> Tree<'g, Writer<'_>> {
                     page_num: child_num,
                     guard: self.guard,
                 };
-                match child.delete_helper(key)? {
+                match &child.delete_helper(key)? {
                     NodeEffect::Empty => {
                         let effect = parent.merge_child_entries(
                             self.guard,
@@ -205,15 +205,18 @@ impl<'g> Tree<'g, Writer<'_>> {
                         );
                         Ok(effect.into())
                     }
-                    NodeEffect::Intact(child) => match node::sufficiency(&child) {
+                    NodeEffect::Intact(child) => match node::sufficiency(child) {
                         Sufficiency::Empty => unreachable!(),
                         Sufficiency::Underflow => {
                             Ok(self.try_fix_underflow(parent, child, child_idx))
                         }
                         Sufficiency::Sufficient => {
-                            let child_entries = NodeEffect::Intact(child).child_entries(child_idx);
-                            let effect =
-                                parent.merge_child_entries(self.guard, child_entries.as_ref());
+                            let child_entries = [ChildEntry::Update {
+                                i: child_idx,
+                                key: child.get_key(0).into(),
+                                page_num: child.page_num(),
+                            }];
+                            let effect = parent.merge_child_entries(self.guard, &child_entries);
                             Ok(effect.into())
                         }
                     },
@@ -246,7 +249,7 @@ impl<'g> Tree<'g, Writer<'_>> {
     fn try_fix_underflow(
         &self,
         parent: &Internal<'g>,
-        child: Node<'g>,
+        child: &Node<'g>,
         child_idx: usize,
     ) -> NodeEffect<'g> {
         // Try to steal from or merge with the left sibling.
@@ -342,7 +345,7 @@ impl<'g> Tree<'g, Writer<'_>> {
 
     /// Creates a new internal root node whose children are split nodes
     /// newly-created due to an operation on the tree.
-    fn parent_of_split(&self, left: Node<'g>, right: Node<'g>) -> Node<'g> {
+    fn parent_of_split(&self, left: &Node<'g>, right: &Node<'g>) -> Node<'g> {
         let keys = [left.get_key(0), right.get_key(0)];
         let child_pointers = [left.page_num(), right.page_num()];
         let root = Internal::parent_of_split(self.guard, keys, child_pointers);
