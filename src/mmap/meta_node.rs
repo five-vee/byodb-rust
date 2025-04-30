@@ -8,15 +8,15 @@
 //! Old format:
 //!
 //! ```ignore
-//! | signature | root_page | num_pages |
-//! |    16B    |     8B    |     8B    |
+//! | root_page | num_pages |
+//! |     8B    |     8B    |
 //! ```
 //!
 //! New format:
 //!
 //! ```ignore
-//! | signature | root_page | num_pages | head_page | head_seq | tail_page | tail_seq |
-//! |    16B    |     8B    |     8B    |    8B     |    8B    |     8B    |    8B    |
+//! | root_page | num_pages | head_page | head_seq | tail_page | tail_seq |
+//! |     8B    |     8B    |    8B     |    8B    |     8B    |    8B    |
 //! ```
 use crate::error::PageError;
 use std::{convert::TryFrom, ptr, rc::Rc};
@@ -25,7 +25,6 @@ use std::{convert::TryFrom, ptr, rc::Rc};
 /// This MUST be at most the size of a disk sector to guarantee write atomicity
 /// of a meta page without having to rely on double buffering.
 pub(crate) const META_PAGE_SIZE: usize = 64;
-pub(crate) const DB_SIG: [u8; 16] = *b"BuildYourOwnDB06";
 const META_NODE_SIZE: usize = std::mem::size_of::<MetaNode>();
 
 const _: () = {
@@ -78,15 +77,10 @@ impl MetaNode {
     /// has 1 page, the B+ tree as a leaf node with no key-values.
     pub fn new() -> Self {
         MetaNode {
-            signature: DB_SIG,
+            root_page: 0,
             num_pages: 1,
             ..Default::default()
         }
-    }
-
-    /// Determines if the meta node has a valid signature.
-    pub fn valid(&self) -> bool {
-        self.signature == DB_SIG
     }
 
     /// Writes a meta node to beginning of the slice.
@@ -120,11 +114,6 @@ impl TryFrom<&[u8]> for MetaNode {
                 META_NODE_SIZE,
             );
         }
-        if !meta_node.valid() {
-            return Err(PageError::InvalidFile(
-                "buffer doesn't contain a valid meta node".into(),
-            ));
-        }
         Ok(meta_node)
     }
 }
@@ -155,27 +144,9 @@ mod tests {
     use super::*;
     use std::convert::TryInto;
 
-    // Helper to create a valid node with a specific sequence number
-    fn create_valid_node() -> MetaNode {
-        MetaNode {
-            signature: DB_SIG,
-            root_page: 1,
-            num_pages: 1,
-            ..Default::default()
-        }
-    }
-
-    // Helper to create an invalid node (bad signature)
-    fn create_invalid_node() -> MetaNode {
-        let mut node = create_valid_node();
-        node.signature[0] = 0; // Invalidate signature
-        node
-    }
-
     #[test]
     fn test_meta_node_try_from_valid() {
         let original_meta = MetaNode {
-            signature: DB_SIG,
             root_page: 1024,
             num_pages: 5,
             ..Default::default()
@@ -191,28 +162,6 @@ mod tests {
     }
 
     #[test]
-    fn test_meta_node_new_is_valid() {
-        let node = MetaNode::new();
-        // Check default values and signature
-        assert_eq!(node.signature, DB_SIG);
-        assert_eq!(node.root_page, 0);
-        assert_eq!(node.num_pages, 1);
-        assert!(node.valid());
-    }
-
-    #[test]
-    fn test_new_valid() {
-        let node = MetaNode::new();
-        assert!(node.valid());
-    }
-
-    #[test]
-    fn test_meta_node_valid_false_sig() {
-        let node = create_invalid_node();
-        assert!(!node.valid());
-    }
-
-    #[test]
     fn test_try_from_too_small() {
         let buffer = [0u8; META_PAGE_SIZE - 1];
         assert!(matches!(
@@ -222,28 +171,8 @@ mod tests {
     }
 
     #[test]
-    fn test_try_from_invalid() {
-        let mut buffer = [0u8; META_PAGE_SIZE];
-        let invalid_node = create_invalid_node();
-        buffer[..META_PAGE_SIZE].copy_from_slice(&<[u8; META_PAGE_SIZE]>::from(&invalid_node));
-        assert!(matches!(
-            MetaNode::try_from(&buffer[..]),
-            Err(PageError::InvalidFile(_))
-        ));
-    }
-
-    #[test]
-    fn test_try_from_valid() {
-        let mut buffer = [0u8; META_PAGE_SIZE];
-        let node = create_valid_node();
-        buffer[..META_PAGE_SIZE].copy_from_slice(&<[u8; META_PAGE_SIZE]>::from(&node));
-        let result = MetaNode::try_from(&buffer[..]).unwrap();
-        assert_eq!(result, node);
-    }
-
-    #[test]
     fn test_meta_node_from_into_bytes() {
-        let original_node = create_valid_node();
+        let original_node = MetaNode::new();
 
         // Convert node to byte buffer
         let buffer: [u8; META_PAGE_SIZE] = (&original_node).into();

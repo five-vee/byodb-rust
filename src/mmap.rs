@@ -121,12 +121,7 @@ impl Mmap {
                 "file must be at least 2 meta page sizes + 1 page".into(),
             ));
         }
-        // There must be at least 1 valid meta node.
-        {
-            let mut buf = [0u8; meta_node::META_PAGE_SIZE];
-            let _ = file.read(&mut buf)?;
-            let _ = MetaNode::try_from(&buf[..])?;
-        }
+        // TODO: validate the contents of the file.
 
         // Safety: it is assumed that no other process has a mutable mapping to the same file.
         let mmap = unsafe { MmapOptions::new().map_mut(&file).unwrap() };
@@ -258,7 +253,6 @@ impl WriterState {
     fn flush_new_meta_node(&mut self, new_root_ptr: usize) {
         let m = self.mmap_mut();
         let curr = MetaNode {
-            signature: meta_node::DB_SIG,
             root_page: new_root_ptr,
             num_pages: self.flush_offset / consts::PAGE_SIZE,
             ..Default::default()
@@ -623,31 +617,6 @@ mod tests {
             // Write less than the minimum required size
             let small_data = vec![0u8; meta_node::META_PAGE_SIZE + consts::PAGE_SIZE - 1];
             file.write_all(&small_data).unwrap();
-            file.sync_all().unwrap();
-
-            let result = Mmap::open_or_create(temp_file.path());
-            assert!(matches!(result, Err(PageError::InvalidFile(_))));
-        }
-
-        // Test case 2: Incorrect page alignment
-        {
-            let temp_file = NamedTempFile::new().unwrap();
-            let mut file = std::fs::File::create(temp_file.path()).unwrap();
-            let misaligned_data = vec![0u8; meta_node::META_PAGE_SIZE + consts::PAGE_SIZE + 1]; // 1 extra byte
-            file.write_all(&misaligned_data).unwrap();
-            file.sync_all().unwrap();
-
-            let result = Mmap::open_or_create(temp_file.path());
-            assert!(matches!(result, Err(PageError::InvalidFile(_))));
-        }
-
-        // Test case 3: Invalid meta node (e.g., zeroed out)
-        {
-            let temp_file = NamedTempFile::new().unwrap();
-            let mut file = std::fs::File::create(temp_file.path()).unwrap();
-            // Write the correct size, but with invalid meta node data (all zeros)
-            let invalid_meta_data = vec![0u8; meta_node::META_PAGE_SIZE + consts::PAGE_SIZE];
-            file.write_all(&invalid_meta_data).unwrap();
             file.sync_all().unwrap();
 
             let result = Mmap::open_or_create(temp_file.path());
