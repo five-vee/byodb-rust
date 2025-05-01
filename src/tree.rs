@@ -50,9 +50,8 @@ pub struct Tree<'g, G: Guard> {
 impl<'g, G: Guard> Tree<'g, G> {
     /// Loads the root of the tree found in the store.
     pub fn new(guard: &'g G) -> Self {
-        let root_ptr = guard.read_meta_node().root_page;
         Tree {
-            page_num: root_ptr,
+            page_num: guard.root_page(),
             guard,
         }
     }
@@ -427,6 +426,8 @@ impl<'g, G: Guard> Iterator for InOrder<'g, G> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use tempfile::NamedTempFile;
 
     use crate::{
@@ -436,12 +437,12 @@ mod tests {
 
     use super::*;
 
-    fn new_file_mmap() -> (Store, NamedTempFile) {
+    fn new_test_store() -> (Arc<Store>, NamedTempFile) {
         let temp_file = NamedTempFile::new().unwrap();
         let path = temp_file.path();
         println!("Created temporary file {path:?}");
         let mmap = Mmap::open_or_create(path).unwrap();
-        let store = Store::new(mmap);
+        let store = Arc::new(Store::new(mmap));
         (store, temp_file)
     }
 
@@ -475,7 +476,8 @@ mod tests {
             );
             i += 1;
         }
-        writer.flush(tree.page_num);
+        let root = tree.page_num;
+        writer.flush(root);
     }
 
     fn insert_complete(writer: Writer, height: u32) {
@@ -510,11 +512,12 @@ mod tests {
 
     #[test]
     fn insert_into_empty_tree() {
-        let (store, _temp_file) = new_file_mmap();
+        let (store, _temp_file) = new_test_store();
         {
             let writer = store.writer();
             let tree = Tree::new(&writer).insert(&[1], &[1]).unwrap();
-            writer.flush(tree.page_num);
+            let root = tree.page_num;
+            writer.flush(root);
         }
         let reader = store.reader();
         let _ = Tree::new(&reader);
@@ -522,7 +525,7 @@ mod tests {
 
     #[test]
     fn insert_until_split() {
-        let (store, _temp_file) = new_file_mmap();
+        let (store, _temp_file) = new_test_store();
         insert_until_height(store.writer(), 3);
         let reader = store.reader();
         let tree = Tree::new(&reader);
@@ -542,7 +545,7 @@ mod tests {
 
     #[test]
     fn get() {
-        let (store, _temp_file) = new_file_mmap();
+        let (store, _temp_file) = new_test_store();
         insert_until_height(store.writer(), 2);
         let reader = store.reader();
         let tree = Tree::new(&reader);
@@ -553,14 +556,15 @@ mod tests {
 
     #[test]
     fn update_intact() {
-        let (store, _temp_file) = new_file_mmap();
+        let (store, _temp_file) = new_test_store();
         let writer = store.writer();
         let tree = Tree::new(&writer)
             .insert(&[0], &[0])
             .unwrap()
             .update(&[0], &[1])
             .unwrap();
-        writer.flush(tree.page_num);
+        let root = tree.page_num;
+        writer.flush(root);
         let reader = store.reader();
         let tree = Tree::new(&reader);
         let got = tree.get(&[0]).unwrap().unwrap();
@@ -570,7 +574,7 @@ mod tests {
 
     #[test]
     fn update_split() {
-        let (store, _temp_file) = new_file_mmap();
+        let (store, _temp_file) = new_test_store();
         insert_complete(store.writer(), 2);
         let old_height = {
             let reader = store.reader();
@@ -588,7 +592,7 @@ mod tests {
 
     #[test]
     fn delete_until_empty() {
-        let (store, _temp_file) = new_file_mmap();
+        let (store, _temp_file) = new_test_store();
         insert_until_height(store.writer(), 3);
         let max = {
             let reader = store.reader();
@@ -630,7 +634,8 @@ mod tests {
                 got.unwrap()
             );
         }
-        writer.flush(tree.page_num);
+        let root = tree.page_num;
+        writer.flush(root);
 
         let reader = store.reader();
         let tree = Tree::new(&reader);
@@ -655,7 +660,7 @@ mod tests {
     #[test]
     fn delete_triggers_higher_root() {
         // Setup
-        let (store, _temp_file) = new_file_mmap();
+        let (store, _temp_file) = new_test_store();
         let writer = store.writer();
         let tree = Tree::new(&writer)
             .insert(&[0; consts::MAX_KEY_SIZE], &[0; consts::MAX_VALUE_SIZE])
@@ -702,7 +707,7 @@ mod tests {
     #[test]
     fn delete_triggers_larger_root() {
         // Setup
-        let (store, _temp_file) = new_file_mmap();
+        let (store, _temp_file) = new_test_store();
         let writer = store.writer();
         let tree = Tree::new(&writer)
             .insert(&[0; consts::MAX_KEY_SIZE], &[0; consts::MAX_VALUE_SIZE])
@@ -753,7 +758,7 @@ mod tests {
     #[test]
     fn delete_triggers_internal_split() {
         // Setup
-        let (store, _temp_file) = new_file_mmap();
+        let (store, _temp_file) = new_test_store();
         let writer = store.writer();
         let mut tree = Tree::new(&writer);
         for i in 0u8..=19u8 {

@@ -39,6 +39,7 @@ impl<'a> Leaf<'a> {
         if self.find(key).is_some() {
             return Err(NodeError::AlreadyExists);
         }
+        writer.mark_free(self.page_num());
         let itr_func = || self.insert_iter(key, val);
         let num_keys = self.get_num_keys() + 1;
         if self.get_num_bytes() + 6 + key.len() + val.len() > consts::PAGE_SIZE {
@@ -65,6 +66,7 @@ impl<'a> Leaf<'a> {
             return Err(NodeError::KeyNotFound);
         }
         let old_val = old_val.unwrap();
+        writer.mark_free(self.page_num());
         let itr_func = || self.update_iter(key, val);
         let num_keys = self.get_num_keys();
         if self.get_num_bytes() - old_val.len() + val.len() > consts::PAGE_SIZE {
@@ -81,6 +83,7 @@ impl<'a> Leaf<'a> {
         if self.find(key).is_none() {
             return Err(NodeError::KeyNotFound);
         }
+        writer.mark_free(self.page_num());
         // Optimization: avoid memory allocation and
         // just return Deletion::Empty if only 1 key.
         let n = self.get_num_keys();
@@ -107,6 +110,8 @@ impl<'a> Leaf<'a> {
     /// Creates the leaf (or leaves) resulting from either left stealing from
     /// right, or left merging with right.
     pub fn steal_or_merge(left: &'a Leaf, right: &'a Leaf, writer: &'a Writer) -> LeafEffect<'a> {
+        writer.mark_free(left.page_num());
+        writer.mark_free(right.page_num());
         let itr_func = || left.iter().chain(right.iter());
         let num_keys = left.get_num_keys() + right.get_num_keys();
         let overflow = left.get_num_bytes() + right.get_num_bytes() - 4 > consts::PAGE_SIZE;
@@ -502,18 +507,20 @@ fn set_next_offset(page: &mut [u8], i: usize, key: &[u8], val: &[u8]) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use tempfile::NamedTempFile;
 
     use crate::mmap::{Mmap, Store};
 
     use super::*;
 
-    fn new_test_store() -> (Store, NamedTempFile, usize) {
+    fn new_test_store() -> (Arc<Store>, NamedTempFile, usize) {
         let temp_file = NamedTempFile::new().unwrap();
         let path = temp_file.path();
         println!("Created temporary file {path:?}");
         let mmap = Mmap::open_or_create(path).unwrap();
-        let store = Store::new(mmap);
+        let store = Arc::new(Store::new(mmap));
         (store, temp_file, 0)
     }
 

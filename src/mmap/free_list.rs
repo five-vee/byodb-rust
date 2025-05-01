@@ -10,20 +10,24 @@
 use std::{
     marker::PhantomData,
     ops::{Deref, DerefMut},
+    usize,
 };
 
 use crate::{consts, mmap::Page};
 
-use super::{Guard as _, ReadOnlyPage, ReusedPageType, Writer};
+use super::{meta_node::MetaNode, Guard as _, ReadOnlyPage, ReusedPageType, Writer};
 
 const FREE_LIST_CAP: usize = (consts::PAGE_SIZE - 8) / 8;
+const INVALID_NEXT: usize = usize::MAX;
 
 /// An in-memory container of metadata about the free list.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(C)]
 pub struct FreeList {
-    head_page_num: usize,
-    head_seq: usize,
-    tail_page_num: usize,
-    tail_seq: usize,
+    pub head_page: usize,
+    pub head_seq: usize,
+    pub tail_page: usize,
+    pub tail_seq: usize,
     max_seq: usize,
 }
 
@@ -40,9 +44,9 @@ impl FreeList {
     /// Pushes a pointer to the list tail.
     pub fn push_tail(&mut self, writer: &Writer, ptr: usize) {
         // add it to the tail node
-        // Safety: tail_page_num points to a page that is guaranteed to never
+        // Safety: tail_page points to a page that is guaranteed to never
         // have any concurrent readers accessing it.
-        let mut node: ListNode<'_, _> = unsafe { writer.overwrite_page(self.tail_page_num) }.into();
+        let mut node: ListNode<'_, _> = unsafe { writer.overwrite_page(self.tail_page) }.into();
         node.set_pointer(seq_to_index(self.tail_seq), ptr);
         self.tail_seq += 1;
 
@@ -55,47 +59,72 @@ impl FreeList {
         let (next, head) = self.pop_helper(writer);
         let next = next.unwrap_or_else(|| {
             // or allocate a new node by appending
-            let page = writer.new_page();
+            let mut page = writer.new_page();
+            init_empty_list_node(&mut page);
             let page = writer.write_page(page);
             page.page_num
         });
 
         // link to the new tail node
         node.set_next(next);
-        self.tail_page_num = next;
-        // Safety: tail_page_num points to a page that is guaranteed to never
+        self.tail_page = next;
+        // Safety: tail_page points to a page that is guaranteed to never
         // have any concurrent readers accessing it.
-        node = unsafe { writer.overwrite_page(self.tail_page_num) }.into();
+        node = unsafe { writer.overwrite_page(self.tail_page) }.into();
 
         // also add the head node if it's removed
         if let Some(head) = head {
             node.set_pointer(0, head);
-            self.tail_seq += 1;
+            self.tail_seq = 1; // previously was 0
         }
     }
 
-    /// Ensures that pages added to the free list cannot be reused
-    /// in the same transaction.
     pub fn set_max_seq(&mut self) {
-        self.max_seq = self.tail_seq
+        self.max_seq = self.tail_seq;
     }
 
     // remove 1 item from the head node, and remove the head node if empty.
     fn pop_helper(&mut self, writer: &Writer) -> (Option<usize>, Option<usize>) {
-        if self.head_seq == self.tail_seq {
+        if self.head_seq == self.max_seq {
             return (None, None); // cannot advance
         }
-        let node: ListNode<'_, _> = writer.read_page(self.head_page_num).into();
+        let node: ListNode<'_, _> = writer.read_page(self.head_page).into();
         let ptr = node.get_pointer(seq_to_index(self.head_seq));
         self.head_seq += 1;
 
         // move to the next one if the head node is empty
         let mut head = None;
         if seq_to_index(self.head_seq) == 0 {
-            head = Some(self.head_page_num);
-            self.head_page_num = node.get_next();
+            head = Some(self.head_page);
+            self.head_page = node.get_next();
+            assert_ne!(self.head_page, INVALID_NEXT);
         }
         (Some(ptr), head)
+    }
+}
+
+impl Default for FreeList {
+    /// Creates the initial empty free list node.
+    fn default() -> Self {
+        FreeList {
+            head_page: 1,
+            head_seq: 0,
+            tail_page: 1,
+            tail_seq: 0,
+            max_seq: 0,
+        }
+    }
+}
+
+impl From<MetaNode> for FreeList {
+    fn from(node: MetaNode) -> Self {
+        FreeList {
+            head_page: node.head_page,
+            head_seq: node.head_seq,
+            tail_page: node.tail_page,
+            tail_seq: node.tail_seq,
+            max_seq: node.tail_seq,
+        }
     }
 }
 
@@ -169,4 +198,13 @@ impl<'w> From<Page<'w, ReusedPageType>> for ListNode<'w, Page<'w, ReusedPageType
             page,
         }
     }
+}
+
+/// Writes into page to initialize it as an empty list node.
+pub fn init_empty_list_node(page: &mut [u8]) {
+    let mut ln = ListNode {
+        _phantom: PhantomData,
+        page,
+    };
+    ln.set_next(INVALID_NEXT);
 }

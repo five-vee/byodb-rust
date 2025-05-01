@@ -42,10 +42,13 @@ use std::{
     ops::{Deref, DerefMut},
     path::Path,
     rc::Rc,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{atomic::Ordering, Arc, Mutex, MutexGuard},
 };
 
 use arc_swap::{ArcSwap, Guard as ArcSwapGuard};
+use crossbeam_epoch::{
+    self as epoch, Atomic as EpochAtomic, Guard as EpochGuard, Owned as EpochOwned,
+};
 use memmap2::{MmapMut, MmapOptions};
 
 use crate::{
@@ -53,6 +56,7 @@ use crate::{
     error::PageError,
     header::{self, NodeType},
 };
+use free_list::FreeList;
 use meta_node::MetaNode;
 
 #[cfg(not(test))]
@@ -94,23 +98,33 @@ impl Mmap {
             .open(path)?;
         let mut file_len = file.metadata()?.len() as usize;
         if file_len == 0 {
-            let mut meta_prelude = [0u8; meta_node::META_PAGE_SIZE];
-            MetaNode::new().copy_to_slice(&mut meta_prelude);
-            file.write_all(&meta_prelude)?;
-            let mut page = Box::new([0u8; consts::PAGE_SIZE]);
-            init_empty_leaf(page.as_mut_slice());
-            file.write_all(page.as_slice())?;
+            {
+                let mut meta_page = [0u8; meta_node::META_PAGE_SIZE];
+                MetaNode::default().copy_to_slice(&mut meta_page);
+                file.write_all(&meta_page)?;
+            }
+            {
+                let mut leaf_page = [0u8; consts::PAGE_SIZE];
+                init_empty_leaf(&mut leaf_page);
+                file.write_all(&leaf_page)?;
+            }
+            {
+                let mut free_list_page = [0u8; consts::PAGE_SIZE];
+                free_list::init_empty_list_node(&mut free_list_page);
+                file.write_all(&free_list_page)?;
+            }
             file_len = file.metadata()?.len() as usize;
             file.sync_all()?;
-            file.seek(std::io::SeekFrom::Start(0))?;
+            file.seek(std::io::SeekFrom::Start(0))?; // not sure if necessary
         }
         let file_len = file_len;
-        if file_len < meta_node::META_PAGE_SIZE + consts::PAGE_SIZE {
+        if file_len < meta_node::META_PAGE_SIZE + 2 * consts::PAGE_SIZE {
             return Err(PageError::InvalidFile(
-                "file must be at least 2 meta page sizes + 1 page".into(),
+                "file must be at least 2 meta page sizes + 2 pages".into(),
             ));
         }
         // TODO: validate the contents of the file.
+        // TODO: fix any errors if possible.
 
         // Safety: it is assumed that no other process has a mutable mapping to the same file.
         let mmap = unsafe { MmapOptions::new().map_mut(&file).unwrap() };
@@ -150,13 +164,6 @@ impl Mmap {
             mmap,
         }
     }
-
-    /// A pointer into the mmap region that represents the start of where all
-    /// the B+ tree pages live.
-    fn pages_ptr(&self) -> *mut u8 {
-        // Safety: ptr + META_PAGE_SIZE is a valid pointer into the mmap region.
-        unsafe { self.mmap.as_ptr().add(meta_node::META_PAGE_SIZE) as *mut u8 }
-    }
 }
 
 /// Container of data needed by Readers.
@@ -172,17 +179,6 @@ struct ReaderState {
 // by ReaderState.
 unsafe impl Send for ReaderState {}
 unsafe impl Sync for ReaderState {}
-
-impl ReaderState {
-    /// A convenient method to retrieve the Mmap
-    /// since it's guarded by UnsafeCell.
-    fn mmap(&self) -> &Mmap {
-        // Safety: ReaderState guarantees that immutable references of the mmap
-        // only read [pages_ptr, pages_ptr + flush_offset * PAGE_SIZE), which never overlaps
-        // with mmutable reference touches of [pages_ptr + flush_offset * PAGE_SIZE, mmap_end).
-        unsafe { &*self.mmap.get() }
-    }
-}
 
 /// Container of data needed by Writer.
 struct WriterState {
@@ -238,14 +234,10 @@ impl WriterState {
         true
     }
 
-    /// Flushes only the meta node double buffer of the mmap.
-    fn flush_new_meta_node(&mut self, new_root_ptr: usize) {
+    /// Flushes only the meta node of the mmap.
+    fn flush_new_meta_node(&mut self, new_root_ptr: usize, fl: &FreeList) {
         let m = self.mmap_mut();
-        let curr = MetaNode {
-            root_page: new_root_ptr,
-            num_pages: self.flush_offset / consts::PAGE_SIZE,
-            ..Default::default()
-        };
+        let curr = MetaNode::new(new_root_ptr, self.flush_offset / consts::PAGE_SIZE, &fl);
         curr.copy_to_slice(m.deref_mut());
         m.flush();
     }
@@ -265,49 +257,77 @@ impl WriterState {
 /// Of course, if one wants the page to be visible to future reader, it MUST
 /// be flushed first.
 pub struct Store {
-    reader: ArcSwap<ReaderState>,
-    writer: Mutex<WriterState>,
+    reader_state: ArcSwap<ReaderState>,
+    writer_state: Mutex<WriterState>,
+    root_page: EpochAtomic<usize>,
 }
 
 impl Store {
     /// Creates a new store from a specified `Mmap`.
     pub fn new(mmap: Mmap) -> Self {
-        let num_pages = MetaNode::try_from(mmap.deref())
-            .expect("there should exist a valid meta node")
-            .num_pages;
-        let offset = num_pages * consts::PAGE_SIZE;
+        let node = MetaNode::try_from(mmap.deref()).expect("there should exist a meta node");
+        let flush_offset = node.num_pages * consts::PAGE_SIZE;
 
         // We manually ensure thread-safety via Mutex/ArcSwap.
         #[allow(clippy::arc_with_non_send_sync)]
         let mmap = Arc::new(UnsafeCell::new(mmap));
         Store {
-            reader: ArcSwap::from_pointee(ReaderState {
+            reader_state: ArcSwap::from_pointee(ReaderState {
                 mmap: mmap.clone(),
-                flush_offset: offset,
+                flush_offset,
             }),
-            writer: Mutex::new(WriterState {
+            writer_state: Mutex::new(WriterState {
                 mmap: mmap.clone(),
-                flush_offset: offset,
-                write_offset: offset,
-                new_offset: offset,
+                flush_offset,
+                write_offset: flush_offset,
+                new_offset: flush_offset,
             }),
+            root_page: EpochAtomic::new(node.root_page),
         }
     }
 
     /// Obtains a Reader guard.
-    pub fn reader(&self) -> Reader {
+    pub fn reader(self: &Arc<Self>) -> Reader {
+        let epoch_guard = epoch::pin();
+        // Note: consider Ordering::Acquire if perf is necessary (prob not).
+        let shared = self.root_page.load(Ordering::SeqCst, &epoch_guard);
+        // Safety: root_page is NEVER null; it is always initialized to some value.
+        let root_page = *unsafe { shared.as_ref() }.unwrap();
         Reader {
-            guard: self.reader.load(),
+            root_page,
+            state_guard: self.reader_state.load(),
+            epoch_guard,
         }
     }
 
     /// Obtains a Writer guard. This will block so long as a Writer
     /// was previously obtained and not yet dropped.
-    pub fn writer(&self) -> Writer<'_> {
+    pub fn writer(self: &Arc<Self>) -> Writer<'_> {
+        let mutex_guard = self.writer_state.lock().unwrap();
+        let node = MetaNode::try_from(mutex_guard.mmap().as_ref())
+            .expect("there should exist a meta node");
         Writer {
-            guard: RefCell::new(self.writer.lock().unwrap()),
-            reader: &self.reader,
+            root_page: node.root_page,
+            free_list: FreeList::from(node),
+            reclaimable_pages: RefCell::new(Vec::new()),
+            flushed: false,
+            store: self.clone(),
+            state_guard: RefCell::new(mutex_guard),
+            epoch_guard: epoch::pin(),
         }
+    }
+
+    /// Adds pages to the free list.
+    fn reclaim_pages(self: &Arc<Self>, pages: Vec<usize>) {
+        let mut w = self.writer();
+        let mut fl = w.free_list;
+        for page_num in pages {
+            fl.push_tail(&w, page_num);
+        }
+        fl.set_max_seq();
+        w.free_list = fl;
+        let root_page = w.root_page; // unchanged
+        w.flush(root_page);
     }
 }
 
@@ -324,8 +344,8 @@ pub trait Guard {
     /// TODO: make this unsafe.
     fn read_page(&self, page_num: usize) -> ReadOnlyPage<'_>;
 
-    /// Reads the meta node from the underlying mmap.
-    fn read_meta_node(&self) -> MetaNode;
+    /// Obtains the root page number accessible by the guard.
+    fn root_page(&self) -> usize;
 }
 
 /// A Reader that provides safe read-only concurrent access to the flushed
@@ -334,12 +354,14 @@ pub trait Guard {
 /// Readers and the Writer don't block each other, but Readers are isolated
 /// from the Writer via the flushing mechanism.
 pub struct Reader {
-    guard: ArcSwapGuard<Arc<ReaderState>>,
+    root_page: usize,
+    state_guard: ArcSwapGuard<Arc<ReaderState>>,
+    epoch_guard: EpochGuard,
 }
 
 impl Guard for Reader {
     fn read_page(&self, page_num: usize) -> ReadOnlyPage<'_> {
-        let guard = &self.guard;
+        let guard = &self.state_guard;
         assert!(
             page_num * consts::PAGE_SIZE < guard.flush_offset,
             "page_num = {} must be < {}",
@@ -353,8 +375,8 @@ impl Guard for Reader {
         }
     }
 
-    fn read_meta_node(&self) -> MetaNode {
-        MetaNode::try_from(self.guard.mmap().deref()).expect("there should exist a valid meta node")
+    fn root_page(&self) -> usize {
+        self.root_page
     }
 }
 
@@ -364,14 +386,28 @@ impl Guard for Reader {
 /// Readers and the Writer don't block each other, but Readers are isolated
 /// from the Writer via the flushing mechanism.
 pub struct Writer<'s> {
-    guard: RefCell<MutexGuard<'s, WriterState>>,
-    reader: &'s ArcSwap<ReaderState>,
+    root_page: usize,
+    free_list: FreeList,
+    reclaimable_pages: RefCell<Vec<usize>>,
+    flushed: bool,
+    store: Arc<Store>,
+    state_guard: RefCell<MutexGuard<'s, WriterState>>,
+    epoch_guard: EpochGuard,
 }
+
+const _: () = {
+    // It's important that epoch_guard is listed AFTER state_guard
+    // so that epoch_guard is dropped AFTER state_guard is dropped.
+    // When Writer is dropped, it defers a reclaim(), which itself acquires
+    // the store's mutex. The mutex cannot be locked unless the writer first
+    // drops its MutexGuard.
+    assert!(memoffset::offset_of!(Writer, state_guard) < memoffset::offset_of!(Writer, epoch_guard))
+};
 
 impl Writer<'_> {
     /// Allocates a new page for write.
     pub fn new_page(&self) -> Page<'_, NewPageType> {
-        let mut guard = self.guard.borrow_mut();
+        let mut guard = self.state_guard.borrow_mut();
         guard.grow_if_needed();
         let page = Page {
             _phantom: PhantomData,
@@ -386,7 +422,7 @@ impl Writer<'_> {
     /// This does NOT make the page available to readers;
     /// the page must be flushed first.
     pub fn write_page<'w>(&'w self, page: Page<'w, NewPageType>) -> ReadOnlyPage<'w> {
-        let mut guard = self.guard.borrow_mut();
+        let mut guard = self.state_guard.borrow_mut();
         guard.write_offset += consts::PAGE_SIZE;
         ReadOnlyPage {
             _phantom: PhantomData,
@@ -397,17 +433,23 @@ impl Writer<'_> {
 
     /// Flushes all written pages and update the meta node root pointer.
     /// Every new page must first be written before calling `flush`.
-    pub fn flush(&self, new_root_ptr: usize) {
-        let mut guard = self.guard.borrow_mut();
+    pub fn flush(mut self, new_root_ptr: usize) {
+        let mut guard = self.state_guard.borrow_mut();
         if guard.write_offset < guard.new_offset {
             panic!("there are still new pages not yet written");
         }
         guard.flush_pages();
-        guard.flush_new_meta_node(new_root_ptr);
-        self.reader.store(Arc::new(ReaderState {
+        guard.flush_new_meta_node(new_root_ptr, &self.free_list);
+        self.store.reader_state.store(Arc::new(ReaderState {
             mmap: guard.mmap.clone(),
             flush_offset: guard.flush_offset,
         }));
+        // Note: consider Ordering::Release if perf is necessary (prob not).
+        self.store
+            .root_page
+            .store(EpochOwned::new(new_root_ptr), Ordering::SeqCst);
+
+        self.flushed = true;
     }
 
     /// Retrieves an existing page and allows the user to write to it.
@@ -415,7 +457,7 @@ impl Writer<'_> {
     /// immutable. As such, please only use this on non-B+-tree pages,
     /// i.e. free list pages.
     pub unsafe fn overwrite_page(&self, page_num: usize) -> Page<'_, ReusedPageType> {
-        let guard = self.guard.borrow();
+        let guard = self.state_guard.borrow();
         // The requested page must already been flushed or written already.
         assert!(page_num * consts::PAGE_SIZE < guard.write_offset);
         Page {
@@ -424,11 +466,20 @@ impl Writer<'_> {
             page_num,
         }
     }
+
+    /// Marks an existing page as free, allowing it to be reclaimed later
+    /// and made available via `overwrite_page()`.
+    pub fn mark_free(&self, page_num: usize) {
+        let guard = self.state_guard.borrow();
+        // The requested page must already been flushed or written already.
+        assert!(page_num * consts::PAGE_SIZE < guard.write_offset);
+        self.reclaimable_pages.borrow_mut().push(page_num);
+    }
 }
 
 impl Guard for Writer<'_> {
     fn read_page(&self, page_num: usize) -> ReadOnlyPage<'_> {
-        let guard = self.guard.borrow();
+        let guard = self.state_guard.borrow();
         assert!(
             page_num * consts::PAGE_SIZE < guard.write_offset,
             "page_num = {} must be < {}",
@@ -442,9 +493,30 @@ impl Guard for Writer<'_> {
         }
     }
 
-    fn read_meta_node(&self) -> MetaNode {
-        MetaNode::try_from(self.guard.borrow().mmap().deref())
-            .expect("there should exist a valid meta node")
+    fn root_page(&self) -> usize {
+        self.root_page
+    }
+}
+
+impl Drop for Writer<'_> {
+    fn drop(&mut self) {
+        if !self.flushed {
+            // This can happen if the write transaction errored or was aborted.
+            // Reset as if nothing ever happened.
+            let mut guard = self.state_guard.borrow_mut();
+            guard.write_offset = guard.flush_offset;
+            guard.new_offset = guard.flush_offset;
+            return;
+        }
+
+        let pages = std::mem::take(&mut *self.reclaimable_pages.borrow_mut());
+        let store = self.store.clone();
+        // Pages cannot be reclaimed back to the free list until it's
+        // guaranteed that no reader (or writer) can traverse to these pages,
+        // either from a B+ tree root node, or via the free list itself.
+        self.epoch_guard.defer(move || {
+            store.reclaim_pages(pages);
+        });
     }
 }
 
@@ -536,12 +608,12 @@ mod tests {
 
     use super::*;
 
-    fn new_file_mmap() -> (Store, NamedTempFile) {
+    fn new_file_mmap() -> (Arc<Store>, NamedTempFile) {
         let temp_file = NamedTempFile::new().unwrap();
         let path = temp_file.path();
         println!("Created temporary file {path:?}");
         let mmap = Mmap::open_or_create(path).unwrap();
-        let store = Store::new(mmap);
+        let store = Arc::new(Store::new(mmap));
         (store, temp_file)
     }
 
@@ -570,13 +642,13 @@ mod tests {
         // Scope 2: Reopen and verify
         {
             let mmap = Mmap::open_or_create(path).unwrap();
-            let store = Store::new(mmap);
+            let store = Arc::new(Store::new(mmap));
             let reader = store.reader();
 
             // Verify the meta node
-            let meta = reader.read_meta_node();
+            let root_page = reader.root_page();
             assert_eq!(
-                meta.root_page, page_num,
+                root_page, page_num,
                 "Root pointer should match the flushed page number"
             );
 
@@ -642,7 +714,8 @@ mod tests {
             page_num
         };
 
-        // Read the flushed page using the same writer
+        // Read the flushed page using a writer.
+        let writer = store.writer();
         let read_page2 = writer.read_page(page2_num);
         assert_eq!(
             &read_page2[edit_offset2..edit_offset2 + pattern2.len()],
@@ -732,10 +805,10 @@ mod tests {
         // 2. Allocate enough new pages to trigger growth.
         // Assuming the store starts with 1 page, the second new_page call should trigger growth.
         // Let's allocate a few more just to be sure, depending on initial size.
-        let initial_len = writer.guard.borrow().mmap().len();
+        let initial_len = writer.state_guard.borrow().mmap().len();
         let mut pages_allocated = 0;
         loop {
-            let current_len = writer.guard.borrow().mmap().len();
+            let current_len = writer.state_guard.borrow().mmap().len();
             if current_len > initial_len {
                 println!(
                     "Growth triggered after allocating {} pages. Initial len: {}, Current len: {}",
@@ -790,10 +863,10 @@ mod tests {
         // 3. Get another writer and trigger growth by allocating new pages.
         {
             let writer2 = store.writer();
-            let initial_len = writer2.guard.borrow().mmap().len();
+            let initial_len = writer2.state_guard.borrow().mmap().len();
             let mut pages_allocated = 0;
             loop {
-                let current_len = writer2.guard.borrow().mmap().len();
+                let current_len = writer2.state_guard.borrow().mmap().len();
                 if current_len > initial_len {
                     println!(
                         "Growth triggered after allocating {} pages. Initial len: {}, Current len: {}",
@@ -832,11 +905,8 @@ mod tests {
         let pattern = [0xAA, 0xBB, 0xCC];
         page[edit_offset..edit_offset + pattern.len()].copy_from_slice(&pattern);
 
-        let page = writer.write_page(page);
-        let page_num = page.page_num;
+        let page_num = writer.write_page(page).page_num;
         writer.flush(page_num);
-        drop(page);
-        drop(writer);
 
         let reader = store.reader();
         let read_page = reader.read_page(page_num);
@@ -868,8 +938,8 @@ mod tests {
 
     #[test]
     fn test_store_reader_writer_isolation() {
-        let (store, _temp_file) = new_file_mmap();
         use std::thread;
+        let (store, _temp_file) = new_file_mmap();
 
         let mut threads = vec![];
 
@@ -888,19 +958,22 @@ mod tests {
         let writer = store.writer();
         let mut page = writer.new_page();
         page[0] = 2;
-        writer.flush(writer.write_page(page).page_num);
+        let page_num = writer.write_page(page).page_num;
+        writer.flush(page_num);
 
         // Save a handle on that page via Store::reader() and Reader::read_page().
         threads.push(thread::spawn({
-            let reader = store.reader();
+            let store = store.clone();
             move || {
+                let reader = store.clone().reader();
                 let page = reader.read_page(page_num);
                 assert_eq!(page[0], 1);
             }
         }));
         threads.push(thread::spawn({
-            let reader = store.reader();
+            let store = store.clone();
             move || {
+                let reader = store.reader();
                 let page = reader.read_page(page_num);
                 assert_eq!(page[0], 1);
             }

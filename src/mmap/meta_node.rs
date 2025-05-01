@@ -21,6 +21,8 @@
 use crate::error::PageError;
 use std::{convert::TryFrom, ptr, rc::Rc};
 
+use super::free_list::FreeList;
+
 /// Size of a meta node as stored on disk.
 /// This MUST be at most the size of a disk sector to guarantee write atomicity
 /// of a meta page without having to rely on double buffering.
@@ -37,13 +39,9 @@ type Result<T> = std::result::Result<T, PageError>;
 /// Rather, it contains metadata about the B+ tree, including where
 /// the root node is located, how many nodes/pages are currently
 /// there (including those not yet reclaimed into the free list), etc.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(C)]
 pub struct MetaNode {
-    /// A signature to version a meta node as the data format may change over
-    /// time.
-    pub signature: [u8; 16],
-
     /// Which page represents the root of the B+ tree.
     pub root_page: usize,
 
@@ -73,13 +71,15 @@ pub struct MetaNode {
 }
 
 impl MetaNode {
-    /// Creates a new meta node representing a completely empty mmap file that
-    /// has 1 page, the B+ tree as a leaf node with no key-values.
-    pub fn new() -> Self {
+    /// Creates a new meta node from the supplied parameters.
+    pub fn new(root_page: usize, num_pages: usize, fl: &FreeList) -> Self {
         MetaNode {
-            root_page: 0,
-            num_pages: 1,
-            ..Default::default()
+            root_page,
+            num_pages,
+            head_page: fl.head_page,
+            head_seq: fl.head_seq,
+            tail_page: fl.tail_page,
+            tail_seq: fl.tail_seq,
         }
     }
 
@@ -90,14 +90,24 @@ impl MetaNode {
     }
 }
 
+impl Default for MetaNode {
+    /// Creates a new meta node representing a completely empty mmap file that
+    /// has 2 pages:
+    /// 1. the B+ tree as a leaf node with no key-values
+    /// 2. the initial empty free list node
+    fn default() -> Self {
+        Self::new(0, 2, &FreeList::default())
+    }
+}
+
 impl TryFrom<&[u8]> for MetaNode {
     type Error = PageError;
 
     fn try_from(value: &[u8]) -> Result<Self> {
-        if value.len() < META_NODE_SIZE {
+        if value.len() < META_PAGE_SIZE {
             return Err(PageError::InvalidFile(Rc::from(format!(
                 "Input slice too small for MetaNode. Expected at least {} bytes, got {}",
-                META_NODE_SIZE,
+                META_PAGE_SIZE,
                 value.len()
             ))));
         }
@@ -172,7 +182,7 @@ mod tests {
 
     #[test]
     fn test_meta_node_from_into_bytes() {
-        let original_node = MetaNode::new();
+        let original_node = MetaNode::default();
 
         // Convert node to byte buffer
         let buffer: [u8; META_PAGE_SIZE] = (&original_node).into();

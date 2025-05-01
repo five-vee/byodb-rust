@@ -34,6 +34,7 @@ impl<'a> Internal<'a> {
         writer: &'a Writer,
         entries: &[ChildEntry],
     ) -> InternalEffect<'a> {
+        writer.mark_free(self.page_num());
         let delta_keys = entries
             .iter()
             .map(|ce| match ce {
@@ -68,6 +69,8 @@ impl<'a> Internal<'a> {
         right: &'a Internal,
         writer: &'a Writer,
     ) -> InternalEffect<'a> {
+        writer.mark_free(left.page_num());
+        writer.mark_free(right.page_num());
         let itr_func = || left.iter().chain(right.iter());
         let num_keys = left.get_num_keys() + right.get_num_keys();
         if left.get_num_bytes() + right.get_num_bytes() - 4 > consts::PAGE_SIZE {
@@ -462,18 +465,20 @@ fn get_num_bytes(page: &[u8]) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use tempfile::NamedTempFile;
 
     use crate::mmap::{Mmap, Store};
 
     use super::*;
 
-    fn new_test_store() -> (Store, NamedTempFile) {
+    fn new_test_store() -> (Arc<Store>, NamedTempFile) {
         let temp_file = NamedTempFile::new().unwrap();
         let path = temp_file.path();
         println!("Created temporary file {path:?}");
         let mmap = Mmap::open_or_create(path).unwrap();
-        let store = Store::new(mmap);
+        let store = Arc::new(Store::new(mmap));
         (store, temp_file)
     }
 
