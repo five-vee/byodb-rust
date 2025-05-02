@@ -42,14 +42,15 @@ use std::{
     ops::{Deref, DerefMut},
     path::Path,
     rc::Rc,
-    sync::{atomic::Ordering, Arc, Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicPtr, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
 };
 
 use arc_swap::{ArcSwap, Guard as ArcSwapGuard};
-use crossbeam_epoch::{
-    self as epoch, Atomic as EpochAtomic, Guard as EpochGuard, Owned as EpochOwned,
-};
 use memmap2::{MmapMut, MmapOptions};
+use seize::{Collector, Guard as _, LocalGuard};
 
 use crate::{
     consts,
@@ -259,7 +260,8 @@ impl WriterState {
 pub struct Store {
     reader_state: ArcSwap<ReaderState>,
     writer_state: Mutex<WriterState>,
-    root_page: EpochAtomic<usize>,
+    collector: Collector,
+    root_page: AtomicPtr<usize>,
 }
 
 impl Store {
@@ -282,21 +284,22 @@ impl Store {
                 write_offset: flush_offset,
                 new_offset: flush_offset,
             }),
-            root_page: EpochAtomic::new(node.root_page),
+            // TODO: dependency inject collector
+            collector: Collector::new().batch_size(1),
+            root_page: AtomicPtr::new(Box::into_raw(Box::new(node.root_page))),
         }
     }
 
     /// Obtains a Reader guard.
     pub fn reader(self: &Arc<Self>) -> Reader {
-        let epoch_guard = epoch::pin();
+        let collector_guard = self.collector.enter();
         // Note: consider Ordering::Acquire if perf is necessary (prob not).
-        let shared = self.root_page.load(Ordering::SeqCst, &epoch_guard);
         // Safety: root_page is NEVER null; it is always initialized to some value.
-        let root_page = *unsafe { shared.as_ref() }.unwrap();
+        let root_page = unsafe { *collector_guard.protect(&self.root_page, Ordering::SeqCst) };
         Reader {
             root_page,
             state_guard: self.reader_state.load(),
-            epoch_guard,
+            collector_guard,
         }
     }
 
@@ -306,14 +309,19 @@ impl Store {
         let mutex_guard = self.writer_state.lock().unwrap();
         let node = MetaNode::try_from(mutex_guard.mmap().as_ref())
             .expect("there should exist a meta node");
+        let collector_guard = self.collector.enter();
+        // Note: consider Ordering::Acquire if perf is necessary (prob not).
+        let prev_root_page = collector_guard.protect(&self.root_page, Ordering::SeqCst);
         Writer {
-            root_page: node.root_page,
+            prev_root_page,
+            // Safety: not null b/c always initialized.
+            curr_root_page: unsafe { *prev_root_page },
             free_list: FreeList::from(node),
             reclaimable_pages: RefCell::new(Vec::new()),
             flushed: false,
             store: self.clone(),
             state_guard: RefCell::new(mutex_guard),
-            epoch_guard: epoch::pin(),
+            collector_guard,
         }
     }
 
@@ -326,7 +334,7 @@ impl Store {
         }
         fl.set_max_seq();
         w.free_list = fl;
-        let root_page = w.root_page; // unchanged
+        let root_page = w.curr_root_page; // unchanged
         w.flush(root_page);
     }
 }
@@ -353,13 +361,13 @@ pub trait Guard {
 /// Readers don't block each other.
 /// Readers and the Writer don't block each other, but Readers are isolated
 /// from the Writer via the flushing mechanism.
-pub struct Reader {
+pub struct Reader<'s> {
     root_page: usize,
     state_guard: ArcSwapGuard<Arc<ReaderState>>,
-    epoch_guard: EpochGuard,
+    collector_guard: LocalGuard<'s>,
 }
 
-impl Guard for Reader {
+impl Guard for Reader<'_> {
     fn read_page(&self, page_num: usize) -> ReadOnlyPage<'_> {
         let guard = &self.state_guard;
         assert!(
@@ -386,23 +394,21 @@ impl Guard for Reader {
 /// Readers and the Writer don't block each other, but Readers are isolated
 /// from the Writer via the flushing mechanism.
 pub struct Writer<'s> {
-    root_page: usize,
+    prev_root_page: *mut usize,
+    curr_root_page: usize,
     free_list: FreeList,
     reclaimable_pages: RefCell<Vec<usize>>,
     flushed: bool,
     store: Arc<Store>,
     state_guard: RefCell<MutexGuard<'s, WriterState>>,
-    epoch_guard: EpochGuard,
-}
 
-const _: () = {
-    // It's important that epoch_guard is listed AFTER state_guard
-    // so that epoch_guard is dropped AFTER state_guard is dropped.
-    // When Writer is dropped, it defers a reclaim(), which itself acquires
-    // the store's mutex. The mutex cannot be locked unless the writer first
-    // drops its MutexGuard.
-    assert!(memoffset::offset_of!(Writer, state_guard) < memoffset::offset_of!(Writer, epoch_guard))
-};
+    // It's important that collector_guard is listed AFTER state_guard
+    // so that collector_guard is dropped AFTER state_guard is dropped.
+    // When Writer is dropped, it defers page reclamation, which itself
+    // acquires the store's mutex. The mutex cannot be locked unless the writer
+    // first drops its MutexGuard.
+    collector_guard: LocalGuard<'s>,
+}
 
 impl Writer<'_> {
     /// Allocates a new page for write.
@@ -444,10 +450,11 @@ impl Writer<'_> {
             mmap: guard.mmap.clone(),
             flush_offset: guard.flush_offset,
         }));
+        self.curr_root_page = new_root_ptr;
         // Note: consider Ordering::Release if perf is necessary (prob not).
         self.store
             .root_page
-            .store(EpochOwned::new(new_root_ptr), Ordering::SeqCst);
+            .store(Box::into_raw(Box::new(new_root_ptr)), Ordering::SeqCst);
 
         self.flushed = true;
     }
@@ -494,7 +501,7 @@ impl Guard for Writer<'_> {
     }
 
     fn root_page(&self) -> usize {
-        self.root_page
+        self.curr_root_page
     }
 }
 
@@ -508,16 +515,39 @@ impl Drop for Writer<'_> {
             guard.new_offset = guard.flush_offset;
             return;
         }
+        let mut pages = self.reclaimable_pages.borrow_mut();
+        if pages.len() == 0 {
+            return;
+        }
 
-        let pages = std::mem::take(&mut *self.reclaimable_pages.borrow_mut());
-        let store = self.store.clone();
+        let reclaimable = Box::into_raw(Box::new(Reclaimable {
+            store: self.store.clone(),
+            root_page: self.prev_root_page,
+            pages: std::mem::take(&mut *pages),
+        }));
         // Pages cannot be reclaimed back to the free list until it's
         // guaranteed that no reader (or writer) can traverse to these pages,
         // either from a B+ tree root node, or via the free list itself.
-        self.epoch_guard.defer(move || {
-            store.reclaim_pages(pages);
-        });
+        // Safety: prev_root_page has already been replaced in the flush() call,
+        // so it is safe to defer its retirement.
+        unsafe {
+            self.collector_guard
+                .defer_retire(reclaimable, |r, _collector| {
+                    let r = Box::from_raw(r); // so r can be auto-dropped
+                    drop(Box::from_raw(r.root_page)); // must manually be dropped
+                    r.store.reclaim_pages(r.pages);
+                });
+        }
+        // self.epoch_guard.defer(move || {
+        //     store.reclaim_pages(pages);
+        // });
     }
+}
+
+struct Reclaimable {
+    store: Arc<Store>,
+    root_page: *mut usize,
+    pages: Vec<usize>,
 }
 
 /// A page inside the mmap region that allows only for reads.
@@ -965,7 +995,7 @@ mod tests {
         threads.push(thread::spawn({
             let store = store.clone();
             move || {
-                let reader = store.clone().reader();
+                let reader = store.reader();
                 let page = reader.read_page(page_num);
                 assert_eq!(page[0], 1);
             }
