@@ -43,8 +43,8 @@ use std::{
     path::Path,
     rc::Rc,
     sync::{
-        atomic::{AtomicPtr, Ordering},
         Arc, Mutex, MutexGuard,
+        atomic::{AtomicPtr, Ordering},
     },
 };
 
@@ -848,7 +848,10 @@ mod tests {
             }
             if pages_allocated > 10 {
                 // Safety break
-                panic!("Growth did not trigger after allocating 10 pages. Initial len: {}, Current len: {}", initial_len, current_len);
+                panic!(
+                    "Growth did not trigger after allocating 10 pages. Initial len: {}, Current len: {}",
+                    initial_len, current_len
+                );
             }
             let _ = writer.new_page(); // Allocate a new page
             pages_allocated += 1;
@@ -906,7 +909,10 @@ mod tests {
                 }
                 if pages_allocated > 10 {
                     // Safety break
-                    panic!("Growth did not trigger after allocating 10 pages. Initial len: {}, Current len: {}", initial_len, current_len);
+                    panic!(
+                        "Growth did not trigger after allocating 10 pages. Initial len: {}, Current len: {}",
+                        initial_len, current_len
+                    );
                 }
                 let _ = writer2.new_page(); // Allocate a new page
                 pages_allocated += 1;
@@ -974,14 +980,13 @@ mod tests {
         let mut threads = vec![];
 
         // Write a page and flush it. Drop the writer.
-        let page_num = {
+        {
             let writer = store.writer();
             let mut page = writer.new_page();
             page[0] = 1;
             let page_num = writer.write_page(page).page_num;
             writer.flush(page_num);
-            page_num
-        };
+        }
 
         // Get another writer via Store::writer() and write + flush another page.
         // Do NOT drop the writer.
