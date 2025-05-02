@@ -1016,7 +1016,7 @@ mod tests {
 
     #[test]
     fn test_free_list() {
-        // TODO: Test the free list:
+        // TODO: implement me.
         // 1. Get a writer.
         // Call new_page() 3 times. Each page will get its own edit:
         // * set all bytes of page1 to 1.
@@ -1036,5 +1036,20 @@ mod tests {
         // Extract its free list.
         // Verify that the free list consists of 1 node (head_page == tail_page).
         // Verify that the free list contains 2 free pointers (tail_seq - head_seq == 2).
+    }
+
+    #[test]
+    fn test_free_list_fill_then_empty() {
+        // TODO: implement me.
+        // The Store starts with an empty free list.
+        // Fill up the free list with 2 nodes worth by calling Writer::new_page(),
+        // then Writer::mark_free(), and then Writer::flush(),
+        // which btw calls Store::reclaim_pages() and thus calls FreeList::push_tail(),
+        // over and over again.
+        // You can tell the free list has 2 nodes worth by reading the file after flush
+        // for the meta node's free list and verifying that tail_page != head_page.
+        // Completely consume from the free list until it's empty via Writer::new_page(),
+        // which calls FreeList::pop_head().
+        // Flush.
     }
 }
