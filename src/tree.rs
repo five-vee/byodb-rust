@@ -58,7 +58,7 @@ impl<'g, G: Guard> Tree<'g, G> {
 
     /// Gets the value corresponding to the key.
     pub fn get(&self, key: &[u8]) -> Result<Option<&[u8]>> {
-        match Node::read(self.guard, self.page_num) {
+        match Self::read(self.guard, self.page_num) {
             Node::Internal(parent) => {
                 let child_idx = parent.find(key);
                 let child_num = parent.get_child_pointer(child_idx);
@@ -77,6 +77,14 @@ impl<'g, G: Guard> Tree<'g, G> {
             }
             Node::Leaf(root) => Ok(root.find(key)),
         }
+    }
+
+    /// Reads the page at `page_num` and returns it represented as a [`Node`].
+    /// This is a convenience wrapper around the unsafe [`Node::read`].
+    fn read(guard: &G, page_num: usize) -> Node<'_> {
+        // Safety: The tree maintains the invariant that it'll only read nodes
+        // that are traversible from the root, including the root itself.
+        unsafe { Node::read(guard, page_num) }
     }
 }
 
@@ -100,7 +108,7 @@ impl<'g> Tree<'g, Writer<'_>> {
     ///
     /// This is a recursive implementation of `insert`.
     fn insert_helper(&self, key: &'g [u8], val: &'g [u8]) -> Result<NodeEffect<'g>> {
-        let node = Node::read(self.guard, self.page_num);
+        let node = Self::read(self.guard, self.page_num);
         match &node {
             // Base case
             Node::Leaf(leaf) => Ok(leaf.insert(self.guard, key, val)?.into()),
@@ -138,7 +146,7 @@ impl<'g> Tree<'g, Writer<'_>> {
     ///
     /// This is a recursive implementation of `update`.
     fn update_helper(&self, key: &'g [u8], val: &'g [u8]) -> Result<NodeEffect<'g>> {
-        let node = Node::read(self.guard, self.page_num);
+        let node = Self::read(self.guard, self.page_num);
         match &node {
             // Base case
             Node::Leaf(leaf) => Ok(leaf.update(self.guard, key, val)?.into()),
@@ -183,7 +191,7 @@ impl<'g> Tree<'g, Writer<'_>> {
     ///
     /// This is a recursive implementation of `delete`.
     fn delete_helper(&self, key: &[u8]) -> Result<NodeEffect<'g>> {
-        let node = Node::read(self.guard, self.page_num);
+        let node = Self::read(self.guard, self.page_num);
         match &node {
             // Base case
             Node::Leaf(leaf) => Ok(leaf.delete(self.guard, key)?.into()),
@@ -289,7 +297,7 @@ impl<'g> Tree<'g, Writer<'_>> {
         sibling_idx: usize,
     ) -> Option<NodeEffect<'g>> {
         let sibling_num = parent.get_child_pointer(sibling_idx);
-        let sibling = &Node::read(self.guard, sibling_num);
+        let sibling = &Self::read(self.guard, sibling_num);
 
         let can_steal_or_merge = node::can_steal(sibling, child, sibling_idx < child_idx)
             || node::can_merge(sibling, child);
@@ -357,7 +365,7 @@ impl<'g, G: Guard> Tree<'g, G> {
     /// Gets the height of the tree.
     /// This performs a scan of the entire tree, so it's not really efficient.
     fn height(&self) -> Result<u32> {
-        let node = Node::read(self.guard, self.page_num);
+        let node = Self::read(self.guard, self.page_num);
         match &node {
             Node::Leaf(_) => Ok(1),
             Node::Internal(node) => {
@@ -399,7 +407,7 @@ impl<'g, G: Guard> Iterator for InOrder<'g, G> {
     type Item = (Rc<[u8]>, Rc<[u8]>);
     fn next(&mut self) -> Option<Self::Item> {
         while let Some((i, tree)) = self.stack.pop() {
-            let node = Node::read(tree.guard, tree.page_num);
+            let node = Tree::read(tree.guard, tree.page_num);
             let n = node.get_num_keys();
             if i == n {
                 continue;
@@ -529,7 +537,7 @@ mod tests {
         insert_until_height(store.writer(), 3);
         let reader = store.reader();
         let tree = Tree::new(&reader);
-        let root = Node::read(&reader, tree.page_num);
+        let root = Tree::read(&reader, tree.page_num);
         assert!(matches!(root, Node::Internal(_)));
         assert!(root.get_num_keys() >= 2);
         let got = tree.inorder_iter().collect::<Vec<_>>();
@@ -640,7 +648,7 @@ mod tests {
         let reader = store.reader();
         let tree = Tree::new(&reader);
         assert_eq!(tree.height().unwrap(), 1);
-        let root = Node::read(&reader, tree.page_num);
+        let root = Tree::read(&reader, tree.page_num);
         assert_eq!(root.get_num_keys(), 0);
     }
 
@@ -676,14 +684,14 @@ mod tests {
             .insert(&[5; consts::MAX_KEY_SIZE], &[5; consts::MAX_VALUE_SIZE])
             .unwrap();
         assert_eq!(tree.height().unwrap(), 2);
-        assert_eq!(Node::read(&writer, tree.page_num).get_num_keys(), 5);
+        assert_eq!(Tree::read(&writer, tree.page_num).get_num_keys(), 5);
 
         // Delete &[1]. This should trigger a split,
         // and the height should grow.
         let tree = tree.delete(&[1]).unwrap();
         assert!(tree.get(&[1]).unwrap().is_none());
         assert_eq!(tree.height().unwrap(), 3);
-        assert_eq!(Node::read(&writer, tree.page_num).get_num_keys(), 2);
+        assert_eq!(Tree::read(&writer, tree.page_num).get_num_keys(), 2);
 
         // Delete the last leaf for more test coverage
         _ = tree.delete(&[5; consts::MAX_KEY_SIZE]).unwrap();
@@ -727,14 +735,14 @@ mod tests {
             .insert(&[5; consts::MAX_KEY_SIZE], &[5; consts::MAX_VALUE_SIZE])
             .unwrap();
         assert_eq!(tree.height().unwrap(), 3);
-        assert_eq!(Node::read(&writer, tree.page_num).get_num_keys(), 2);
+        assert_eq!(Tree::read(&writer, tree.page_num).get_num_keys(), 2);
 
         // Delete &[3]. This should trigger a split,
         // but the height shouldn't grow.
         let tree = tree.delete(&[3]).unwrap();
         assert!(tree.get(&[3]).unwrap().is_none());
         assert_eq!(tree.height().unwrap(), 3);
-        assert_eq!(Node::read(&writer, tree.page_num).get_num_keys(), 3);
+        assert_eq!(Tree::read(&writer, tree.page_num).get_num_keys(), 3);
     }
 
     // [ 1000 x 2 ]
@@ -778,7 +786,7 @@ mod tests {
             .insert(&[24], &[24; 1000])
             .unwrap();
         assert_eq!(tree.height().unwrap(), 4);
-        assert_eq!(Node::read(&writer, tree.page_num).get_num_keys(), 2);
+        assert_eq!(Tree::read(&writer, tree.page_num).get_num_keys(), 2);
 
         // Delete &[20]. This should trigger a split,
         // but the height shouldn't grow.
@@ -786,6 +794,6 @@ mod tests {
         let tree = tree.delete(&[20]).unwrap();
         assert!(tree.get(&[20]).unwrap().is_none());
         assert_eq!(tree.height().unwrap(), 4);
-        assert_eq!(Node::read(&writer, tree.page_num).get_num_keys(), 2);
+        assert_eq!(Tree::read(&writer, tree.page_num).get_num_keys(), 2);
     }
 }

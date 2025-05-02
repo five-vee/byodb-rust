@@ -119,8 +119,10 @@ pub enum Node<'a> {
 }
 
 impl<'a> Node<'a> {
-    pub fn read<G: Guard>(guard: &'a G, page_num: usize) -> Node<'a> {
-        let page = guard.read_page(page_num);
+    /// Reads the page at `page_num` and returns it represented as a `Node`.
+    /// This is unsafe for the same reason [`Guard::read_page`] is unsafe.
+    pub unsafe fn read<G: Guard>(guard: &'a G, page_num: usize) -> Node<'a> {
+        let page = unsafe { guard.read_page(page_num) };
         Self::try_from(page).unwrap()
     }
 

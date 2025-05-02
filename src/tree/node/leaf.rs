@@ -15,14 +15,6 @@ pub struct Leaf<'a> {
 }
 
 impl<'a> Leaf<'a> {
-    /// Reads a page as a leaf node type.
-    pub fn read<G: Guard>(guard: &'a G, page_num: usize) -> Leaf<'a> {
-        let page = guard.read_page(page_num);
-        let node_type = header::get_node_type(page.as_ref()).unwrap();
-        assert_eq!(node_type, NodeType::Leaf);
-        Leaf { page }
-    }
-
     /// Inserts a key-value pair.
     pub fn insert(
         &self,
@@ -145,7 +137,7 @@ impl<'a> Leaf<'a> {
 
     /// Gets the page number associated to the leaf node.
     pub fn page_num(&self) -> usize {
-        self.page.page_num
+        self.page.page_num()
     }
 
     /// Returns a key-value iterator of the leaf.
@@ -175,6 +167,17 @@ impl<'a> Leaf<'a> {
             val,
             skip: false,
         }
+    }
+}
+
+#[cfg(test)]
+impl<'g> Leaf<'g> {
+    /// Reads a page as a leaf node type.
+    fn read<G: Guard>(guard: &'g G, page_num: usize) -> Leaf<'g> {
+        let page = unsafe { guard.read_page(page_num) };
+        let node_type = header::get_node_type(page.as_ref()).unwrap();
+        assert_eq!(node_type, NodeType::Leaf);
+        Leaf { page }
     }
 }
 
@@ -275,8 +278,7 @@ impl<'s, 'w> Builder<'s, 'w> {
             n
         );
         assert_ne!(n, 0, "This case should be handled by Leaf::delete instead.");
-        let page = self.writer.write_page(self.page);
-        page.try_into().unwrap()
+        self.page.read_only().try_into().unwrap()
     }
 }
 

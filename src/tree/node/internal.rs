@@ -109,7 +109,7 @@ impl<'a> Internal<'a> {
 
     /// Gets the page number associated to the internal node.
     pub fn page_num(&self) -> usize {
-        self.page.page_num
+        self.page.page_num()
     }
 
     /// Creates a child-entry iterator for the internal node.
@@ -244,8 +244,7 @@ impl<'s, 'w> Builder<'s, 'w> {
             self.i,
             n
         );
-        let page = self.writer.write_page(self.page);
-        page.try_into().unwrap()
+        self.page.read_only().try_into().unwrap()
     }
 }
 

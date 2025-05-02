@@ -10,12 +10,11 @@
 use std::{
     marker::PhantomData,
     ops::{Deref, DerefMut},
-    usize,
 };
 
 use crate::{consts, mmap::Page};
 
-use super::{meta_node::MetaNode, Guard as _, ReadOnlyPage, ReusedPageType, Writer};
+use super::{Guard as _, ReadOnlyPage, WriteablePageType, Writer, meta_node::MetaNode};
 
 const FREE_LIST_CAP: usize = (consts::PAGE_SIZE - 8) / 8;
 const INVALID_NEXT: usize = usize::MAX;
@@ -61,8 +60,7 @@ impl FreeList {
             // or allocate a new node by appending
             let mut page = writer.new_page();
             init_empty_list_node(&mut page);
-            let page = writer.write_page(page);
-            page.page_num
+            page.read_only().page_num()
         });
 
         // link to the new tail node
@@ -70,6 +68,8 @@ impl FreeList {
         self.tail_page = next;
         // Safety: tail_page points to a page that is guaranteed to never
         // have any concurrent readers accessing it.
+        // Also, &mut self ensures there is only one mutable reference to the
+        // underlying page.
         node = unsafe { writer.overwrite_page(self.tail_page) }.into();
 
         // also add the head node if it's removed
@@ -88,7 +88,8 @@ impl FreeList {
         if self.head_seq == self.max_seq {
             return (None, None); // cannot advance
         }
-        let node: ListNode<'_, _> = writer.read_page(self.head_page).into();
+        // Safety: &mut self ensures exclusive access to the head list node page.
+        let node: ListNode<'_, _> = unsafe { writer.read_page(self.head_page) }.into();
         let ptr = node.get_pointer(seq_to_index(self.head_seq));
         self.head_seq += 1;
 
@@ -191,8 +192,8 @@ impl<P: DerefMut<Target = [u8]>> ListNode<'_, P> {
     }
 }
 
-impl<'w> From<Page<'w, ReusedPageType>> for ListNode<'w, Page<'w, ReusedPageType>> {
-    fn from(page: Page<'w, ReusedPageType>) -> Self {
+impl<'w> From<Page<'w, WriteablePageType>> for ListNode<'w, Page<'w, WriteablePageType>> {
+    fn from(page: Page<'w, WriteablePageType>) -> Self {
         ListNode {
             _phantom: PhantomData,
             page,

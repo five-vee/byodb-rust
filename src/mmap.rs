@@ -185,7 +185,6 @@ unsafe impl Sync for ReaderState {}
 struct WriterState {
     mmap: Arc<UnsafeCell<Mmap>>,
     flush_offset: usize,
-    write_offset: usize,
     new_offset: usize,
 }
 
@@ -217,7 +216,7 @@ impl WriterState {
     fn flush_pages(&mut self) {
         let m = self.mmap_mut();
         m.flush();
-        self.flush_offset = self.write_offset;
+        self.flush_offset = self.new_offset;
     }
 
     /// Grows the underlying mmap only if there's no more space for new pages.
@@ -281,7 +280,6 @@ impl Store {
             writer_state: Mutex::new(WriterState {
                 mmap: mmap.clone(),
                 flush_offset,
-                write_offset: flush_offset,
                 new_offset: flush_offset,
             }),
             // TODO: dependency inject collector
@@ -343,14 +341,22 @@ impl Store {
 /// It provides guarded read-only access to the mmap region.
 pub trait Guard {
     /// Reads a page at `page_num`.
+    ///
+    /// This function is unsafe b/c if used incorrectly, it can access pages
+    /// that is actively shared with a writer. This can happen if
+    /// `writer.overwrite_page(page_num)` was called and the `Page` was not yet
+    /// dropped.
+    ///
+    /// To safely use this function, please ensure to only read pages that
+    /// are guaranteed to never have any concurrent readers accessing it.
+    ///
     /// Note: If the implementing type is Reader, only flushed pages can be
     /// read.
     ///
     /// If it's a Writer, then either flushed or written pages can be read.
     /// Newly allocated pages must be written first before they can be read.
     /// Remember to flush pages to make them available to future readers.
-    /// TODO: make this unsafe.
-    fn read_page(&self, page_num: usize) -> ReadOnlyPage<'_>;
+    unsafe fn read_page(&self, page_num: usize) -> ReadOnlyPage<'_>;
 
     /// Obtains the root page number accessible by the guard.
     fn root_page(&self) -> usize;
@@ -368,7 +374,7 @@ pub struct Reader<'s> {
 }
 
 impl Guard for Reader<'_> {
-    fn read_page(&self, page_num: usize) -> ReadOnlyPage<'_> {
+    unsafe fn read_page(&self, page_num: usize) -> ReadOnlyPage<'_> {
         let guard = &self.state_guard;
         assert!(
             page_num * consts::PAGE_SIZE < guard.flush_offset,
@@ -412,7 +418,7 @@ pub struct Writer<'s> {
 
 impl Writer<'_> {
     /// Allocates a new page for write.
-    pub fn new_page(&self) -> Page<'_, NewPageType> {
+    pub fn new_page(&self) -> Page<'_, WriteablePageType> {
         let mut guard = self.state_guard.borrow_mut();
         guard.grow_if_needed();
         let page = Page {
@@ -424,26 +430,10 @@ impl Writer<'_> {
         page
     }
 
-    /// Finalizes a page, marking it read-only.
-    /// This does NOT make the page available to readers;
-    /// the page must be flushed first.
-    pub fn write_page<'w>(&'w self, page: Page<'w, NewPageType>) -> ReadOnlyPage<'w> {
-        let mut guard = self.state_guard.borrow_mut();
-        guard.write_offset += consts::PAGE_SIZE;
-        ReadOnlyPage {
-            _phantom: PhantomData,
-            mmap: page.mmap,
-            page_num: page.page_num,
-        }
-    }
-
     /// Flushes all written pages and update the meta node root pointer.
     /// Every new page must first be written before calling `flush`.
     pub fn flush(mut self, new_root_ptr: usize) {
         let mut guard = self.state_guard.borrow_mut();
-        if guard.write_offset < guard.new_offset {
-            panic!("there are still new pages not yet written");
-        }
         guard.flush_pages();
         guard.flush_new_meta_node(new_root_ptr, &self.free_list);
         self.store.reader_state.store(Arc::new(ReaderState {
@@ -460,13 +450,14 @@ impl Writer<'_> {
     }
 
     /// Retrieves an existing page and allows the user to write to it.
+    ///
     /// This is unsafe b/c it can allow overwriting data that is assumed to be
     /// immutable. As such, please only use this on non-B+-tree pages,
-    /// i.e. free list pages.
-    pub unsafe fn overwrite_page(&self, page_num: usize) -> Page<'_, ReusedPageType> {
+    /// i.e. free list pages. Also, make sure there exists only one mutable
+    /// reference at a time to the underlying page.
+    pub unsafe fn overwrite_page(&self, page_num: usize) -> Page {
         let guard = self.state_guard.borrow();
-        // The requested page must already been flushed or written already.
-        assert!(page_num * consts::PAGE_SIZE < guard.write_offset);
+        assert!(page_num * consts::PAGE_SIZE < guard.new_offset);
         Page {
             _phantom: PhantomData,
             mmap: guard.mmap.clone(),
@@ -478,20 +469,19 @@ impl Writer<'_> {
     /// and made available via `overwrite_page()`.
     pub fn mark_free(&self, page_num: usize) {
         let guard = self.state_guard.borrow();
-        // The requested page must already been flushed or written already.
-        assert!(page_num * consts::PAGE_SIZE < guard.write_offset);
+        assert!(page_num * consts::PAGE_SIZE < guard.new_offset);
         self.reclaimable_pages.borrow_mut().push(page_num);
     }
 }
 
 impl Guard for Writer<'_> {
-    fn read_page(&self, page_num: usize) -> ReadOnlyPage<'_> {
+    unsafe fn read_page(&self, page_num: usize) -> ReadOnlyPage<'_> {
         let guard = self.state_guard.borrow();
         assert!(
-            page_num * consts::PAGE_SIZE < guard.write_offset,
+            page_num * consts::PAGE_SIZE < guard.new_offset,
             "page_num = {} must be < {}",
             page_num,
-            guard.write_offset / consts::PAGE_SIZE
+            guard.new_offset / consts::PAGE_SIZE
         );
         ReadOnlyPage {
             _phantom: PhantomData,
@@ -511,7 +501,6 @@ impl Drop for Writer<'_> {
             // This can happen if the write transaction errored or was aborted.
             // Reset as if nothing ever happened.
             let mut guard = self.state_guard.borrow_mut();
-            guard.write_offset = guard.flush_offset;
             guard.new_offset = guard.flush_offset;
             return;
         }
@@ -550,45 +539,38 @@ struct Reclaimable {
     pages: Vec<usize>,
 }
 
-/// A page inside the mmap region that allows only for reads.
-/// The lifetime 'a is tied to either a Reader or Writer:
-/// * if a Reader, then it represents a flushed page.
-/// * if a Writer, then it can represent either a flushed or
-///   written (but not yet flushed) page.
-pub struct ReadOnlyPage<'a> {
-    _phantom: PhantomData<&'a ()>,
-    mmap: Arc<UnsafeCell<Mmap>>,
-    pub page_num: usize,
-}
-
-impl<'a> Deref for ReadOnlyPage<'a> {
-    type Target = [u8];
-    fn deref(&self) -> &'a [u8] {
-        // Safety: [page_ptr, page_ptr + PAGE_SIZE) is a guaranteed valid region in the mmap.
-        // It is guaranteed that no writers can touch this region (since it's already flushed).
-        // page_ptr cannot dangle b/c the mmap is never dropped/realloc'ed so long as
-        // the reader guard (&'r Reader) exists.
-        &unsafe { &*self.mmap.get() }.mmap[meta_node::META_PAGE_SIZE
-            + self.page_num * consts::PAGE_SIZE
-            ..meta_node::META_PAGE_SIZE + (self.page_num + 1) * consts::PAGE_SIZE]
-    }
-}
-
 pub trait PageType {}
 
-pub struct NewPageType;
-impl PageType for NewPageType {}
+pub struct ReadOnlyPageType;
+impl PageType for ReadOnlyPageType {}
 
-pub struct ReusedPageType;
-impl PageType for ReusedPageType {}
+pub struct WriteablePageType;
+impl PageType for WriteablePageType {}
 
-/// A page inside the mmap region that allows for reads and writes.
+pub type ReadOnlyPage<'a> = Page<'a, ReadOnlyPageType>;
+
+/// A page inside the mmap region that allows for reads and possibly writes.
 /// A page is not accessible to readers until flushed.
-/// Nor can it be read by a writer until written.
-pub struct Page<'w, T: PageType = NewPageType> {
+pub struct Page<'w, T: PageType = WriteablePageType> {
     _phantom: PhantomData<&'w T>,
     mmap: Arc<UnsafeCell<Mmap>>,
     page_num: usize,
+}
+
+impl Page<'_, ReadOnlyPageType> {
+    pub fn page_num(&self) -> usize {
+        self.page_num
+    }
+}
+
+impl<'w> Page<'w, WriteablePageType> {
+    pub fn read_only(self) -> Page<'w, ReadOnlyPageType> {
+        Page {
+            _phantom: PhantomData,
+            mmap: self.mmap,
+            page_num: self.page_num,
+        }
+    }
 }
 
 impl<T: PageType> Deref for Page<'_, T> {
@@ -605,7 +587,7 @@ impl<T: PageType> Deref for Page<'_, T> {
     }
 }
 
-impl<T: PageType> DerefMut for Page<'_, T> {
+impl DerefMut for Page<'_, WriteablePageType> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         // Safety: [page_ptr, page_ptr + PAGE_SIZE) is a guaranteed valid region in the mmap.
         // Due to the mutex guard in Writer, at most one mutable reference can
@@ -622,7 +604,7 @@ impl<T: PageType> DerefMut for Page<'_, T> {
 pub fn write_empty_leaf(writer: &Writer) -> usize {
     let mut page = writer.new_page();
     init_empty_leaf(&mut page);
-    writer.write_page(page).page_num
+    page.read_only().page_num()
 }
 
 fn init_empty_leaf(page: &mut [u8]) {
@@ -662,8 +644,7 @@ mod tests {
 
             page[edit_offset..edit_offset + pattern.len()].copy_from_slice(&pattern);
 
-            let written_page = writer.write_page(page);
-            page_num = written_page.page_num;
+            page_num = page.read_only().page_num();
             // Flush with the root pointer as the new page number for simplicity
             writer.flush(page_num);
         }
@@ -683,7 +664,7 @@ mod tests {
             );
 
             // Verify the page
-            let read_page = reader.read_page(page_num);
+            let read_page = unsafe { reader.read_page(page_num) };
             assert_eq!(
                 &read_page[edit_offset..edit_offset + pattern.len()],
                 &pattern,
@@ -721,11 +702,11 @@ mod tests {
         let page1_num = {
             let mut page = writer.new_page();
             page[edit_offset1..edit_offset1 + pattern1.len()].copy_from_slice(&pattern1);
-            writer.write_page(page).page_num
+            page.read_only().page_num()
         };
 
         // Read the written page using the same writer
-        let read_page1 = writer.read_page(page1_num);
+        let read_page1 = unsafe { writer.read_page(page1_num) };
         assert_eq!(
             &read_page1[edit_offset1..edit_offset1 + pattern1.len()],
             &pattern1,
@@ -739,14 +720,14 @@ mod tests {
         let page2_num = {
             let mut page = writer.new_page();
             page[edit_offset2..edit_offset2 + pattern2.len()].copy_from_slice(&pattern2);
-            let page_num = writer.write_page(page).page_num;
+            let page_num = page.read_only().page_num;
             writer.flush(page_num); // Flush this page
             page_num
         };
 
         // Read the flushed page using a writer.
         let writer = store.writer();
-        let read_page2 = writer.read_page(page2_num);
+        let read_page2 = unsafe { writer.read_page(page2_num) };
         assert_eq!(
             &read_page2[edit_offset2..edit_offset2 + pattern2.len()],
             &pattern2,
@@ -771,14 +752,14 @@ mod tests {
             let writer = store.writer();
             let mut page = writer.new_page();
             page[edit_offset1..edit_offset1 + pattern1.len()].copy_from_slice(&pattern1);
-            page1_num = writer.write_page(page).page_num;
+            page1_num = page.read_only().page_num();
             writer.flush(page1_num);
         } // Writer dropped here
 
         // 2. Get a reader and verify it can read the flushed page.
         {
             let reader1 = store.reader();
-            let read_page1 = reader1.read_page(page1_num);
+            let read_page1 = unsafe { reader1.read_page(page1_num) };
             assert_eq!(
                 &read_page1[edit_offset1..edit_offset1 + pattern1.len()],
                 &pattern1,
@@ -801,7 +782,7 @@ mod tests {
         {
             let reader2 = store.reader();
             // Can still read the first flushed page
-            let read_page1_again = reader2.read_page(page1_num);
+            let read_page1_again = unsafe { reader2.read_page(page1_num) };
             assert_eq!(
                 &read_page1_again[edit_offset1..edit_offset1 + pattern1.len()],
                 &pattern1,
@@ -822,7 +803,7 @@ mod tests {
         let page1 = {
             let mut page = writer.new_page();
             page[edit_offset..edit_offset + pattern.len()].copy_from_slice(&pattern);
-            writer.write_page(page) // Keep the ReadOnlyPage handle
+            page.read_only() // Keep the ReadOnlyPage handle
         };
 
         // Verify initial read is okay
@@ -878,13 +859,13 @@ mod tests {
             let writer = store.writer();
             let mut page = writer.new_page();
             page[edit_offset..edit_offset + pattern.len()].copy_from_slice(&pattern);
-            page1_num = writer.write_page(page).page_num;
+            page1_num = page.read_only().page_num();
             writer.flush(page1_num);
         } // Writer dropped here
 
         // 2. Get a reader and obtain a ReadOnlyPage handle for the flushed page.
         let reader = store.reader();
-        let page1_handle = reader.read_page(page1_num);
+        let page1_handle = unsafe { reader.read_page(page1_num) };
 
         // Verify initial read is okay
         assert_eq!(
@@ -941,11 +922,11 @@ mod tests {
         let pattern = [0xAA, 0xBB, 0xCC];
         page[edit_offset..edit_offset + pattern.len()].copy_from_slice(&pattern);
 
-        let page_num = writer.write_page(page).page_num;
+        let page_num = page.read_only().page_num();
         writer.flush(page_num);
 
         let reader = store.reader();
-        let read_page = reader.read_page(page_num);
+        let read_page = unsafe { reader.read_page(page_num) };
 
         // Verify the dummy value made at the edit site is there and that the page is of correct size
         assert_eq!(read_page.len(), consts::PAGE_SIZE);
@@ -962,14 +943,14 @@ mod tests {
         let (store, _temp_file) = new_file_mmap();
         let writer = store.writer();
         let page = writer.new_page();
-        let page_num = writer.write_page(page).page_num;
+        let page_num = page.read_only().page_num();
         // DON'T flush. Drop the writer instead.
         drop(writer);
 
         let reader = store.reader();
         // Try to read the recently written page via Reader::read_page(page_num).
         // This should fail b/c not flushed yet.
-        let _ = reader.read_page(page_num);
+        let _ = unsafe { reader.read_page(page_num) };
     }
 
     #[test]
@@ -984,7 +965,7 @@ mod tests {
             let writer = store.writer();
             let mut page = writer.new_page();
             page[0] = 1;
-            let page_num = writer.write_page(page).page_num;
+            let page_num = page.read_only().page_num();
             writer.flush(page_num);
         }
 
@@ -993,7 +974,7 @@ mod tests {
         let writer = store.writer();
         let mut page = writer.new_page();
         page[0] = 2;
-        let page_num = writer.write_page(page).page_num;
+        let page_num = page.read_only().page_num();
         writer.flush(page_num);
 
         // Save a handle on that page via Store::reader() and Reader::read_page().
@@ -1001,7 +982,7 @@ mod tests {
             let store = store.clone();
             move || {
                 let reader = store.reader();
-                let page = reader.read_page(page_num);
+                let page = unsafe { reader.read_page(page_num) };
                 assert_eq!(page[0], 1);
             }
         }));
@@ -1009,7 +990,7 @@ mod tests {
             let store = store.clone();
             move || {
                 let reader = store.reader();
-                let page = reader.read_page(page_num);
+                let page = unsafe { reader.read_page(page_num) };
                 assert_eq!(page[0], 1);
             }
         }));
