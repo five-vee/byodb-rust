@@ -66,6 +66,7 @@ const MIN_FILE_GROWTH_SIZE: usize = (1 << 14) * consts::PAGE_SIZE;
 #[cfg(test)]
 const MIN_FILE_GROWTH_SIZE: usize = 2 * consts::PAGE_SIZE;
 
+#[allow(dead_code)]
 type Result<T> = std::result::Result<T, PageError>;
 
 /// A wrapper around a memory-mapped region (mmap).
@@ -186,6 +187,8 @@ struct WriterState {
     mmap: Arc<UnsafeCell<Mmap>>,
     flush_offset: usize,
     new_offset: usize,
+    reclaimable_pages: Vec<usize>,
+    free_list: FreeList,
 }
 
 // Safety: Although UnsafeCell isn't Sync, we promise that only 1 WriterState
@@ -235,9 +238,13 @@ impl WriterState {
     }
 
     /// Flushes only the meta node of the mmap.
-    fn flush_new_meta_node(&mut self, new_root_ptr: usize, fl: &FreeList) {
+    fn flush_new_meta_node(&mut self, new_root_ptr: usize) {
         let m = self.mmap_mut();
-        let curr = MetaNode::new(new_root_ptr, self.flush_offset / consts::PAGE_SIZE, &fl);
+        let curr = MetaNode::new(
+            new_root_ptr,
+            self.flush_offset / consts::PAGE_SIZE,
+            &self.free_list,
+        );
         curr.copy_to_slice(m.deref_mut());
         m.flush();
     }
@@ -281,6 +288,8 @@ impl Store {
                 mmap: mmap.clone(),
                 flush_offset,
                 new_offset: flush_offset,
+                reclaimable_pages: Vec::new(),
+                free_list: FreeList::from(node),
             }),
             // TODO: dependency inject collector
             collector: Collector::new().batch_size(1),
@@ -297,7 +306,7 @@ impl Store {
         Reader {
             root_page,
             state_guard: self.reader_state.load(),
-            collector_guard,
+            _collector_guard: collector_guard,
         }
     }
 
@@ -305,8 +314,6 @@ impl Store {
     /// was previously obtained and not yet dropped.
     pub fn writer(self: &Arc<Self>) -> Writer<'_> {
         let mutex_guard = self.writer_state.lock().unwrap();
-        let node = MetaNode::try_from(mutex_guard.mmap().as_ref())
-            .expect("there should exist a meta node");
         let collector_guard = self.collector.enter();
         // Note: consider Ordering::Acquire if perf is necessary (prob not).
         let prev_root_page = collector_guard.protect(&self.root_page, Ordering::SeqCst);
@@ -314,8 +321,6 @@ impl Store {
             prev_root_page,
             // Safety: not null b/c always initialized.
             curr_root_page: unsafe { *prev_root_page },
-            free_list: FreeList::from(node),
-            reclaimable_pages: RefCell::new(Vec::new()),
             flushed: false,
             store: self.clone(),
             state_guard: RefCell::new(mutex_guard),
@@ -324,14 +329,19 @@ impl Store {
     }
 
     /// Adds pages to the free list.
-    fn reclaim_pages(self: &Arc<Self>, pages: Vec<usize>) {
-        let mut w = self.writer();
-        let mut fl = w.free_list;
+    fn reclaim_pages(self: &Arc<Self>) {
+        let w = self.writer();
+        let (mut fl, pages) = {
+            let mut borrow = w.state_guard.borrow_mut();
+            let fl = borrow.free_list;
+            let pages = std::mem::take(&mut borrow.reclaimable_pages);
+            (fl, pages)
+        };
         for page_num in pages {
             fl.push_tail(&w, page_num);
         }
         fl.set_max_seq();
-        w.free_list = fl;
+        w.state_guard.borrow_mut().free_list = fl;
         let root_page = w.curr_root_page; // unchanged
         w.flush(root_page);
     }
@@ -370,7 +380,7 @@ pub trait Guard {
 pub struct Reader<'s> {
     root_page: usize,
     state_guard: ArcSwapGuard<Arc<ReaderState>>,
-    collector_guard: LocalGuard<'s>,
+    _collector_guard: LocalGuard<'s>,
 }
 
 impl Guard for Reader<'_> {
@@ -402,8 +412,6 @@ impl Guard for Reader<'_> {
 pub struct Writer<'s> {
     prev_root_page: *mut usize,
     curr_root_page: usize,
-    free_list: FreeList,
-    reclaimable_pages: RefCell<Vec<usize>>,
     flushed: bool,
     store: Arc<Store>,
     state_guard: RefCell<MutexGuard<'s, WriterState>>,
@@ -419,15 +427,22 @@ pub struct Writer<'s> {
 impl Writer<'_> {
     /// Allocates a new page for write.
     pub fn new_page(&self) -> Page<'_, WriteablePageType> {
-        let mut guard = self.state_guard.borrow_mut();
-        guard.grow_if_needed();
-        let page = Page {
+        let guard = &self.state_guard;
+        // Try from the free list first.
+        let mut fl = guard.borrow_mut().free_list;
+        let page_num = fl.pop_head(self).unwrap_or({
+            // Otherwise allocate from the page bank.
+            let mut borrow = guard.borrow_mut();
+            borrow.grow_if_needed();
+            borrow.new_offset += consts::PAGE_SIZE;
+            (borrow.new_offset - 1) / consts::PAGE_SIZE
+        });
+        guard.borrow_mut().free_list = fl;
+        Page {
             _phantom: PhantomData,
-            mmap: guard.mmap.clone(),
-            page_num: guard.new_offset / consts::PAGE_SIZE,
-        };
-        guard.new_offset += consts::PAGE_SIZE;
-        page
+            mmap: guard.borrow().mmap.clone(),
+            page_num,
+        }
     }
 
     /// Flushes all written pages and update the meta node root pointer.
@@ -435,17 +450,18 @@ impl Writer<'_> {
     pub fn flush(mut self, new_root_ptr: usize) {
         let mut guard = self.state_guard.borrow_mut();
         guard.flush_pages();
-        guard.flush_new_meta_node(new_root_ptr, &self.free_list);
+        guard.flush_new_meta_node(new_root_ptr);
         self.store.reader_state.store(Arc::new(ReaderState {
             mmap: guard.mmap.clone(),
             flush_offset: guard.flush_offset,
         }));
         self.curr_root_page = new_root_ptr;
         // Note: consider Ordering::Release if perf is necessary (prob not).
-        self.store
-            .root_page
-            .store(Box::into_raw(Box::new(new_root_ptr)), Ordering::SeqCst);
-
+        self.prev_root_page = self.collector_guard.swap(
+            &self.store.root_page,
+            Box::into_raw(Box::new(new_root_ptr)),
+            Ordering::SeqCst,
+        );
         self.flushed = true;
     }
 
@@ -468,24 +484,24 @@ impl Writer<'_> {
     /// Marks an existing page as free, allowing it to be reclaimed later
     /// and made available via `overwrite_page()`.
     pub fn mark_free(&self, page_num: usize) {
-        let guard = self.state_guard.borrow();
-        assert!(page_num * consts::PAGE_SIZE < guard.new_offset);
-        self.reclaimable_pages.borrow_mut().push(page_num);
+        let mut borrow = self.state_guard.borrow_mut();
+        assert!(page_num * consts::PAGE_SIZE < borrow.new_offset);
+        borrow.reclaimable_pages.push(page_num);
     }
 }
 
 impl Guard for Writer<'_> {
     unsafe fn read_page(&self, page_num: usize) -> ReadOnlyPage<'_> {
-        let guard = self.state_guard.borrow();
+        let borrow = self.state_guard.borrow();
         assert!(
-            page_num * consts::PAGE_SIZE < guard.new_offset,
+            page_num * consts::PAGE_SIZE < borrow.new_offset,
             "page_num = {} must be < {}",
             page_num,
-            guard.new_offset / consts::PAGE_SIZE
+            borrow.new_offset / consts::PAGE_SIZE
         );
         ReadOnlyPage {
             _phantom: PhantomData,
-            mmap: guard.mmap.clone(),
+            mmap: borrow.mmap.clone(),
             page_num,
         }
     }
@@ -497,26 +513,28 @@ impl Guard for Writer<'_> {
 
 impl Drop for Writer<'_> {
     fn drop(&mut self) {
+        let mut borrow = self.state_guard.borrow_mut();
         if !self.flushed {
             // This can happen if the write transaction errored or was aborted.
             // Reset as if nothing ever happened.
-            let mut guard = self.state_guard.borrow_mut();
-            guard.new_offset = guard.flush_offset;
+            borrow.new_offset = borrow.flush_offset;
             return;
         }
-        let mut pages = self.reclaimable_pages.borrow_mut();
-        if pages.len() == 0 {
+        if borrow.reclaimable_pages.is_empty() {
             return;
         }
 
+        /* Pages cannot be reclaimed back to the free list until it's
+        guaranteed that no reader (or writer) can traverse to these pages,
+        either from a B+ tree root node, or via the free list itself.
+         */
+
+        // Box::into_raw so reclaimable doesn't get dropped until
+        // defer_retire
         let reclaimable = Box::into_raw(Box::new(Reclaimable {
             store: self.store.clone(),
             root_page: self.prev_root_page,
-            pages: std::mem::take(&mut *pages),
         }));
-        // Pages cannot be reclaimed back to the free list until it's
-        // guaranteed that no reader (or writer) can traverse to these pages,
-        // either from a B+ tree root node, or via the free list itself.
         // Safety: prev_root_page has already been replaced in the flush() call,
         // so it is safe to defer its retirement.
         unsafe {
@@ -524,19 +542,15 @@ impl Drop for Writer<'_> {
                 .defer_retire(reclaimable, |r, _collector| {
                     let r = Box::from_raw(r); // so r can be auto-dropped
                     drop(Box::from_raw(r.root_page)); // must manually be dropped
-                    r.store.reclaim_pages(r.pages);
+                    r.store.reclaim_pages();
                 });
         }
-        // self.epoch_guard.defer(move || {
-        //     store.reclaim_pages(pages);
-        // });
     }
 }
 
 struct Reclaimable {
     store: Arc<Store>,
     root_page: *mut usize,
-    pages: Vec<usize>,
 }
 
 pub trait PageType {}
@@ -998,5 +1012,29 @@ mod tests {
         for t in threads {
             let _ = t.join();
         }
+    }
+
+    #[test]
+    fn test_free_list() {
+        // TODO: Test the free list:
+        // 1. Get a writer.
+        // Call new_page() 3 times. Each page will get its own edit:
+        // * set all bytes of page1 to 1.
+        // * set all bytes of page2 to 2.
+        // * set all bytes of page3 to 3.
+        // Call mark_free() on page1.
+        // Call flush().
+        // 2. Get another writer.
+        // Call mark_free() on page3.
+        // Call overwrite_page() on page1 and set all bytes to 4.
+        // Call mark_free() on page2.
+        // Call flush().
+        // 3. Get a reader.
+        // Call read_page() on the page1. Verify that:
+        // * all bytes of page1 == 4.
+        // 4. Read the file's meta node.
+        // Extract its free list.
+        // Verify that the free list consists of 1 node (head_page == tail_page).
+        // Verify that the free list contains 2 free pointers (tail_seq - head_seq == 2).
     }
 }
