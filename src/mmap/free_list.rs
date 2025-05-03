@@ -27,7 +27,6 @@ pub struct FreeList {
     pub head_seq: usize,
     pub tail_page: usize,
     pub tail_seq: usize,
-    max_seq: usize,
 }
 
 impl FreeList {
@@ -79,13 +78,9 @@ impl FreeList {
         }
     }
 
-    pub fn set_max_seq(&mut self) {
-        self.max_seq = self.tail_seq;
-    }
-
     // remove 1 item from the head node, and remove the head node if empty.
     fn pop_helper(&mut self, writer: &Writer) -> (Option<usize>, Option<usize>) {
-        if self.head_seq == self.max_seq {
+        if self.head_seq == self.tail_seq {
             return (None, None); // cannot advance
         }
         // Safety: &mut self ensures exclusive access to the head list node page.
@@ -112,7 +107,6 @@ impl Default for FreeList {
             head_seq: 0,
             tail_page: 1,
             tail_seq: 0,
-            max_seq: 0,
         }
     }
 }
@@ -124,7 +118,6 @@ impl From<MetaNode> for FreeList {
             head_seq: node.head_seq,
             tail_page: node.tail_page,
             tail_seq: node.tail_seq,
-            max_seq: node.tail_seq,
         }
     }
 }

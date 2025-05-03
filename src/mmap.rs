@@ -293,6 +293,7 @@ impl Store {
             }),
             // TODO: dependency inject collector
             collector: Collector::new().batch_size(1),
+            // Remember to manually drop this leaked box in Store::drop.
             root_page: AtomicPtr::new(Box::into_raw(Box::new(node.root_page))),
         }
     }
@@ -321,7 +322,7 @@ impl Store {
             prev_root_page,
             // Safety: not null b/c always initialized.
             curr_root_page: unsafe { *prev_root_page },
-            flushed: false,
+            abort: false,
             store: self.clone(),
             state_guard: RefCell::new(mutex_guard),
             collector_guard,
@@ -333,6 +334,9 @@ impl Store {
         let w = self.writer();
         let (mut fl, pages) = {
             let mut borrow = w.state_guard.borrow_mut();
+            if borrow.reclaimable_pages.is_empty() {
+                return;
+            }
             let fl = borrow.free_list;
             let pages = std::mem::take(&mut borrow.reclaimable_pages);
             (fl, pages)
@@ -340,10 +344,16 @@ impl Store {
         for page_num in pages {
             fl.push_tail(&w, page_num);
         }
-        fl.set_max_seq();
         w.state_guard.borrow_mut().free_list = fl;
         let root_page = w.curr_root_page; // unchanged
         w.flush(root_page);
+    }
+}
+
+impl Drop for Store {
+    fn drop(&mut self) {
+        // Safety: root_page is never null.
+        drop(unsafe { Box::from_raw(self.root_page.load(Ordering::SeqCst)) });
     }
 }
 
@@ -412,7 +422,7 @@ impl Guard for Reader<'_> {
 pub struct Writer<'s> {
     prev_root_page: *mut usize,
     curr_root_page: usize,
-    flushed: bool,
+    abort: bool,
     store: Arc<Store>,
     state_guard: RefCell<MutexGuard<'s, WriterState>>,
 
@@ -430,7 +440,7 @@ impl Writer<'_> {
         let guard = &self.state_guard;
         // Try from the free list first.
         let mut fl = guard.borrow_mut().free_list;
-        let page_num = fl.pop_head(self).unwrap_or({
+        let page_num = fl.pop_head(self).unwrap_or_else(|| {
             // Otherwise allocate from the page bank.
             let mut borrow = guard.borrow_mut();
             borrow.grow_if_needed();
@@ -456,13 +466,16 @@ impl Writer<'_> {
             flush_offset: guard.flush_offset,
         }));
         self.curr_root_page = new_root_ptr;
+        // Safety: prev_root_page is never uninitialized.
+        if new_root_ptr == unsafe { *self.prev_root_page } {
+            return;
+        }
         // Note: consider Ordering::Release if perf is necessary (prob not).
-        self.prev_root_page = self.collector_guard.swap(
+        let _ = self.collector_guard.swap(
             &self.store.root_page,
             Box::into_raw(Box::new(new_root_ptr)),
             Ordering::SeqCst,
         );
-        self.flushed = true;
     }
 
     /// Retrieves an existing page and allows the user to write to it.
@@ -484,9 +497,28 @@ impl Writer<'_> {
     /// Marks an existing page as free, allowing it to be reclaimed later
     /// and made available via `overwrite_page()`.
     pub fn mark_free(&self, page_num: usize) {
+        let offset = page_num * consts::PAGE_SIZE;
         let mut borrow = self.state_guard.borrow_mut();
-        assert!(page_num * consts::PAGE_SIZE < borrow.new_offset);
+        assert!(offset < borrow.new_offset);
+        // We can put directly into the free list if it's not flushed,
+        // i.e. not accessible by concurrent readers.
+        if offset >= borrow.flush_offset {
+            let mut fl = borrow.free_list;
+
+            // FreeList::push_tail uses self, which may itself try to call
+            // borrow()/borrow_mut(), which can cause a panic.
+            drop(borrow);
+
+            fl.push_tail(self, page_num);
+            self.state_guard.borrow_mut().free_list = fl;
+            return;
+        }
         borrow.reclaimable_pages.push(page_num);
+    }
+
+    /// Aborts the write transaction.
+    pub fn abort(mut self) {
+        self.abort = true;
     }
 }
 
@@ -514,13 +546,14 @@ impl Guard for Writer<'_> {
 impl Drop for Writer<'_> {
     fn drop(&mut self) {
         let mut borrow = self.state_guard.borrow_mut();
-        if !self.flushed {
+        if self.abort {
             // This can happen if the write transaction errored or was aborted.
             // Reset as if nothing ever happened.
             borrow.new_offset = borrow.flush_offset;
-            return;
-        }
-        if borrow.reclaimable_pages.is_empty() {
+            borrow.reclaimable_pages.truncate(0);
+            borrow.free_list = FreeList::from(
+                MetaNode::try_from(borrow.mmap().as_ref()).expect("there should exist a meta node"),
+            );
             return;
         }
 
@@ -529,11 +562,24 @@ impl Drop for Writer<'_> {
         either from a B+ tree root node, or via the free list itself.
          */
 
+        // Safety: prev_root_page is never null.
+        let root_page = if self.curr_root_page != unsafe { *self.prev_root_page } {
+            Some(self.prev_root_page)
+        } else {
+            None
+        };
+        let reclaim_pages = !borrow.reclaimable_pages.is_empty();
+        if root_page.is_none() && !reclaim_pages {
+            // Don't bother with retirement mechanism.
+            return;
+        }
+
         // Box::into_raw so reclaimable doesn't get dropped until
         // defer_retire
         let reclaimable = Box::into_raw(Box::new(Reclaimable {
             store: self.store.clone(),
-            root_page: self.prev_root_page,
+            root_page,
+            reclaim_pages,
         }));
         // Safety: prev_root_page has already been replaced in the flush() call,
         // so it is safe to defer its retirement.
@@ -541,8 +587,12 @@ impl Drop for Writer<'_> {
             self.collector_guard
                 .defer_retire(reclaimable, |r, _collector| {
                     let r = Box::from_raw(r); // so r can be auto-dropped
-                    drop(Box::from_raw(r.root_page)); // must manually be dropped
-                    r.store.reclaim_pages();
+                    if let Some(root_page) = r.root_page {
+                        drop(Box::from_raw(root_page)); // must manually be dropped
+                    }
+                    if r.reclaim_pages {
+                        r.store.reclaim_pages();
+                    }
                 });
         }
     }
@@ -550,7 +600,8 @@ impl Drop for Writer<'_> {
 
 struct Reclaimable {
     store: Arc<Store>,
-    root_page: *mut usize,
+    root_page: Option<*mut usize>,
+    reclaim_pages: bool,
 }
 
 pub trait PageType {}
@@ -568,7 +619,7 @@ pub type ReadOnlyPage<'a> = Page<'a, ReadOnlyPageType>;
 pub struct Page<'w, T: PageType = WriteablePageType> {
     _phantom: PhantomData<&'w T>,
     mmap: Arc<UnsafeCell<Mmap>>,
-    page_num: usize,
+    pub page_num: usize,
 }
 
 impl Page<'_, ReadOnlyPageType> {
@@ -1015,41 +1066,119 @@ mod tests {
     }
 
     #[test]
-    fn test_free_list() {
-        // TODO: implement me.
-        // 1. Get a writer.
-        // Call new_page() 3 times. Each page will get its own edit:
-        // * set all bytes of page1 to 1.
-        // * set all bytes of page2 to 2.
-        // * set all bytes of page3 to 3.
-        // Call mark_free() on page1.
-        // Call flush().
-        // 2. Get another writer.
-        // Call mark_free() on page3.
-        // Call overwrite_page() on page1 and set all bytes to 4.
-        // Call mark_free() on page2.
-        // Call flush().
-        // 3. Get a reader.
-        // Call read_page() on the page1. Verify that:
-        // * all bytes of page1 == 4.
-        // 4. Read the file's meta node.
-        // Extract its free list.
-        // Verify that the free list consists of 1 node (head_page == tail_page).
-        // Verify that the free list contains 2 free pointers (tail_seq - head_seq == 2).
+    fn test_free_list_reclaimed_after_flush() {
+        // Start with empty free list.
+        let (store, temp_file) = new_file_mmap();
+        // Alloc 3 pages.
+        // Flush.
+        {
+            let writer = store.writer();
+            assert_eq!(writer.new_page().read_only().page_num(), 2);
+            assert_eq!(writer.new_page().read_only().page_num(), 3);
+            assert_eq!(writer.new_page().read_only().page_num(), 4);
+            writer.flush(0 /* dummy */);
+        }
+        // Read disk free list; it should be empty.
+        {
+            let mmap = Mmap::open_or_create(temp_file.path()).unwrap();
+            let meta_node = MetaNode::try_from(mmap.as_ref()).unwrap();
+            assert_eq!(meta_node.head_seq, meta_node.tail_seq);
+        }
+        // Free 2 pages.
+        // Alloc a new page. Its page_num should NOT one of the previous 3.
+        // Flush.
+        {
+            let writer = store.writer();
+            writer.mark_free(4);
+            writer.mark_free(2);
+            writer.new_page();
+            writer.flush(0 /* dummy */);
+        }
+        // Read disk free list; it should have 2 free page (tail_seq - head_seq == 2).
+        // Verify that meta node's num_pages == 4 + 2,
+        // where 2 is the starting page count.
+        {
+            let mmap = Mmap::open_or_create(temp_file.path()).unwrap();
+            let meta_node = MetaNode::try_from(mmap.as_ref()).unwrap();
+            assert!(
+                meta_node.tail_seq - meta_node.head_seq == 2,
+                "meta_node: {meta_node:?}"
+            );
+            assert_eq!(meta_node.num_pages, 6, "meta_node: {meta_node:?}");
+        }
+        // Alloc a new page.
+        // Flush.
+        // Flush again (idempotent for test determinism).
+        {
+            let writer = store.writer();
+            writer.new_page().read_only().page_num();
+            writer.flush(0 /* dummy */);
+            store.writer().flush(0 /* dummy */);
+        }
+        // Read disk free list; it should have 1 free page (tail_seq - head_seq == 1).
+        // Verify that meta node's num_pages == 4 + 2,
+        // where 2 is the starting page count.
+        {
+            let mmap = Mmap::open_or_create(temp_file.path()).unwrap();
+            let meta_node = MetaNode::try_from(mmap.as_ref()).unwrap();
+            assert!(
+                meta_node.tail_seq - meta_node.head_seq == 1,
+                "meta_node: {meta_node:?}"
+            );
+            assert_eq!(meta_node.num_pages, 6, "meta_node: {meta_node:?}");
+        }
     }
 
     #[test]
-    fn test_free_list_fill_then_empty() {
-        // TODO: implement me.
-        // The Store starts with an empty free list.
-        // Fill up the free list with 2 nodes worth by calling Writer::new_page(),
-        // then Writer::mark_free(), and then Writer::flush(),
-        // which btw calls Store::reclaim_pages() and thus calls FreeList::push_tail(),
-        // over and over again.
-        // You can tell the free list has 2 nodes worth by reading the file after flush
-        // for the meta node's free list and verifying that tail_page != head_page.
-        // Completely consume from the free list until it's empty via Writer::new_page(),
-        // which calls FreeList::pop_head().
+    fn test_free_list_reclaimed_before_flush() {
+        // Start with empty free list.
+        let (store, temp_file) = new_file_mmap();
+        // Alloc 3 pages.
+        // Free 2 pages.
+        // Alloc a new page. Its page_num should be one of the previous 3.
         // Flush.
+        // Flush again (idempotent for test determinism).
+        {
+            let writer = store.writer();
+            assert_eq!(writer.new_page().read_only().page_num(), 2);
+            assert_eq!(writer.new_page().read_only().page_num(), 3);
+            assert_eq!(writer.new_page().read_only().page_num(), 4);
+            writer.mark_free(4);
+            writer.mark_free(2);
+            let page_num = writer.new_page().read_only().page_num();
+            assert_eq!(page_num, 4, "got page_num = {page_num}, want == 4");
+            writer.flush(0 /* dummy */);
+            store.writer().flush(0 /* dummy */);
+        }
+        // Read disk free list; it should have 1 free page (tail_seq - head_seq == 1).
+        // Verify that meta node's num_pages == 3 + 2,
+        // where 2 is the starting page count.
+        {
+            let mmap = Mmap::open_or_create(temp_file.path()).unwrap();
+            let meta_node = MetaNode::try_from(mmap.as_ref()).unwrap();
+            assert!(
+                meta_node.tail_seq - meta_node.head_seq == 1,
+                "meta_node: {meta_node:?}"
+            );
+            assert_eq!(meta_node.num_pages, 5, "meta_node: {meta_node:?}");
+        }
+    }
+
+    #[test]
+    fn test_free_list_grow_and_shrink() {
+        // Start with empty free list.
+        let (store, temp_file) = new_file_mmap();
+        // Repeat:
+        // * let writer = store.writer();
+        // * let page_num = writer.new_page().read_only().page_num();
+        // * writer.mark_free(page_num);
+        // * writer.flush(0 /* dummy */);
+        // * Read file's free list. If tail_page != head_page, done.
+        // Repeat:
+        // * let writer = store.writer();
+        // * let _ = writer.new_page();
+        // * writer.flush(0 /* dummy */);
+        // * Read file's free list. If head_seq == tail_seq, done.
+        // todo!()
     }
 }

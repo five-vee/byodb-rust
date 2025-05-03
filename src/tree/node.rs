@@ -263,7 +263,7 @@ pub fn sufficiency(n: &Node) -> Sufficiency {
 /// Merges `left` and `right` into a possibly-overflowed node and splits if
 /// needed. This is modeled as a Deletion b/c it is (so far) only useful in the
 /// context of deletion.
-pub fn steal_or_merge<'w>(left: &'w Node, right: &'w Node, writer: &'w Writer) -> NodeEffect<'w> {
+pub fn steal_or_merge<'w>(left: Node, right: Node, writer: &'w Writer) -> NodeEffect<'w> {
     match (left, right) {
         (Node::Leaf(left), Node::Leaf(right)) => Leaf::steal_or_merge(left, right, writer).into(),
         (Node::Internal(left), Node::Internal(right)) => {

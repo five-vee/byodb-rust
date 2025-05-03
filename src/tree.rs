@@ -92,14 +92,17 @@ impl<'g> Tree<'g, Writer<'_>> {
     /// Inserts a key-value pair. The resulting tree won't be visible to
     /// readers until the writer is externally flushed.
     pub fn insert(self, key: &[u8], val: &[u8]) -> Result<Self> {
-        let new_page_num = match &self.insert_helper(key, val)? {
+        let writer = self.guard;
+        let new_page_num = match self.insert_helper(key, val)? {
             NodeEffect::Intact(new_root) => new_root.page_num(),
-            NodeEffect::Split { left, right } => self.parent_of_split(left, right).page_num(),
+            NodeEffect::Split { left, right } => {
+                Self::parent_of_split(writer, &left, &right).page_num()
+            }
             _ => unreachable!(),
         };
         Ok(Tree {
             page_num: new_page_num,
-            guard: self.guard,
+            guard: writer,
         })
     }
 
@@ -107,9 +110,8 @@ impl<'g> Tree<'g, Writer<'_>> {
     /// the resulting tree.
     ///
     /// This is a recursive implementation of `insert`.
-    fn insert_helper(&self, key: &'g [u8], val: &'g [u8]) -> Result<NodeEffect<'g>> {
-        let node = Self::read(self.guard, self.page_num);
-        match &node {
+    fn insert_helper(self, key: &[u8], val: &[u8]) -> Result<NodeEffect<'g>> {
+        match Self::read(self.guard, self.page_num) {
             // Base case
             Node::Leaf(leaf) => Ok(leaf.insert(self.guard, key, val)?.into()),
             // Recursive case
@@ -130,14 +132,17 @@ impl<'g> Tree<'g, Writer<'_>> {
 
     /// Updates the value corresponding to a key.
     pub fn update(self, key: &[u8], val: &[u8]) -> Result<Self> {
-        let new_page_num = match &self.update_helper(key, val)? {
+        let writer = self.guard;
+        let new_page_num = match self.update_helper(key, val)? {
             NodeEffect::Intact(root) => root.page_num(),
-            NodeEffect::Split { left, right } => self.parent_of_split(left, right).page_num(),
+            NodeEffect::Split { left, right } => {
+                Self::parent_of_split(writer, &left, &right).page_num()
+            }
             _ => unreachable!(),
         };
         Ok(Tree {
             page_num: new_page_num,
-            guard: self.guard,
+            guard: writer,
         })
     }
 
@@ -145,9 +150,8 @@ impl<'g> Tree<'g, Writer<'_>> {
     /// the resulting tree.
     ///
     /// This is a recursive implementation of `update`.
-    fn update_helper(&self, key: &'g [u8], val: &'g [u8]) -> Result<NodeEffect<'g>> {
-        let node = Self::read(self.guard, self.page_num);
-        match &node {
+    fn update_helper(self, key: &[u8], val: &[u8]) -> Result<NodeEffect<'g>> {
+        match Self::read(self.guard, self.page_num) {
             // Base case
             Node::Leaf(leaf) => Ok(leaf.update(self.guard, key, val)?.into()),
             // Recursive case
@@ -168,8 +172,9 @@ impl<'g> Tree<'g, Writer<'_>> {
 
     /// Deletes a key and its corresponding value.
     pub fn delete(self, key: &[u8]) -> Result<Self> {
-        let new_page_num = match &self.delete_helper(key)? {
-            NodeEffect::Empty => mmap::write_empty_leaf(self.guard),
+        let writer = self.guard;
+        let new_page_num = match self.delete_helper(key)? {
+            NodeEffect::Empty => mmap::write_empty_leaf(writer),
             NodeEffect::Intact(root) => match node::sufficiency(&root) {
                 Sufficiency::Empty => unreachable!(),
                 Sufficiency::Underflow => match &root {
@@ -178,11 +183,13 @@ impl<'g> Tree<'g, Writer<'_>> {
                 },
                 Sufficiency::Sufficient => root.page_num(),
             },
-            NodeEffect::Split { left, right } => self.parent_of_split(left, right).page_num(),
+            NodeEffect::Split { left, right } => {
+                Self::parent_of_split(writer, &left, &right).page_num()
+            }
         };
         Ok(Tree {
             page_num: new_page_num,
-            guard: self.guard,
+            guard: writer,
         })
     }
 
@@ -190,9 +197,8 @@ impl<'g> Tree<'g, Writer<'_>> {
     /// the resulting tree.
     ///
     /// This is a recursive implementation of `delete`.
-    fn delete_helper(&self, key: &[u8]) -> Result<NodeEffect<'g>> {
-        let node = Self::read(self.guard, self.page_num);
-        match &node {
+    fn delete_helper(self, key: &[u8]) -> Result<NodeEffect<'g>> {
+        match Self::read(self.guard, self.page_num) {
             // Base case
             Node::Leaf(leaf) => Ok(leaf.delete(self.guard, key)?.into()),
             // Recursive case
@@ -204,7 +210,7 @@ impl<'g> Tree<'g, Writer<'_>> {
                     page_num: child_num,
                     guard: self.guard,
                 };
-                match &child.delete_helper(key)? {
+                match child.delete_helper(key)? {
                     NodeEffect::Empty => {
                         let effect = parent.merge_child_entries(
                             self.guard,
@@ -212,7 +218,7 @@ impl<'g> Tree<'g, Writer<'_>> {
                         );
                         Ok(effect.into())
                     }
-                    NodeEffect::Intact(child) => match node::sufficiency(child) {
+                    NodeEffect::Intact(child) => match node::sufficiency(&child) {
                         Sufficiency::Empty => unreachable!(),
                         Sufficiency::Underflow => {
                             Ok(self.try_fix_underflow(parent, child, child_idx))
@@ -255,22 +261,24 @@ impl<'g> Tree<'g, Writer<'_>> {
     /// parent (internal) node.
     fn try_fix_underflow(
         &self,
-        parent: &Internal<'g>,
-        child: &Node<'g>,
+        parent: Internal<'g>,
+        child: Node<'g>,
         child_idx: usize,
     ) -> NodeEffect<'g> {
-        // Try to steal from or merge with the left sibling.
-        if child_idx > 0 {
-            if let Some(effect) = self.try_steal_or_merge(parent, &child, child_idx, child_idx - 1)
-            {
-                return effect;
-            }
-        }
-        // Try to do so with the right sibling.
-        if child_idx < parent.get_num_keys() - 1 {
-            if let Some(effect) = self.try_steal_or_merge(parent, &child, child_idx, child_idx + 1)
-            {
-                return effect;
+        // Try to steal from or merge with a sibling.
+        let sibling_idx = if child_idx > 0 {
+            Some(child_idx - 1)
+        } else if child_idx < parent.get_num_keys() - 1 {
+            Some(child_idx + 1)
+        } else {
+            None
+        };
+        if let Some(sibling_idx) = sibling_idx {
+            let sibling = Self::read(self.guard, parent.get_child_pointer(sibling_idx));
+            let can_steal_or_merge = node::can_steal(&sibling, &child, sibling_idx < child_idx)
+                || node::can_merge(&sibling, &child);
+            if can_steal_or_merge {
+                return self.steal_or_merge(parent, child, child_idx, sibling, sibling_idx);
             }
         }
 
@@ -289,28 +297,21 @@ impl<'g> Tree<'g, Writer<'_>> {
 
     /// Fixes the underflow of `child` by stealing from or merging from
     /// one of its direct siblings.
-    fn try_steal_or_merge(
+    fn steal_or_merge(
         &self,
-        parent: &Internal<'g>,
-        child: &Node<'g>,
+        parent: Internal<'g>,
+        child: Node<'g>,
         child_idx: usize,
+        sibling: Node<'g>,
         sibling_idx: usize,
-    ) -> Option<NodeEffect<'g>> {
-        let sibling_num = parent.get_child_pointer(sibling_idx);
-        let sibling = &Self::read(self.guard, sibling_num);
-
-        let can_steal_or_merge = node::can_steal(sibling, child, sibling_idx < child_idx)
-            || node::can_merge(sibling, child);
-        if !can_steal_or_merge {
-            return None;
-        }
-
-        let (mut left, mut right) = (sibling, child);
+    ) -> NodeEffect<'g> {
         let (mut left_idx, mut right_idx) = (sibling_idx, child_idx);
-        if sibling_idx > child_idx {
-            (right, left) = (sibling, child);
-            (right_idx, left_idx) = (sibling_idx, child_idx);
-        }
+        let (left, right) = if sibling_idx < child_idx {
+            (sibling, child)
+        } else {
+            (left_idx, right_idx) = (child_idx, sibling_idx);
+            (child, sibling)
+        };
         match node::steal_or_merge(left, right, self.guard) {
             NodeEffect::Empty => unreachable!(),
             NodeEffect::Intact(child) => {
@@ -326,7 +327,7 @@ impl<'g> Tree<'g, Writer<'_>> {
                         ChildEntry::Delete { i: right_idx },
                     ],
                 );
-                Some(effect.into())
+                effect.into()
             }
             NodeEffect::Split { left, right } => {
                 // stolen
@@ -345,17 +346,17 @@ impl<'g> Tree<'g, Writer<'_>> {
                         },
                     ],
                 );
-                Some(effect.into())
+                effect.into()
             }
         }
     }
 
     /// Creates a new internal root node whose children are split nodes
     /// newly-created due to an operation on the tree.
-    fn parent_of_split(&self, left: &Node<'g>, right: &Node<'g>) -> Node<'g> {
+    fn parent_of_split(writer: &'g Writer, left: &Node<'g>, right: &Node<'g>) -> Node<'g> {
         let keys = [left.get_key(0), right.get_key(0)];
         let child_pointers = [left.page_num(), right.page_num()];
-        let root = Internal::parent_of_split(self.guard, keys, child_pointers);
+        let root = Internal::parent_of_split(writer, keys, child_pointers);
         Node::Internal(root)
     }
 }
@@ -488,12 +489,12 @@ mod tests {
         writer.flush(root);
     }
 
-    fn insert_complete(writer: Writer, height: u32) {
+    fn insert_complete(store: &Arc<Store>, height: u32) {
         assert_ne!(height, 0);
-        let mut tree = Tree::new(&writer);
         let mut i = 0u64;
-        let mut root_ptr = tree.page_num;
         loop {
+            let writer = store.writer();
+            let tree = Tree::new(&writer);
             let x = u64_to_key(i);
             let result = tree.insert(&x, &x);
             assert!(
@@ -510,12 +511,16 @@ mod tests {
             );
             i += 1;
             if new_tree.height().unwrap() > height {
+                writer.abort();
                 break;
             }
-            tree = new_tree;
-            root_ptr = tree.page_num;
+            let new_page_num = new_tree.page_num;
+            writer.flush(new_page_num);
         }
-        writer.flush(root_ptr);
+        // Sanity check.
+        let reader = store.reader();
+        let tree = Tree::new(&reader);
+        assert_eq!(tree.height().unwrap(), height);
     }
 
     #[test]
@@ -583,15 +588,16 @@ mod tests {
     #[test]
     fn update_split() {
         let (store, _temp_file) = new_test_store();
-        insert_complete(store.writer(), 2);
+        insert_complete(&store, 2);
         let old_height = {
             let reader = store.reader();
             Tree::new(&reader).height().unwrap()
         };
+        assert_eq!(old_height, 2);
 
         let writer = store.writer();
         let key = &u64_to_key(0);
-        let new_value = &[0u8; consts::MAX_VALUE_SIZE];
+        let new_value = &[1u8; consts::MAX_VALUE_SIZE];
         let tree = Tree::new(&writer).update(key, new_value).unwrap();
         let got = tree.get(key).unwrap().unwrap();
         assert_eq!(got, new_value);

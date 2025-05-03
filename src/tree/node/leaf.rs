@@ -16,12 +16,7 @@ pub struct Leaf<'a> {
 
 impl<'a> Leaf<'a> {
     /// Inserts a key-value pair.
-    pub fn insert(
-        &self,
-        writer: &'a Writer,
-        key: &'a [u8],
-        val: &'a [u8],
-    ) -> Result<LeafEffect<'a>> {
+    pub fn insert(self, writer: &'a Writer, key: &[u8], val: &[u8]) -> Result<LeafEffect<'a>> {
         if key.len() > consts::MAX_KEY_SIZE {
             return Err(NodeError::MaxKeySize(key.len()));
         }
@@ -31,22 +26,14 @@ impl<'a> Leaf<'a> {
         if self.find(key).is_some() {
             return Err(NodeError::AlreadyExists);
         }
-        writer.mark_free(self.page_num());
         let itr_func = || self.insert_iter(key, val);
         let num_keys = self.get_num_keys() + 1;
-        if self.get_num_bytes() + 6 + key.len() + val.len() > consts::PAGE_SIZE {
-            return Ok(build_split(writer, &itr_func, num_keys));
-        }
-        Ok(build(writer, itr_func(), num_keys))
+        let overflow = self.get_num_bytes() + 6 + key.len() + val.len() > consts::PAGE_SIZE;
+        Ok(self.build_then_free(writer, itr_func, num_keys, overflow))
     }
 
     /// Updates the value corresponding to a key.
-    pub fn update(
-        &self,
-        writer: &'a Writer,
-        key: &'a [u8],
-        val: &'a [u8],
-    ) -> Result<LeafEffect<'a>> {
+    pub fn update(self, writer: &'a Writer, key: &[u8], val: &[u8]) -> Result<LeafEffect<'a>> {
         if key.len() > consts::MAX_KEY_SIZE {
             return Err(NodeError::MaxKeySize(key.len()));
         }
@@ -58,24 +45,30 @@ impl<'a> Leaf<'a> {
             return Err(NodeError::KeyNotFound);
         }
         let old_val = old_val.unwrap();
-        writer.mark_free(self.page_num());
         let itr_func = || self.update_iter(key, val);
         let num_keys = self.get_num_keys();
-        if self.get_num_bytes() - old_val.len() + val.len() > consts::PAGE_SIZE {
-            return Ok(build_split(writer, &itr_func, num_keys));
-        }
-        Ok(build(writer, itr_func(), num_keys))
+        let overflow = self.get_num_bytes() - old_val.len() + val.len() > consts::PAGE_SIZE;
+        Ok(self.build_then_free(writer, itr_func, num_keys, overflow))
     }
 
     /// Deletes a key and its corresponding value.
-    pub fn delete<'w>(&self, writer: &'w Writer, key: &[u8]) -> Result<LeafEffect<'w>> {
+    pub fn delete<'w>(self, writer: &'w Writer, key: &[u8]) -> Result<LeafEffect<'w>> {
+        let page_num = self.page_num();
+        let effect = self.delete_inner(writer, key);
+        if effect.is_ok() {
+            // Now that self is no longer used, free it.
+            writer.mark_free(page_num);
+        }
+        effect
+    }
+
+    fn delete_inner<'w>(self, writer: &'w Writer, key: &[u8]) -> Result<LeafEffect<'w>> {
         if key.len() > consts::MAX_KEY_SIZE {
             return Err(NodeError::MaxKeySize(key.len()));
         }
         if self.find(key).is_none() {
             return Err(NodeError::KeyNotFound);
         }
-        writer.mark_free(self.page_num());
         // Optimization: avoid memory allocation and
         // just return Deletion::Empty if only 1 key.
         let n = self.get_num_keys();
@@ -101,18 +94,22 @@ impl<'a> Leaf<'a> {
 
     /// Creates the leaf (or leaves) resulting from either left stealing from
     /// right, or left merging with right.
-    pub fn steal_or_merge(left: &'a Leaf, right: &'a Leaf, writer: &'a Writer) -> LeafEffect<'a> {
-        writer.mark_free(left.page_num());
-        writer.mark_free(right.page_num());
+    pub fn steal_or_merge(left: Leaf, right: Leaf, writer: &'a Writer) -> LeafEffect<'a> {
         let itr_func = || left.iter().chain(right.iter());
         let num_keys = left.get_num_keys() + right.get_num_keys();
         let overflow = left.get_num_bytes() + right.get_num_bytes() - 4 > consts::PAGE_SIZE;
-        if overflow {
+        let effect = if overflow {
             // Steal
-            return build_split(writer, &itr_func, num_keys);
-        }
-        // Merge
-        build(writer, itr_func(), num_keys)
+            build_split(writer, &itr_func, num_keys)
+        } else {
+            // Merge
+            build(writer, itr_func(), num_keys)
+        };
+        // Now that left and right are no longer used, free them.
+        writer.mark_free(left.page_num());
+        writer.mark_free(right.page_num());
+
+        effect
     }
 
     /// Gets the `i`th key.
@@ -167,6 +164,27 @@ impl<'a> Leaf<'a> {
             val,
             skip: false,
         }
+    }
+
+    /// Builds an [`LeafEffect`], then frees self back to the store.
+    fn build_then_free<'l, I, F>(
+        &'l self,
+        writer: &'a Writer,
+        itr_func: F,
+        num_keys: usize,
+        overflow: bool,
+    ) -> LeafEffect<'a>
+    where
+        I: Iterator<Item = (&'l [u8], &'l [u8])>,
+        F: Fn() -> I,
+    {
+        let effect = if overflow {
+            build_split(writer, &itr_func, num_keys)
+        } else {
+            build(writer, itr_func(), num_keys)
+        };
+        writer.mark_free(self.page_num());
+        effect
     }
 }
 
@@ -319,9 +337,9 @@ where
 }
 
 /// Builds a new leaf from the provided iterator of key-value pairs.
-fn build<'w, I>(writer: &'w Writer, itr: I, num_keys: usize) -> LeafEffect<'w>
+fn build<'l, 'w, I>(writer: &'w Writer, itr: I, num_keys: usize) -> LeafEffect<'w>
 where
-    I: Iterator<Item = (&'w [u8], &'w [u8])>,
+    I: Iterator<Item = (&'l [u8], &'l [u8])>,
 {
     let mut b = Builder::new(writer, num_keys);
     for (k, v) in itr {
@@ -332,9 +350,9 @@ where
 
 /// Builds two leaves by finding the split point from the provided iterator of
 /// key-value pairs.
-fn build_split<'w, I, F>(writer: &'w Writer, itr_func: &F, num_keys: usize) -> LeafEffect<'w>
+fn build_split<'l, 'w, I, F>(writer: &'w Writer, itr_func: &F, num_keys: usize) -> LeafEffect<'w>
 where
-    I: Iterator<Item = (&'w [u8], &'w [u8])>,
+    I: Iterator<Item = (&'l [u8], &'l [u8])>,
     F: Fn() -> I,
 {
     let split_at = find_split(itr_func(), num_keys);
@@ -680,7 +698,6 @@ mod tests {
             .update(&writer, "1".as_bytes(), &[1u8; consts::MAX_VALUE_SIZE])
             .unwrap()
             .take_split();
-        drop(leaf);
         assert_eq!(left.get_num_keys(), 1);
         assert_eq!(right.get_num_keys(), 1);
         assert_eq!(
@@ -791,7 +808,7 @@ mod tests {
             .add_key_value(&[4; consts::MAX_KEY_SIZE], &[4; consts::MAX_VALUE_SIZE])
             .build();
 
-        let (left, right) = Leaf::steal_or_merge(&left, &right, &writer).take_split();
+        let (left, right) = Leaf::steal_or_merge(left, right, &writer).take_split();
         assert!(left.get_num_keys() >= 2);
         assert!(right.get_num_keys() >= 2);
         assert!(right.get_num_keys() < 3);
@@ -822,7 +839,7 @@ mod tests {
             .add_key_value(&[3], &[3])
             .build();
 
-        let merged = Leaf::steal_or_merge(&left, &right, &writer).take_intact();
+        let merged = Leaf::steal_or_merge(left, right, &writer).take_intact();
         assert_eq!(
             merged.iter().collect::<Vec<_>>(),
             vec![(&[1][..], &[1][..]), (&[2], &[2]), (&[3], &[3]),]

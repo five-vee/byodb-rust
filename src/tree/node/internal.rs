@@ -30,11 +30,10 @@ impl<'a> Internal<'a> {
 
     /// Merges child entries into the internal node.
     pub fn merge_child_entries(
-        &self,
+        self,
         writer: &'a Writer,
         entries: &[ChildEntry],
     ) -> InternalEffect<'a> {
-        writer.mark_free(self.page_num());
         let delta_keys = entries
             .iter()
             .map(|ce| match ce {
@@ -56,29 +55,29 @@ impl<'a> Internal<'a> {
         let itr_func = || self.merge_iter(entries);
         let num_keys = (self.get_num_keys() as isize + delta_keys) as usize;
         let overflow = (self.get_num_bytes() as isize + delta_size) as usize > consts::PAGE_SIZE;
-        if overflow {
-            return build_split(writer, &itr_func, num_keys);
-        }
-        build(writer, itr_func(), num_keys)
+        self.build_then_free(writer, itr_func, num_keys, overflow)
     }
 
     /// Resolves underflow of either `left` or `right` by either having one
     /// steal from the other, or merging the two.
     pub fn steal_or_merge(
-        left: &'a Internal,
-        right: &'a Internal,
+        left: Internal,
+        right: Internal,
         writer: &'a Writer,
     ) -> InternalEffect<'a> {
-        writer.mark_free(left.page_num());
-        writer.mark_free(right.page_num());
         let itr_func = || left.iter().chain(right.iter());
         let num_keys = left.get_num_keys() + right.get_num_keys();
-        if left.get_num_bytes() + right.get_num_bytes() - 4 > consts::PAGE_SIZE {
+        let effect = if left.get_num_bytes() + right.get_num_bytes() - 4 > consts::PAGE_SIZE {
             // Steal
-            return build_split(writer, &itr_func, num_keys);
-        }
-        // Merge
-        build(writer, itr_func(), num_keys)
+            build_split(writer, &itr_func, num_keys)
+        } else {
+            // Merge
+            build(writer, itr_func(), num_keys)
+        };
+        // Now that left and right are no longer used, free them.
+        writer.mark_free(left.page_num());
+        writer.mark_free(right.page_num());
+        effect
     }
 
     /// Finds the index of the child that contains the key.
@@ -131,6 +130,27 @@ impl<'a> Internal<'a> {
             node_iter: self.iter().enumerate().peekable(),
             entries_iter: entries.iter().peekable(),
         }
+    }
+
+    /// Builds an [`InternalEffect`], then frees self back to the store.
+    fn build_then_free<'i, I, F>(
+        &'i self,
+        writer: &'a Writer,
+        itr_func: F,
+        num_keys: usize,
+        overflow: bool,
+    ) -> InternalEffect<'a>
+    where
+        I: Iterator<Item = (&'i [u8], usize)>,
+        F: Fn() -> I,
+    {
+        let effect = if overflow {
+            build_split(writer, &itr_func, num_keys)
+        } else {
+            build(writer, itr_func(), num_keys)
+        };
+        writer.mark_free(self.page_num());
+        effect
     }
 }
 
@@ -614,7 +634,7 @@ mod tests {
             .add_child_entry(&[5; consts::MAX_KEY_SIZE], 5)
             .build();
 
-        let (left, right) = Internal::steal_or_merge(&left, &right, &writer).take_split();
+        let (left, right) = Internal::steal_or_merge(left, right, &writer).take_split();
         assert!(left.get_num_keys() >= 2);
         assert!(right.get_num_keys() >= 2);
         assert!(right.get_num_keys() < 4);
@@ -641,7 +661,7 @@ mod tests {
             .add_child_entry(&[3], 3)
             .build();
 
-        let merged = Internal::steal_or_merge(&left, &right, &writer).take_intact();
+        let merged = Internal::steal_or_merge(left, right, &writer).take_intact();
         assert_eq!(
             merged.iter().collect::<Vec<_>>(),
             vec![(&[1][..], 1), (&[2], 2), (&[3], 3),]
