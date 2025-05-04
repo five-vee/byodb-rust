@@ -22,8 +22,8 @@ mod node;
 
 use std::rc::Rc;
 
-pub use crate::error::TreeError;
-use crate::mmap::{self, Guard, Writer};
+use crate::core::error::TreeError;
+use crate::core::mmap::{self, Guard, Writer};
 use node::{ChildEntry, Internal, Node, NodeEffect, Sufficiency};
 
 type Result<T> = std::result::Result<T, TreeError>;
@@ -439,7 +439,7 @@ mod tests {
 
     use tempfile::NamedTempFile;
 
-    use crate::{
+    use crate::core::{
         consts,
         mmap::{Mmap, Store},
     };

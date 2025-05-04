@@ -12,7 +12,7 @@ use std::{
     ops::{Deref, DerefMut},
 };
 
-use crate::{consts, mmap::Page};
+use crate::core::{consts, mmap::Page};
 
 use super::{Guard as _, ReadOnlyPage, WriteablePageType, Writer, meta_node::MetaNode};
 

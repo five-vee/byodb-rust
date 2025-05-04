@@ -52,7 +52,7 @@ use arc_swap::{ArcSwap, Guard as ArcSwapGuard};
 use memmap2::{MmapMut, MmapOptions};
 use seize::{Collector, Guard as _, LocalGuard};
 
-use crate::{
+use crate::core::{
     consts,
     error::PageError,
     header::{self, NodeType},
@@ -683,7 +683,7 @@ mod tests {
 
     use tempfile::NamedTempFile;
 
-    use crate::consts;
+    use crate::core::consts;
 
     use super::*;
 

@@ -18,7 +18,7 @@
 //! | root_page | num_pages | head_page | head_seq | tail_page | tail_seq |
 //! |     8B    |     8B    |    8B     |    8B    |     8B    |    8B    |
 //! ```
-use crate::error::PageError;
+use crate::core::error::PageError;
 use std::{convert::TryFrom, ptr, rc::Rc};
 
 use super::free_list::FreeList;

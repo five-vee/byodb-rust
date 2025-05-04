@@ -1,4 +1,4 @@
-use crate::error::NodeError;
+use crate::core::error::NodeError;
 
 type Result<T> = std::result::Result<T, NodeError>;
 

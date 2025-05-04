@@ -1,6 +1,6 @@
 use std::{iter::Peekable, ops::Deref as _, rc::Rc};
 
-use crate::{
+use crate::core::{
     consts,
     error::NodeError,
     mmap::{Page, ReadOnlyPage, Writer},
@@ -488,7 +488,7 @@ mod tests {
 
     use tempfile::NamedTempFile;
 
-    use crate::mmap::{Mmap, Store};
+    use crate::core::mmap::{Mmap, Store};
 
     use super::*;
 

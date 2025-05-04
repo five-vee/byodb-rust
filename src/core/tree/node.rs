@@ -98,9 +98,9 @@ mod leaf;
 
 use std::rc::Rc;
 
-use crate::error::NodeError;
-use crate::mmap::{Guard, ReadOnlyPage, Writer};
-use crate::{consts, header};
+use crate::core::error::NodeError;
+use crate::core::mmap::{Guard, ReadOnlyPage, Writer};
+use crate::core::{consts, header};
 use header::NodeType;
 pub(crate) use internal::ChildEntry;
 pub(crate) use internal::Internal;
