@@ -679,8 +679,6 @@ fn init_empty_leaf(page: &mut [u8]) {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Read;
-
     use tempfile::NamedTempFile;
 
     use crate::core::consts;
@@ -1186,7 +1184,7 @@ mod tests {
         };
         {
             let writer = store.writer();
-            for i in 0..2 * free_list::FREE_LIST_CAP {
+            for _ in 0..2 * free_list::FREE_LIST_CAP {
                 let _ = writer.new_page();
             }
             writer.flush(0 /* dummy */);

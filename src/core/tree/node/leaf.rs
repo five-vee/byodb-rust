@@ -3,7 +3,10 @@ use std::ops::Deref as _;
 
 use crate::core::consts;
 use crate::core::error::NodeError;
-use crate::core::mmap::{Guard, Page, ReadOnlyPage, Writer};
+use crate::core::mmap::{Page, ReadOnlyPage, Writer};
+
+#[cfg(test)]
+use crate::core::mmap::Guard;
 
 use super::header::{self, NodeType};
 
@@ -241,19 +244,18 @@ impl<'r> LeafEffect<'r> {
 }
 
 // A builder of a B+ tree leaf node.
-struct Builder<'s, 'w> {
+struct Builder<'w> {
     i: usize,
-    writer: &'w Writer<'s>,
     page: Page<'w>,
 }
 
-impl<'s, 'w> Builder<'s, 'w> {
+impl<'w> Builder<'w> {
     /// Creates a new leaf builder.
-    fn new(writer: &'w Writer<'s>, num_keys: usize) -> Self {
+    fn new(writer: &'w Writer, num_keys: usize) -> Self {
         let mut page = writer.new_page();
         header::set_node_type(&mut page, NodeType::Leaf);
         header::set_num_keys(&mut page, num_keys);
-        Self { i: 0, writer, page }
+        Self { i: 0, page }
     }
 
     /// Adds a key-value pair to the builder.
@@ -379,7 +381,7 @@ pub struct LeafIterator<'l, 'a> {
     n: usize,
 }
 
-impl<'l, 'a> Iterator for LeafIterator<'l, 'a> {
+impl<'a> Iterator for LeafIterator<'_, 'a> {
     type Item = (&'a [u8], &'a [u8]);
 
     fn next(&mut self) -> Option<Self::Item> {

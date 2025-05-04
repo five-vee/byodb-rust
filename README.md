@@ -36,4 +36,4 @@ https://build-your-own.org/database/, but instead of Go, use Rust. This a person
 * [x] 7.1 Memory management techniques
 * [x] 7.2 Linked list on disk
 * [x] 7.3 Free list implementation
-* [ ] 7.4 KV with a free list
+* [x] 7.4 KV with a free list

@@ -213,19 +213,18 @@ pub enum ChildEntry {
 }
 
 // A builder of a B+ tree internal node.
-struct Builder<'s, 'w> {
+struct Builder<'w> {
     i: usize,
-    writer: &'w Writer<'s>,
     page: Page<'w>,
 }
 
-impl<'s, 'w> Builder<'s, 'w> {
+impl<'w> Builder<'w> {
     /// Creates a new internal node builder.
-    fn new(writer: &'w Writer<'s>, num_keys: usize) -> Self {
+    fn new(writer: &'w Writer, num_keys: usize) -> Self {
         let mut page = writer.new_page();
         header::set_node_type(&mut page, NodeType::Internal);
         header::set_num_keys(&mut page, num_keys);
-        Self { i: 0, writer, page }
+        Self { i: 0, page }
     }
 
     /// Adds a child entry to the builder.
@@ -339,7 +338,7 @@ pub struct InternalIterator<'i, 'a> {
     n: usize,
 }
 
-impl<'i, 'a> Iterator for InternalIterator<'i, 'a> {
+impl<'a> Iterator for InternalIterator<'_, 'a> {
     type Item = (&'a [u8], usize);
 
     fn next(&mut self) -> Option<Self::Item> {

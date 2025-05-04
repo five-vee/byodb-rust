@@ -1,5 +1,5 @@
 mod consts;
-mod error;
-mod mmap;
-mod tree;
+pub(crate) mod error;
 mod header;
+pub(crate) mod mmap;
+pub(crate) mod tree;

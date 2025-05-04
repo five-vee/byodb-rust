@@ -43,21 +43,30 @@ type Result<T> = std::result::Result<T, TreeError>;
 /// the data until they reach a point where they would naturally access the
 /// newly written parts.
 pub struct Tree<'g, G: Guard> {
-    page_num: usize,
     guard: &'g G,
+    page_num: usize,
 }
 
 impl<'g, G: Guard> Tree<'g, G> {
     /// Loads the root of the tree found in the store.
     pub fn new(guard: &'g G) -> Self {
         Tree {
-            page_num: guard.root_page(),
             guard,
+            page_num: guard.root_page(),
         }
     }
 
+    /// Loads the root of the tree at a specified root page num.
+    pub fn new_at(guard: &'g G, page_num: usize) -> Self {
+        Tree { page_num, guard }
+    }
+
+    pub fn page_num(&self) -> usize {
+        self.page_num
+    }
+
     /// Gets the value corresponding to the key.
-    pub fn get(&self, key: &[u8]) -> Result<Option<&[u8]>> {
+    pub fn get(&self, key: &[u8]) -> Result<Option<&'g [u8]>> {
         match Self::read(self.guard, self.page_num) {
             Node::Internal(parent) => {
                 let child_idx = parent.find(key);
