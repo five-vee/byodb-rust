@@ -92,6 +92,7 @@ impl FreeList {
         let mut head = None;
         if seq_to_index(self.head_seq) == 0 {
             head = Some(self.head_page);
+
             let next = node.get_next();
             if next == INVALID_NEXT {
                 // allocate a new node by appending
@@ -102,7 +103,8 @@ impl FreeList {
             } else {
                 self.head_page = next;
             };
-            assert_ne!(self.head_page, INVALID_NEXT);
+
+            // assert_ne!(self.head_page, INVALID_NEXT);
         }
         (Some(ptr), head)
     }

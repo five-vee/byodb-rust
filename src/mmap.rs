@@ -1167,15 +1167,8 @@ mod tests {
     }
 
     #[test]
-    fn test_free_list_grow_and_shrink() {
-        // Start with empty free list.
+    fn test_free_list_grow_then_shrink() {
         let (store, temp_file) = new_file_mmap();
-        // Repeat:
-        // * let writer = store.writer();
-        // * let page_num = writer.new_page().read_only().page_num();
-        // * writer.mark_free(page_num);
-        // * writer.flush(0 /* dummy */);
-        // * Read file's free list. If tail_page != head_page, done.
         let prev_tail_seq = {
             let writer = store.writer();
             let page_nums = (0..2 * free_list::FREE_LIST_CAP)
@@ -1191,11 +1184,6 @@ mod tests {
             assert!(node.tail_seq > node.head_seq);
             node.tail_seq
         };
-        // Repeat:
-        // * let writer = store.writer();
-        // * let _ = writer.new_page();
-        // * writer.flush(0 /* dummy */);
-        // * Read file's free list. If head_page == tail_page, done.
         {
             let writer = store.writer();
             for i in 0..2 * free_list::FREE_LIST_CAP {
@@ -1206,6 +1194,34 @@ mod tests {
             let node = MetaNode::try_from(mmap.as_ref()).unwrap();
             assert_eq!(node.head_page, node.tail_page);
             assert!(node.tail_seq > prev_tail_seq);
+        }
+    }
+
+    #[test]
+    fn test_free_list_grow_and_shrink() {
+        // Start with empty free list.
+        let (store, temp_file) = new_file_mmap();
+        // Repeat:
+        // * let writer = store.writer();
+        // * let page_num = writer.new_page().read_only().page_num();
+        // * writer.mark_free(page_num);
+        // * writer.flush(0 /* dummy */);
+        // * Read file's free list. If tail_page != head_page, done.
+        let mut i = 0;
+        loop {
+            let writer = store.writer();
+            let page_num = writer.new_page().read_only().page_num();
+            writer.mark_free(page_num);
+            writer.flush(0 /* dummy */);
+            i += 1;
+            let mmap = Mmap::open_or_create(temp_file.path()).unwrap();
+            let node = MetaNode::try_from(mmap.as_ref()).unwrap();
+            if node.tail_page != node.head_page {
+                break;
+            }
+            if i == 1000 {
+                panic!("i = {i}");
+            }
         }
     }
 }

@@ -33,7 +33,7 @@ https://build-your-own.org/database/, but instead of Go, use Rust. This a person
 
 ## [0.7 Free List: Recyle & Reuse](https://build-your-own.org/database/07_free_list)
 
-* [ ] 7.1 Memory management techniques
-* [ ] 7.2 Linked list on disk
-* [ ] 7.3 Free list implementation
+* [x] 7.1 Memory management techniques
+* [x] 7.2 Linked list on disk
+* [x] 7.3 Free list implementation
 * [ ] 7.4 KV with a free list
