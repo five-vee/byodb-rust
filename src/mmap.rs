@@ -679,6 +679,8 @@ fn init_empty_leaf(page: &mut [u8]) {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
+
     use tempfile::NamedTempFile;
 
     use crate::consts;
@@ -1174,11 +1176,36 @@ mod tests {
         // * writer.mark_free(page_num);
         // * writer.flush(0 /* dummy */);
         // * Read file's free list. If tail_page != head_page, done.
+        let prev_tail_seq = {
+            let writer = store.writer();
+            let page_nums = (0..2 * free_list::FREE_LIST_CAP)
+                .map(|_| writer.new_page().read_only().page_num())
+                .collect::<Vec<_>>();
+            for page_num in page_nums {
+                writer.mark_free(page_num);
+            }
+            writer.flush(0 /* dummy */);
+            let mmap = Mmap::open_or_create(temp_file.path()).unwrap();
+            let node = MetaNode::try_from(mmap.as_ref()).unwrap();
+            assert_ne!(node.head_page, node.tail_page);
+            assert!(node.tail_seq > node.head_seq);
+            node.tail_seq
+        };
         // Repeat:
         // * let writer = store.writer();
         // * let _ = writer.new_page();
         // * writer.flush(0 /* dummy */);
-        // * Read file's free list. If head_seq == tail_seq, done.
-        // todo!()
+        // * Read file's free list. If head_page == tail_page, done.
+        {
+            let writer = store.writer();
+            for i in 0..2 * free_list::FREE_LIST_CAP {
+                let _ = writer.new_page();
+            }
+            writer.flush(0 /* dummy */);
+            let mmap = Mmap::open_or_create(temp_file.path()).unwrap();
+            let node = MetaNode::try_from(mmap.as_ref()).unwrap();
+            assert_eq!(node.head_page, node.tail_page);
+            assert!(node.tail_seq > prev_tail_seq);
+        }
     }
 }

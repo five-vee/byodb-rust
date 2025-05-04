@@ -16,7 +16,7 @@ use crate::{consts, mmap::Page};
 
 use super::{Guard as _, ReadOnlyPage, WriteablePageType, Writer, meta_node::MetaNode};
 
-const FREE_LIST_CAP: usize = (consts::PAGE_SIZE - 8) / 8;
+pub(crate) const FREE_LIST_CAP: usize = (consts::PAGE_SIZE - 8) / 8;
 const INVALID_NEXT: usize = usize::MAX;
 
 /// An in-memory container of metadata about the free list.
@@ -74,7 +74,7 @@ impl FreeList {
         // also add the head node if it's removed
         if let Some(head) = head {
             node.set_pointer(0, head);
-            self.tail_seq = 1; // previously was 0
+            self.tail_seq += 1; // previously seq_to_index(self.tail_seq) == 0
         }
     }
 
@@ -92,7 +92,16 @@ impl FreeList {
         let mut head = None;
         if seq_to_index(self.head_seq) == 0 {
             head = Some(self.head_page);
-            self.head_page = node.get_next();
+            let next = node.get_next();
+            if next == INVALID_NEXT {
+                // allocate a new node by appending
+                let mut page = writer.new_page();
+                init_empty_list_node(&mut page);
+                self.head_page = page.read_only().page_num();
+                self.tail_page = self.head_page;
+            } else {
+                self.head_page = next;
+            };
             assert_ne!(self.head_page, INVALID_NEXT);
         }
         (Some(ptr), head)
@@ -176,7 +185,7 @@ impl<'w> From<ReadOnlyPage<'w>> for ListNode<'w, ReadOnlyPage<'w>> {
 impl<P: DerefMut<Target = [u8]>> ListNode<'_, P> {
     /// Sets the next pointer.
     fn set_next(&mut self, next: usize) {
-        self.page[0..8].copy_from_slice(&next.to_be_bytes());
+        self.page[0..8].copy_from_slice(&next.to_le_bytes());
     }
 
     /// Sets the value of `i`th pointer.
