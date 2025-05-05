@@ -88,6 +88,13 @@ impl<'g, G: Guard> Tree<'g, G> {
         }
     }
 
+    /// Iterates through the tree in-order.
+    pub fn in_order_iter(&self) -> InOrder<'g, G> {
+        InOrder {
+            stack: vec![(0, Self::new_at(self.guard, self.page_num))],
+        }
+    }
+
     /// Reads the page at `page_num` and returns it represented as a [`Node`].
     /// This is a convenience wrapper around the unsafe [`Node::read`].
     fn read(guard: &G, page_num: usize) -> Node<'_> {
@@ -396,25 +403,15 @@ impl<'g, G: Guard> Tree<'g, G> {
             }
         }
     }
-
-    /// Iterates through the tree in-order.
-    /// This is very slow, so be careful.
-    fn inorder_iter(&self) -> InOrder<'g, G> {
-        let copy = Self::new(self.guard);
-        InOrder {
-            stack: vec![(0, Rc::new(copy))],
-        }
-    }
 }
 
-#[cfg(test)]
-struct InOrder<'g, G: Guard> {
-    stack: Vec<(usize, Rc<Tree<'g, G>>)>,
+/// An in-order iterator over a tree.
+pub struct InOrder<'g, G: Guard> {
+    stack: Vec<(usize, Tree<'g, G>)>,
 }
 
-#[cfg(test)]
 impl<'g, G: Guard> Iterator for InOrder<'g, G> {
-    type Item = (Rc<[u8]>, Rc<[u8]>);
+    type Item = (&'g [u8], &'g [u8]);
     fn next(&mut self) -> Option<Self::Item> {
         while let Some((i, tree)) = self.stack.pop() {
             let node = Tree::read(tree.guard, tree.page_num);
@@ -424,15 +421,15 @@ impl<'g, G: Guard> Iterator for InOrder<'g, G> {
             }
             match &node {
                 Node::Leaf(leaf) => {
-                    self.stack.push((i + 1, tree.clone()));
-                    return Some((leaf.get_key(i).into(), leaf.get_value(i).into()));
+                    self.stack.push((i + 1, tree));
+                    return Some((leaf.get_key(i), leaf.get_value(i)));
                 }
                 Node::Internal(internal) => {
                     let pn = internal.get_child_pointer(i);
-                    let child = Rc::new(Tree {
+                    let child = Tree {
                         page_num: pn,
                         guard: tree.guard,
-                    });
+                    };
                     self.stack.push((i + 1, tree));
                     self.stack.push((0, child));
                 }
@@ -554,7 +551,10 @@ mod tests {
         let root = Tree::read(&reader, tree.page_num);
         assert!(matches!(root, Node::Internal(_)));
         assert!(root.get_num_keys() >= 2);
-        let got = tree.inorder_iter().collect::<Vec<_>>();
+        let got = tree
+            .in_order_iter()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect::<Vec<(Rc<[u8]>, Rc<[u8]>)>>();
         let want = (0..got.len() as u64)
             .map(|i| {
                 let x = u64_to_key(i);
@@ -620,7 +620,7 @@ mod tests {
         let max = {
             let reader = store.reader();
             let max_key = Tree::new(&reader)
-                .inorder_iter()
+                .in_order_iter()
                 .last()
                 .map(|(k, _)| k)
                 .unwrap();

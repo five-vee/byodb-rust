@@ -22,83 +22,74 @@ impl DB {
         })
     }
 
-    pub fn rw_txn(&self) -> RWTxn<'_> {
-        let writer = self.store.writer();
-        let curr_root_page = writer.root_page();
-        RWTxn {
-            writer,
-            curr_root_page,
+    pub fn r_txn(&self) -> Txn<Reader> {
+        let reader = self.store.reader();
+        let root_page = reader.root_page();
+        Txn {
+            guard: reader,
+            root_page,
         }
     }
 
-    pub fn r_txn(&self) -> RTxn<'_> {
-        let reader = self.store.reader();
-        let root_page = reader.root_page();
-        RTxn { reader, root_page }
+    pub fn rw_txn(&self) -> Txn<Writer> {
+        let writer = self.store.writer();
+        let root_page = writer.root_page();
+        Txn {
+            guard: writer,
+            root_page,
+        }
     }
 }
 
-pub struct RWTxn<'s> {
-    writer: Writer<'s>,
-    curr_root_page: usize,
+pub struct Txn<G: Guard> {
+    guard: G,
+    root_page: usize,
 }
 
-impl RWTxn<'_> {
+impl<G: Guard> Txn<G> {
     pub fn get(&self, key: &[u8]) -> Result<Option<&[u8]>> {
-        let tree = Tree::new_at(&self.writer, self.curr_root_page);
+        let tree = Tree::new_at(&self.guard, self.root_page);
         let val = tree.get(key)?.map(|val| {
             // Safety: The underlying data is in the mmap, which
-            // self.writer has access to. So long as self.writer exists,
+            // self.guard has access to. So long as self.guard exists,
             // so too does the mmap.
             unsafe { &*std::ptr::slice_from_raw_parts(val.as_ptr(), val.len()) }
         });
         Ok(val)
     }
 
+    pub fn in_order_iter(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
+        Tree::new_at(&self.guard, self.root_page).in_order_iter()
+    }
+}
+
+impl Txn<Writer<'_>> {
     pub fn insert(&mut self, key: &[u8], val: &[u8]) -> Result<()> {
-        self.curr_root_page = Tree::new_at(&self.writer, self.curr_root_page)
+        self.root_page = Tree::new_at(&self.guard, self.root_page)
             .insert(key, val)?
             .page_num();
         Ok(())
     }
 
     pub fn update(&mut self, key: &[u8], val: &[u8]) -> Result<()> {
-        self.curr_root_page = Tree::new_at(&self.writer, self.curr_root_page)
+        self.root_page = Tree::new_at(&self.guard, self.root_page)
             .update(key, val)?
             .page_num();
         Ok(())
     }
 
     pub fn delete(&mut self, key: &[u8]) -> Result<()> {
-        self.curr_root_page = Tree::new_at(&self.writer, self.curr_root_page)
+        self.root_page = Tree::new_at(&self.guard, self.root_page)
             .delete(key)?
             .page_num();
         Ok(())
     }
 
     pub fn commit(self) {
-        self.writer.flush(self.curr_root_page);
+        self.guard.flush(self.root_page);
     }
 
     pub fn abort(self) {
-        self.writer.abort();
-    }
-}
-
-pub struct RTxn<'s> {
-    reader: Reader<'s>,
-    root_page: usize,
-}
-
-impl RTxn<'_> {
-    pub fn get(&self, key: &[u8]) -> Result<Option<&[u8]>> {
-        let tree = Tree::new_at(&self.reader, self.root_page);
-        let val = tree.get(key)?.map(|val| {
-            // Safety: The underlying data is in the mmap, which
-            // self.writer has access to. So long as self.writer exists,
-            // so too does the mmap.
-            unsafe { &*std::ptr::slice_from_raw_parts(val.as_ptr(), val.len()) }
-        });
-        Ok(val)
+        self.guard.abort();
     }
 }
