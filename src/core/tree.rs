@@ -20,8 +20,6 @@
 
 mod node;
 
-use std::rc::Rc;
-
 use crate::core::error::TreeError;
 use crate::core::mmap::{self, Guard, Writer};
 use node::{ChildEntry, Internal, Node, NodeEffect, Sufficiency};
@@ -48,16 +46,8 @@ pub struct Tree<'g, G: Guard> {
 }
 
 impl<'g, G: Guard> Tree<'g, G> {
-    /// Loads the root of the tree found in the store.
-    pub fn new(guard: &'g G) -> Self {
-        Tree {
-            guard,
-            page_num: guard.root_page(),
-        }
-    }
-
     /// Loads the root of the tree at a specified root page num.
-    pub fn new_at(guard: &'g G, page_num: usize) -> Self {
+    pub fn new(guard: &'g G, page_num: usize) -> Self {
         Tree { page_num, guard }
     }
 
@@ -91,7 +81,7 @@ impl<'g, G: Guard> Tree<'g, G> {
     /// Iterates through the tree in-order.
     pub fn in_order_iter(&self) -> InOrder<'g, G> {
         InOrder {
-            stack: vec![(0, Self::new_at(self.guard, self.page_num))],
+            stack: vec![(0, Self::new(self.guard, self.page_num))],
         }
     }
 
@@ -378,7 +368,7 @@ impl<'g> Tree<'g, Writer<'_>> {
 }
 
 #[cfg(test)]
-impl<'g, G: Guard> Tree<'g, G> {
+impl<G: Guard> Tree<'_, G> {
     /// Gets the height of the tree.
     /// This performs a scan of the entire tree, so it's not really efficient.
     fn height(&self) -> Result<u32> {
@@ -441,6 +431,7 @@ impl<'g, G: Guard> Iterator for InOrder<'g, G> {
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
     use std::sync::Arc;
 
     use tempfile::NamedTempFile;
@@ -469,7 +460,7 @@ mod tests {
 
     fn insert_until_height(writer: Writer, height: u32) {
         assert_ne!(height, 0);
-        let mut tree = Tree::new(&writer);
+        let mut tree = Tree::new(&writer, writer.root_page());
         let mut i = 0u64;
         loop {
             if tree.height().unwrap() == height {
@@ -500,7 +491,7 @@ mod tests {
         let mut i = 0u64;
         loop {
             let writer = store.writer();
-            let tree = Tree::new(&writer);
+            let tree = Tree::new(&writer, writer.root_page());
             let x = u64_to_key(i);
             let result = tree.insert(&x, &x);
             assert!(
@@ -525,7 +516,7 @@ mod tests {
         }
         // Sanity check.
         let reader = store.reader();
-        let tree = Tree::new(&reader);
+        let tree = Tree::new(&reader, reader.root_page());
         assert_eq!(tree.height().unwrap(), height);
     }
 
@@ -534,12 +525,14 @@ mod tests {
         let (store, _temp_file) = new_test_store();
         {
             let writer = store.writer();
-            let tree = Tree::new(&writer).insert(&[1], &[1]).unwrap();
+            let tree = Tree::new(&writer, writer.root_page())
+                .insert(&[1], &[1])
+                .unwrap();
             let root = tree.page_num;
             writer.flush(root);
         }
         let reader = store.reader();
-        let _ = Tree::new(&reader);
+        let _ = Tree::new(&reader, reader.root_page());
     }
 
     #[test]
@@ -547,7 +540,7 @@ mod tests {
         let (store, _temp_file) = new_test_store();
         insert_until_height(store.writer(), 3);
         let reader = store.reader();
-        let tree = Tree::new(&reader);
+        let tree = Tree::new(&reader, reader.root_page());
         let root = Tree::read(&reader, tree.page_num);
         assert!(matches!(root, Node::Internal(_)));
         assert!(root.get_num_keys() >= 2);
@@ -570,7 +563,7 @@ mod tests {
         let (store, _temp_file) = new_test_store();
         insert_until_height(store.writer(), 2);
         let reader = store.reader();
-        let tree = Tree::new(&reader);
+        let tree = Tree::new(&reader, reader.root_page());
         let want = &u64_to_key(1u64);
         let got = tree.get(want).unwrap().unwrap();
         assert_eq!(got, want);
@@ -580,7 +573,7 @@ mod tests {
     fn update_intact() {
         let (store, _temp_file) = new_test_store();
         let writer = store.writer();
-        let tree = Tree::new(&writer)
+        let tree = Tree::new(&writer, writer.root_page())
             .insert(&[0], &[0])
             .unwrap()
             .update(&[0], &[1])
@@ -588,7 +581,7 @@ mod tests {
         let root = tree.page_num;
         writer.flush(root);
         let reader = store.reader();
-        let tree = Tree::new(&reader);
+        let tree = Tree::new(&reader, reader.root_page());
         let got = tree.get(&[0]).unwrap().unwrap();
         assert_eq!(got, &[1]);
         assert_eq!(tree.height().unwrap(), 1);
@@ -600,14 +593,16 @@ mod tests {
         insert_complete(&store, 2);
         let old_height = {
             let reader = store.reader();
-            Tree::new(&reader).height().unwrap()
+            Tree::new(&reader, reader.root_page()).height().unwrap()
         };
         assert_eq!(old_height, 2);
 
         let writer = store.writer();
         let key = &u64_to_key(0);
         let new_value = &[1u8; consts::MAX_VALUE_SIZE];
-        let tree = Tree::new(&writer).update(key, new_value).unwrap();
+        let tree = Tree::new(&writer, writer.root_page())
+            .update(key, new_value)
+            .unwrap();
         let got = tree.get(key).unwrap().unwrap();
         assert_eq!(got, new_value);
         assert_eq!(tree.height().unwrap(), old_height + 1);
@@ -619,7 +614,7 @@ mod tests {
         insert_until_height(store.writer(), 3);
         let max = {
             let reader = store.reader();
-            let max_key = Tree::new(&reader)
+            let max_key = Tree::new(&reader, reader.root_page())
                 .in_order_iter()
                 .last()
                 .map(|(k, _)| k)
@@ -631,7 +626,7 @@ mod tests {
         };
 
         let writer = store.writer();
-        let mut tree = Tree::new(&writer);
+        let mut tree = Tree::new(&writer, writer.root_page());
         for i in 0..=max {
             let key = &u64_to_key(i);
             let result = tree.delete(key);
@@ -661,7 +656,7 @@ mod tests {
         writer.flush(root);
 
         let reader = store.reader();
-        let tree = Tree::new(&reader);
+        let tree = Tree::new(&reader, reader.root_page());
         assert_eq!(tree.height().unwrap(), 1);
         let root = Tree::read(&reader, tree.page_num);
         assert_eq!(root.get_num_keys(), 0);
@@ -685,7 +680,7 @@ mod tests {
         // Setup
         let (store, _temp_file) = new_test_store();
         let writer = store.writer();
-        let tree = Tree::new(&writer)
+        let tree = Tree::new(&writer, writer.root_page())
             .insert(&[0; consts::MAX_KEY_SIZE], &[0; consts::MAX_VALUE_SIZE])
             .unwrap()
             .insert(&[1], &[1; 1000])
@@ -732,7 +727,7 @@ mod tests {
         // Setup
         let (store, _temp_file) = new_test_store();
         let writer = store.writer();
-        let tree = Tree::new(&writer)
+        let tree = Tree::new(&writer, writer.root_page())
             .insert(&[0; consts::MAX_KEY_SIZE], &[0; consts::MAX_VALUE_SIZE])
             .unwrap()
             .insert(&[1; consts::MAX_KEY_SIZE], &[1; consts::MAX_VALUE_SIZE])
@@ -783,7 +778,7 @@ mod tests {
         // Setup
         let (store, _temp_file) = new_test_store();
         let writer = store.writer();
-        let mut tree = Tree::new(&writer);
+        let mut tree = Tree::new(&writer, writer.root_page());
         for i in 0u8..=19u8 {
             tree = tree
                 .insert(&[i; consts::MAX_KEY_SIZE], &[i; consts::MAX_VALUE_SIZE])

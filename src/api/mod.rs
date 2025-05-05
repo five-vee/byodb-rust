@@ -48,7 +48,7 @@ pub struct Txn<G: Guard> {
 
 impl<G: Guard> Txn<G> {
     pub fn get(&self, key: &[u8]) -> Result<Option<&[u8]>> {
-        let tree = Tree::new_at(&self.guard, self.root_page);
+        let tree = Tree::new(&self.guard, self.root_page);
         let val = tree.get(key)?.map(|val| {
             // Safety: The underlying data is in the mmap, which
             // self.guard has access to. So long as self.guard exists,
@@ -59,27 +59,27 @@ impl<G: Guard> Txn<G> {
     }
 
     pub fn in_order_iter(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
-        Tree::new_at(&self.guard, self.root_page).in_order_iter()
+        Tree::new(&self.guard, self.root_page).in_order_iter()
     }
 }
 
 impl Txn<Writer<'_>> {
     pub fn insert(&mut self, key: &[u8], val: &[u8]) -> Result<()> {
-        self.root_page = Tree::new_at(&self.guard, self.root_page)
+        self.root_page = Tree::new(&self.guard, self.root_page)
             .insert(key, val)?
             .page_num();
         Ok(())
     }
 
     pub fn update(&mut self, key: &[u8], val: &[u8]) -> Result<()> {
-        self.root_page = Tree::new_at(&self.guard, self.root_page)
+        self.root_page = Tree::new(&self.guard, self.root_page)
             .update(key, val)?
             .page_num();
         Ok(())
     }
 
     pub fn delete(&mut self, key: &[u8]) -> Result<()> {
-        self.root_page = Tree::new_at(&self.guard, self.root_page)
+        self.root_page = Tree::new(&self.guard, self.root_page)
             .delete(key)?
             .page_num();
         Ok(())
