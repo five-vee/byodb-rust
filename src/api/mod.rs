@@ -1,6 +1,6 @@
 pub mod error;
 
-use std::{path::Path, sync::Arc};
+use std::{ops::RangeBounds, path::Path, sync::Arc};
 
 use error::TxnError;
 
@@ -60,6 +60,13 @@ impl<G: Guard> Txn<G> {
 
     pub fn in_order_iter(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
         Tree::new(&self.guard, self.root_page).in_order_iter()
+    }
+
+    pub fn in_order_range_iter<R: RangeBounds<[u8]>>(
+        &self,
+        range: &R,
+    ) -> impl Iterator<Item = (&[u8], &[u8])> {
+        Tree::new(&self.guard, self.root_page).in_order_range_iter(range)
     }
 }
 

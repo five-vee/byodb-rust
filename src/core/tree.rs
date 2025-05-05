@@ -20,6 +20,8 @@
 
 mod node;
 
+use std::ops::RangeBounds;
+
 use crate::core::error::TreeError;
 use crate::core::mmap::{self, Guard, Writer};
 use node::{ChildEntry, Internal, Node, NodeEffect, Sufficiency};
@@ -78,10 +80,65 @@ impl<'g, G: Guard> Tree<'g, G> {
         }
     }
 
-    /// Iterates through the tree in-order.
-    pub fn in_order_iter(&self) -> InOrder<'g, G> {
+    /// Iterates through the entire tree in-order.
+    pub fn in_order_iter(&self) -> InOrder<'g, 'g, G> {
         InOrder {
             stack: vec![(0, Self::new(self.guard, self.page_num))],
+            end_bound: std::ops::Bound::Unbounded,
+        }
+    }
+
+    /// Iterates through the tree in-order, bounded by `range`.
+    pub fn in_order_range_iter<'q, R>(&self, range: &'q R) -> InOrder<'q, 'g, G>
+    where
+        R: RangeBounds<[u8]>,
+    {
+        if matches!(range.start_bound(), std::ops::Bound::Unbounded) {
+            return InOrder {
+                stack: vec![(0, Self::new(self.guard, self.page_num))],
+                end_bound: range.end_bound(),
+            };
+        }
+
+        // Find.
+        let start_bound = range.start_bound();
+        type LeafPredicate<'q, 'g> = Box<dyn Fn((&'g [u8], &'g [u8])) -> bool + 'q>;
+        let (leaf_predicate, start): (LeafPredicate<'q, 'g>, &[u8]) = match start_bound {
+            std::ops::Bound::Included(start) => (Box::new(move |pair| pair.0 >= start), start),
+            std::ops::Bound::Excluded(start) => (Box::new(move |pair| pair.0 > start), start),
+            _ => unreachable!(),
+        };
+        let mut stack = vec![(0, Self::new(self.guard, self.page_num))];
+        while let Some((i, tree)) = stack.pop() {
+            let node = Tree::read(tree.guard, tree.page_num);
+            let n = node.get_num_keys();
+            if i == n {
+                break;
+            }
+            match &node {
+                Node::Leaf(leaf) => match leaf.iter().position(&leaf_predicate) {
+                    // leaf range < start; try again up the stack
+                    None => {}
+                    Some(j) => {
+                        stack.push((j, tree));
+                        break;
+                    }
+                },
+                Node::Internal(internal) => {
+                    let child_idx = (i..internal.get_num_keys())
+                        .rev()
+                        .find(|&j| internal.get_key(j) <= start)
+                        .unwrap_or(i);
+                    let child_page = internal.get_child_pointer(child_idx);
+                    let child = Tree::new(tree.guard, child_page);
+                    stack.push((child_idx + 1, tree));
+                    stack.push((0, child));
+                }
+            }
+        }
+        InOrder {
+            stack,
+            end_bound: range.end_bound(),
         }
     }
 
@@ -396,11 +453,12 @@ impl<G: Guard> Tree<'_, G> {
 }
 
 /// An in-order iterator over a tree.
-pub struct InOrder<'g, G: Guard> {
+pub struct InOrder<'q, 'g, G: Guard> {
     stack: Vec<(usize, Tree<'g, G>)>,
+    end_bound: std::ops::Bound<&'q [u8]>,
 }
 
-impl<'g, G: Guard> Iterator for InOrder<'g, G> {
+impl<'q, 'g, G: Guard> Iterator for InOrder<'q, 'g, G> {
     type Item = (&'g [u8], &'g [u8]);
     fn next(&mut self) -> Option<Self::Item> {
         while let Some((i, tree)) = self.stack.pop() {
@@ -411,6 +469,20 @@ impl<'g, G: Guard> Iterator for InOrder<'g, G> {
             }
             match &node {
                 Node::Leaf(leaf) => {
+                    let key = leaf.get_key(i);
+                    match self.end_bound {
+                        std::ops::Bound::Included(end) => {
+                            if key > end {
+                                return None;
+                            }
+                        }
+                        std::ops::Bound::Excluded(end) => {
+                            if key >= end {
+                                return None;
+                            }
+                        }
+                        std::ops::Bound::Unbounded => {}
+                    }
                     self.stack.push((i + 1, tree));
                     return Some((leaf.get_key(i), leaf.get_value(i)));
                 }
@@ -431,9 +503,11 @@ impl<'g, G: Guard> Iterator for InOrder<'g, G> {
 
 #[cfg(test)]
 mod tests {
-    use std::rc::Rc;
     use std::sync::Arc;
+    use std::{ops::Range, rc::Rc};
 
+    use rand::rng;
+    use rand::seq::SliceRandom;
     use tempfile::NamedTempFile;
 
     use crate::core::{
@@ -627,7 +701,9 @@ mod tests {
 
         let writer = store.writer();
         let mut tree = Tree::new(&writer, writer.root_page());
-        for i in 0..=max {
+        let mut inds = (0..=max).collect::<Vec<_>>();
+        inds.shuffle(&mut rng());
+        for i in inds {
             let key = &u64_to_key(i);
             let result = tree.delete(key);
             assert!(
@@ -805,5 +881,129 @@ mod tests {
         assert!(tree.get(&[20]).unwrap().is_none());
         assert_eq!(tree.height().unwrap(), 4);
         assert_eq!(Tree::read(&writer, tree.page_num).get_num_keys(), 2);
+    }
+
+    #[test]
+    fn test_in_order_range_iter() {
+        let (store, _temp_file) = new_test_store();
+        // Setup.
+        {
+            let writer = store.writer();
+            let mut tree = Tree::new(&writer, writer.root_page());
+            let mut inds = (1..=100).collect::<Vec<_>>();
+            inds.shuffle(&mut rng());
+            for i in inds {
+                let x = u64_to_key(i);
+                tree = tree.insert(&x, &x).unwrap();
+            }
+            let new_root_ptr = tree.page_num();
+            writer.flush(new_root_ptr);
+        }
+        let reader = store.reader();
+        let tree = Tree::new(&reader, reader.root_page());
+
+        // Golang style table-driven tests.
+        struct TestCase {
+            name: &'static str,
+            range: (
+                std::ops::Bound<&'static [u8]>,
+                std::ops::Bound<&'static [u8]>,
+            ),
+            want: Range<u64>,
+        }
+        impl Drop for TestCase {
+            fn drop(&mut self) {
+                for b in [self.range.0, self.range.1] {
+                    match b {
+                        std::ops::Bound::Included(b) => {
+                            drop(unsafe { Box::from_raw(b.as_ptr() as *mut u8) });
+                        }
+                        std::ops::Bound::Excluded(b) => {
+                            drop(unsafe { Box::from_raw(b.as_ptr() as *mut u8) });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let tests = [
+            TestCase {
+                name: "unbounded unbounded",
+                range: (std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
+                want: 1..101,
+            },
+            TestCase {
+                name: "included included",
+                range: (
+                    std::ops::Bound::Included(Box::leak(Box::new(u64_to_key(5)))),
+                    std::ops::Bound::Included(Box::leak(Box::new(u64_to_key(98)))),
+                ),
+                want: 5..99,
+            },
+            TestCase {
+                name: "excluded included",
+                range: (
+                    std::ops::Bound::Excluded(Box::leak(Box::new(u64_to_key(5)))),
+                    std::ops::Bound::Included(Box::leak(Box::new(u64_to_key(98)))),
+                ),
+                want: 6..99,
+            },
+            TestCase {
+                name: "excluded excluded",
+                range: (
+                    std::ops::Bound::Excluded(Box::leak(Box::new(u64_to_key(5)))),
+                    std::ops::Bound::Excluded(Box::leak(Box::new(u64_to_key(98)))),
+                ),
+                want: 6..98,
+            },
+            TestCase {
+                name: "unbounded included",
+                range: (
+                    std::ops::Bound::Unbounded,
+                    std::ops::Bound::Included(Box::leak(Box::new(u64_to_key(98)))),
+                ),
+                want: 1..99,
+            },
+            TestCase {
+                name: "unbounded excluded",
+                range: (
+                    std::ops::Bound::Unbounded,
+                    std::ops::Bound::Excluded(Box::leak(Box::new(u64_to_key(98)))),
+                ),
+                want: 1..98,
+            },
+            TestCase {
+                name: "included unbounded",
+                range: (
+                    std::ops::Bound::Included(Box::leak(Box::new(u64_to_key(5)))),
+                    std::ops::Bound::Unbounded,
+                ),
+                want: 5..101,
+            },
+            TestCase {
+                name: "excluded unbounded",
+                range: (
+                    std::ops::Bound::Excluded(Box::leak(Box::new(u64_to_key(5)))),
+                    std::ops::Bound::Unbounded,
+                ),
+                want: 6..101,
+            },
+            TestCase {
+                name: "no overlap",
+                range: (
+                    std::ops::Bound::Excluded(Box::leak(Box::new(u64_to_key(200)))),
+                    std::ops::Bound::Unbounded,
+                ),
+                want: 0..0,
+            },
+        ];
+        for test in tests {
+            let got = tree
+                .in_order_range_iter(&test.range)
+                .map(|(k, _)| u64::from_be_bytes([k[0], k[1], k[2], k[3], k[4], k[5], k[6], k[7]]))
+                .collect::<Vec<_>>();
+            let want = test.want.clone().collect::<Vec<_>>();
+            assert_eq!(got, want, "Test case \"{}\" failed", test.name);
+        }
     }
 }

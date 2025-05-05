@@ -84,7 +84,7 @@ impl<'a> Internal<'a> {
     pub fn find(&self, key: &[u8]) -> usize {
         let n = self.get_num_keys();
         assert_ne!(n, 0);
-        (1..n).rev().find(|i| self.get_key(*i) <= key).unwrap_or(0)
+        (1..n).rev().find(|&i| self.get_key(i) <= key).unwrap_or(0)
     }
 
     /// Gets the child pointer at an index.
