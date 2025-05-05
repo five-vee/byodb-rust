@@ -13,20 +13,20 @@ use super::header::{self, NodeType};
 type Result<T> = std::result::Result<T, NodeError>;
 
 /// A B+ tree leaf node.
-pub struct Leaf<'a> {
-    page: ReadOnlyPage<'a>,
+pub struct Leaf<'g> {
+    page: ReadOnlyPage<'g>,
 }
 
-impl<'a> Leaf<'a> {
+impl<'g> Leaf<'g> {
     /// Inserts a key-value pair.
-    pub fn insert(self, writer: &'a Writer, key: &[u8], val: &[u8]) -> Result<LeafEffect<'a>> {
+    pub fn insert(self, writer: &'g Writer, key: &[u8], val: &[u8]) -> Result<LeafEffect<'g>> {
         if key.len() > consts::MAX_KEY_SIZE {
             return Err(NodeError::MaxKeySize(key.len()));
         }
         if val.len() > consts::MAX_VALUE_SIZE {
             return Err(NodeError::MaxValueSize(val.len()));
         }
-        if self.find(key).is_some() {
+        if self.get(key).is_some() {
             return Err(NodeError::AlreadyExists);
         }
         let itr_func = || self.insert_iter(key, val);
@@ -36,14 +36,14 @@ impl<'a> Leaf<'a> {
     }
 
     /// Updates the value corresponding to a key.
-    pub fn update(self, writer: &'a Writer, key: &[u8], val: &[u8]) -> Result<LeafEffect<'a>> {
+    pub fn update(self, writer: &'g Writer, key: &[u8], val: &[u8]) -> Result<LeafEffect<'g>> {
         if key.len() > consts::MAX_KEY_SIZE {
             return Err(NodeError::MaxKeySize(key.len()));
         }
         if val.len() > consts::MAX_VALUE_SIZE {
             return Err(NodeError::MaxValueSize(val.len()));
         }
-        let old_val = self.find(key);
+        let old_val = self.get(key);
         if old_val.is_none() {
             return Err(NodeError::KeyNotFound);
         }
@@ -69,7 +69,7 @@ impl<'a> Leaf<'a> {
         if key.len() > consts::MAX_KEY_SIZE {
             return Err(NodeError::MaxKeySize(key.len()));
         }
-        if self.find(key).is_none() {
+        if self.get(key).is_none() {
             return Err(NodeError::KeyNotFound);
         }
         // Optimization: avoid memory allocation and
@@ -90,14 +90,14 @@ impl<'a> Leaf<'a> {
         Ok(LeafEffect::Intact(b.build()))
     }
 
-    /// Finds the value corresponding to the queried key.
-    pub fn find(&self, key: &[u8]) -> Option<&'a [u8]> {
+    /// Gets the value corresponding to the queried key.
+    pub fn get(&self, key: &[u8]) -> Option<&'g [u8]> {
         self.iter().find(|&(k, _)| k == key).map(|(_, v)| v)
     }
 
     /// Creates the leaf (or leaves) resulting from either left stealing from
     /// right, or left merging with right.
-    pub fn steal_or_merge(left: Leaf, right: Leaf, writer: &'a Writer) -> LeafEffect<'a> {
+    pub fn steal_or_merge(left: Leaf, right: Leaf, writer: &'g Writer) -> LeafEffect<'g> {
         let itr_func = || left.iter().chain(right.iter());
         let num_keys = left.get_num_keys() + right.get_num_keys();
         let overflow = left.get_num_bytes() + right.get_num_bytes() - 4 > consts::PAGE_SIZE;
@@ -116,12 +116,12 @@ impl<'a> Leaf<'a> {
     }
 
     /// Gets the `i`th key.
-    pub fn get_key(&self, i: usize) -> &'a [u8] {
+    pub fn get_key(&self, i: usize) -> &'g [u8] {
         get_key(&self.page, i)
     }
 
     /// Gets the `i`th value.
-    pub fn get_value(&self, i: usize) -> &'a [u8] {
+    pub fn get_value(&self, i: usize) -> &'g [u8] {
         get_value(&self.page, i)
     }
 
@@ -141,7 +141,7 @@ impl<'a> Leaf<'a> {
     }
 
     /// Returns a key-value iterator of the leaf.
-    pub fn iter(&self) -> LeafIterator<'_, 'a> {
+    pub fn iter(&self) -> LeafIterator<'_, 'g> {
         LeafIterator {
             node: self,
             i: 0,
@@ -150,7 +150,7 @@ impl<'a> Leaf<'a> {
     }
 
     /// Returns a key-value insert-iterator of the leaf.
-    fn insert_iter<'l>(&'l self, key: &'a [u8], val: &'a [u8]) -> InsertIterator<'l, 'a> {
+    fn insert_iter<'l>(&'l self, key: &'g [u8], val: &'g [u8]) -> InsertIterator<'l, 'g> {
         InsertIterator {
             leaf_itr: self.iter().peekable(),
             key,
@@ -160,7 +160,7 @@ impl<'a> Leaf<'a> {
     }
 
     /// Returns a key-value update-iterator of the leaf.
-    fn update_iter<'l>(&'l self, key: &'a [u8], val: &'a [u8]) -> UpdateIterator<'l, 'a> {
+    fn update_iter<'l>(&'l self, key: &'g [u8], val: &'g [u8]) -> UpdateIterator<'l, 'g> {
         UpdateIterator {
             leaf_itr: self.iter().peekable(),
             key,
@@ -172,11 +172,11 @@ impl<'a> Leaf<'a> {
     /// Builds an [`LeafEffect`], then frees self back to the store.
     fn build_then_free<'l, I, F>(
         &'l self,
-        writer: &'a Writer,
+        writer: &'g Writer,
         itr_func: F,
         num_keys: usize,
         overflow: bool,
-    ) -> LeafEffect<'a>
+    ) -> LeafEffect<'g>
     where
         I: Iterator<Item = (&'l [u8], &'l [u8])>,
         F: Fn() -> I,
@@ -560,7 +560,7 @@ mod tests {
             leaf.iter().collect::<Vec<_>>(),
             vec![("hello".as_bytes(), "world".as_bytes())]
         );
-        assert_eq!(leaf.find("hello".as_bytes()).unwrap(), "world".as_bytes());
+        assert_eq!(leaf.get("hello".as_bytes()).unwrap(), "world".as_bytes());
     }
 
     #[test]
@@ -608,8 +608,8 @@ mod tests {
         let (left, right) = result.unwrap().take_split();
         assert_eq!(left.get_num_keys(), 1);
         assert_eq!(right.get_num_keys(), 1);
-        assert_eq!(left.find(key0).unwrap(), val0);
-        assert_eq!(right.find(key1).unwrap(), val1);
+        assert_eq!(left.get(key0).unwrap(), val0);
+        assert_eq!(right.get(key1).unwrap(), val1);
     }
 
     #[test]
@@ -620,7 +620,7 @@ mod tests {
         let leaf = Builder::new(&writer, 1)
             .add_key_value("key".as_bytes(), "val".as_bytes())
             .build();
-        assert!(matches!(leaf.find("key".as_bytes()), Some(v) if v == "val".as_bytes()));
+        assert!(matches!(leaf.get("key".as_bytes()), Some(v) if v == "val".as_bytes()));
     }
 
     #[test]
@@ -629,7 +629,7 @@ mod tests {
         let reader = store.reader();
 
         let leaf = Leaf::read(&reader, root_ptr);
-        assert!(leaf.find("key".as_bytes()).is_none())
+        assert!(leaf.get("key".as_bytes()).is_none())
     }
 
     #[test]
@@ -682,7 +682,7 @@ mod tests {
                 ("key2".as_bytes(), "val2".as_bytes())
             ]
         );
-        assert_eq!(leaf.find("key1".as_bytes()).unwrap(), "val1_new".as_bytes());
+        assert_eq!(leaf.get("key1".as_bytes()).unwrap(), "val1_new".as_bytes());
     }
 
     #[test]
@@ -703,11 +703,11 @@ mod tests {
         assert_eq!(left.get_num_keys(), 1);
         assert_eq!(right.get_num_keys(), 1);
         assert_eq!(
-            left.find(&[0u8; consts::MAX_KEY_SIZE]).unwrap(),
+            left.get(&[0u8; consts::MAX_KEY_SIZE]).unwrap(),
             &[0u8; consts::MAX_VALUE_SIZE]
         );
         assert_eq!(
-            right.find("1".as_bytes()).unwrap(),
+            right.get("1".as_bytes()).unwrap(),
             &[1u8; consts::MAX_VALUE_SIZE]
         );
     }
@@ -769,7 +769,7 @@ mod tests {
             leaf.iter().collect::<Vec<_>>(),
             vec![("key2".as_bytes(), "val2".as_bytes())]
         );
-        assert!(leaf.find("key1".as_bytes()).is_none());
+        assert!(leaf.get("key1".as_bytes()).is_none());
     }
 
     #[test]

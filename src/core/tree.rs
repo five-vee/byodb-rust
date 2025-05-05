@@ -74,7 +74,7 @@ impl<'g, G: Guard> Tree<'g, G> {
                     })
                 })
             }
-            Node::Leaf(root) => Ok(root.find(key)),
+            Node::Leaf(root) => Ok(root.get(key)),
         }
     }
 
