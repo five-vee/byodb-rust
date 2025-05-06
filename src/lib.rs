@@ -7,14 +7,14 @@
 //! ## Example
 //!
 //! ```rust,no_run
-//! # use byodb_rust::{DB, Result};
+//! # use byodb_rust::{DB, Result, Txn};
 //! # fn main() -> Result<()> {
 //! let path = "/path/to/a/db/file";
-//! let db = DB::open_or_create(path)?;
+//! let db: DB = DB::open_or_create(path)?;
 //!
 //! // Perform reads in a read transaction.
 //! {
-//!     let r_txn = db.r_txn();
+//!     let r_txn: Txn<_> = db.r_txn();
 //!     for (k, v) in r_txn.in_order_iter() {
 //!         println!("key: {k:?}, val: {v:?}");
 //!     }
@@ -22,7 +22,7 @@
 //!
 //! // Perform reads and writes in a read-write transaction.
 //! {
-//!     let mut rw_txn = db.rw_txn();
+//!     let mut rw_txn: Txn<_> = db.rw_txn();
 //!     if rw_txn.get("some_key".as_bytes())?.is_some() {
 //!         rw_txn.update("some_key".as_bytes(), "some_new_val".as_bytes())?;
 //!     }
