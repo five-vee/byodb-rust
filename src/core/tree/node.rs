@@ -1,3 +1,5 @@
+//! [`Node`] is a enum that wraps either a [`Leaf`] or [`Internal`] node.
+//!
 //! # Design a node format
 //!
 //! Here is our node format. The 2nd row is the encoded field size in bytes.
@@ -240,8 +242,9 @@ impl<'a> From<InternalEffect<'a>> for NodeEffect<'a> {
 /// deletion operation on a node.
 pub enum Sufficiency {
     /// A node without 0 keys after a delete was performed on it.
-    /// This is a special-case of `Underflow` done to avoid unnecessary
-    /// page allocations, since empty non-root nodes aren't allowed.
+    /// This is a special-case of [`Sufficiency::Underflow`] done to avoid
+    /// unnecessary page allocations, since empty non-root nodes aren't
+    /// allowed.
     Empty,
     /// A node that is NOT sufficiently sized but is not empty
     /// (i.e. has 1 key).

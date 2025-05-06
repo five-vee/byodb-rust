@@ -1,24 +1,15 @@
-//! The meta node is special node that is not part of the B+ tree.
+//! The [`MetaNode`] is special node that is not part of the B+ tree.
 //! Rather, it contains metadata about the B+ tree, including where
 //! the root node is located, how many nodes/pages are currently
-//! there (including those not yet reclaimed into the free list), etc.
+//! there (including those not yet reclaimed into the [`FreeList`]), etc.
 //!
 //! The meta node has the following format on disk:
-//!
-//! Old format:
-//!
-//! ```ignore
-//! | root_page | num_pages |
-//! |     8B    |     8B    |
-//! ```
-//!
-//! New format:
 //!
 //! ```ignore
 //! | root_page | num_pages | head_page | head_seq | tail_page | tail_seq |
 //! |     8B    |     8B    |    8B     |    8B    |     8B    |    8B    |
 //! ```
-use crate::core::error::PageError;
+use crate::core::error::MmapError;
 use std::{convert::TryFrom, ptr, rc::Rc};
 
 use super::free_list::FreeList;
@@ -33,7 +24,7 @@ const _: () = {
     assert!(META_NODE_SIZE <= META_PAGE_SIZE);
 };
 
-type Result<T> = std::result::Result<T, PageError>;
+type Result<T> = std::result::Result<T, MmapError>;
 
 /// The meta node is special node that is not part of the B+ tree.
 /// Rather, it contains metadata about the B+ tree, including where
@@ -101,11 +92,11 @@ impl Default for MetaNode {
 }
 
 impl TryFrom<&[u8]> for MetaNode {
-    type Error = PageError;
+    type Error = MmapError;
 
     fn try_from(value: &[u8]) -> Result<Self> {
         if value.len() < META_PAGE_SIZE {
-            return Err(PageError::InvalidFile(Rc::from(format!(
+            return Err(MmapError::InvalidFile(Rc::from(format!(
                 "Input slice too small for MetaNode. Expected at least {} bytes, got {}",
                 META_PAGE_SIZE,
                 value.len()
@@ -176,7 +167,7 @@ mod tests {
         let buffer = [0u8; META_PAGE_SIZE - 1];
         assert!(matches!(
             MetaNode::try_from(&buffer[..]),
-            Err(PageError::InvalidFile(_))
+            Err(MmapError::InvalidFile(_))
         ));
     }
 

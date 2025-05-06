@@ -1,3 +1,5 @@
+//! Errors returned by functions in the [`crate::core`] module.
+
 use std::{io, rc::Rc};
 
 /// An error type for `mod tree`.
@@ -22,9 +24,9 @@ pub enum NodeError {
     KeyNotFound,
 }
 
-/// An error type for `mod page_store`.
+/// An error type for `mod mmap`.
 #[derive(thiserror::Error, Debug)]
-pub enum PageError {
+pub enum MmapError {
     #[error(transparent)]
     IOError(#[from] io::Error),
     #[error("Invalid file: {0}")]

@@ -1,7 +1,11 @@
+//! [`Mmap`] represents a file-backed memory-mapped region that serves as the
+//! underlying data layer of the B+ [`crate::core::tree::Tree`].
+//!
 //! # Mmap format
 //!
-//! The store is the storage layer for the copy-on-write B+ tree. It is a
-//! memory-mapped region that can be backed by a file.
+//! The store is the storage layer for the copy-on-write B+
+//! [`crate::core::tree::Tree`]. It is a memory-mapped region that is backed by
+//! a file.
 //!
 //! The mmap has the following structure:
 //!
@@ -15,21 +19,59 @@
 //!
 //! # Snapshot isolation
 //!
-//! There can be multiple concurrent readers of a store. Readers do not block
-//! each other.
+//! [Multiversion concurrency control](https://en.wikipedia.org/wiki/Multiversion_concurrency_control)
+//! (MVCC) is a non-locking concurrency control method to allow concurrent
+//! access in the database.
 //!
-//! There can be only 1 writer of a store at a time. However, readers do not
-//! block the writer, and the writer does not block readers.
+//! A [`Store`] provides guarded concurrent access to the underlying [`Mmap`].
+//! [`Store::reader`] returns a [`Reader`], which is essentially a read-only
+//! transaction that has global access to a snapshot of the underlying data.
+//! There can be multiple concurrent readers of a store. [`Reader`]s do not
+//! block each other.
 //!
-//! Readers can only read pages once they're flushed: no dirty reads allowed.
-//! Writers can allocate new pages and can even read non-flushed pages.
-//! Of course, if one wants the page to be visible to future reader, it MUST
-//! be flushed first.
+//! [`Store::writer`] returns a [`Writer`], which is a read-write transaction.
+//! There can be only 1 [`Writer`] of a store at a time (achieved via
+//! [`Mutex`]). However, readers do not block the writer, and the writer does
+//! not block readers. This is achieved via the [`arc_swap`] crate (more on
+//! this later).
 //!
-//! # Building MVCC transactions
+//! [`Reader`]s can only read pages once they're flushed: no dirty reads
+//! allowed. [`Writer`]s can allocate new pages and can even read non-flushed
+//! pages. Of course, if one wants the page to be visible to future reader, it
+//! **MUST** be flushed first, i.e. [`Writer::flush`].
 //!
-//! Though this module doesn't support MVCC transactions out of the box,
-//! the abstractions provided can be used to build transactions.
+//! A transaction can be aborted instead by [`Writer::abort`]. Though this
+//! doesn't revert any dirty pages, those pages are inaccessible b/c the
+//! meta node won't be updated unless flushed.
+//!
+//! We use the crate [`arc_swap`] for multi-buffering of the memory-mapped
+//! file. Through a [`arc_swap::Guard`], a [`Reader`] will still hold reference
+//! to the old mmap even if a [`Writer`] has completely replaced the mmap with
+//! a newer one that's larger in size due to file growth.
+//!
+//! ## Meta page
+//!
+//! The meta page is crucial for write transaction atomicity and durability
+//! guarantees. It acts similarly to a memory barrier for accessing the tree
+//! (through the root pointer), or the free list.
+//!
+//! ## Garbage collection
+//!
+//! The [`Writer`] is responsible for collecting garbage pages and making them
+//! available for re-use.
+//!
+//! Pages that are marked free are put in a pending "bag". When it's guaranteed
+//! that no readers can traverse from their B+ tree root page to a page, that
+//! page can be safely reclaimed into the [`FreeList`].
+//!
+//! This is performed through a reclamation mechanism that, relies on the
+//! [`seize`] crate. The benefit of this over a traditional epoch-based
+//! reclamation (EBR) process (such as
+//! [`crossbeam_epoch`](https://docs.rs/crossbeam-epoch)) is that EBR lacks
+//! predictability or even guarantees that garbage will be reclaimed in a
+//! certain time period. Periodic checks are often required to determine when
+//! it is safe to free memory. Unlike EBR, [`seize`] can be more easily
+//! configured when it can reclaim.
 mod free_list;
 mod meta_node;
 
@@ -54,7 +96,7 @@ use seize::{Collector, Guard as _, LocalGuard};
 
 use crate::core::{
     consts,
-    error::PageError,
+    error::MmapError,
     header::{self, NodeType},
 };
 use free_list::FreeList;
@@ -67,10 +109,10 @@ const MIN_FILE_GROWTH_SIZE: usize = (1 << 14) * consts::PAGE_SIZE;
 const MIN_FILE_GROWTH_SIZE: usize = 2 * consts::PAGE_SIZE;
 
 #[allow(dead_code)]
-type Result<T> = std::result::Result<T, PageError>;
+type Result<T> = std::result::Result<T, MmapError>;
 
 /// A wrapper around a memory-mapped region (mmap).
-/// It is optionally backed by a file.
+/// It is backed by a file.
 pub struct Mmap {
     file: Rc<RefCell<File>>,
     mmap: MmapMut,
@@ -121,7 +163,7 @@ impl Mmap {
         }
         let file_len = file_len;
         if file_len < meta_node::META_PAGE_SIZE + 2 * consts::PAGE_SIZE {
-            return Err(PageError::InvalidFile(
+            return Err(MmapError::InvalidFile(
                 "file must be at least 2 meta page sizes + 2 pages".into(),
             ));
         }
@@ -322,7 +364,7 @@ impl Store {
             prev_root_page,
             // Safety: not null b/c always initialized.
             curr_root_page: unsafe { *prev_root_page },
-            abort: false,
+            abort: true,
             store: self.clone(),
             state_guard: RefCell::new(mutex_guard),
             collector_guard,
@@ -331,10 +373,12 @@ impl Store {
 
     /// Adds pages to the free list.
     fn reclaim_pages(self: &Arc<Self>) {
-        let w = self.writer();
+        let mut w = self.writer();
         let (mut fl, pages) = {
             let mut borrow = w.state_guard.borrow_mut();
             if borrow.reclaimable_pages.is_empty() {
+                drop(borrow);
+                w.abort();
                 return;
             }
             let fl = borrow.free_list;
@@ -458,6 +502,7 @@ impl Writer<'_> {
     /// Flushes all written pages and update the meta node root pointer.
     /// Every new page must first be written before calling `flush`.
     pub fn flush(mut self, new_root_ptr: usize) {
+        self.abort = false;
         let mut guard = self.state_guard.borrow_mut();
         guard.flush_pages();
         guard.flush_new_meta_node(new_root_ptr);
@@ -752,7 +797,7 @@ mod tests {
             file.sync_all().unwrap();
 
             let result = Mmap::open_or_create(temp_file.path());
-            assert!(matches!(result, Err(PageError::InvalidFile(_))));
+            assert!(matches!(result, Err(MmapError::InvalidFile(_))));
         }
     }
 

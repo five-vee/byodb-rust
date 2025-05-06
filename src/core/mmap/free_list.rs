@@ -1,4 +1,12 @@
-//! list node format:
+//! The free list is a linked list, where each node is itself a page in the
+//! mmap, and each node holds pointers to pages that can be freely used
+//! to write new B+ tree pages.
+//!
+//! The [`Writer`] is responsible for cleaning up garbage unreferenced
+//! memory-mapped pages and adding them to the [`FreeList`]. Any page
+//! referenced by this list is available for re-use, thus saving on file size.
+//!
+//! List node format:
 //!
 //! ```ignore
 //! | next | pointers | unused |
@@ -6,6 +14,21 @@
 //! ```
 //!
 //! `next` points to the next list node. `pointers` points to free pages.
+//!
+//! ## Torn writes
+//!
+//! A write to a free list page is considered "torn" when the write doesn't
+//! complete, leaving the page in a partial corrupted state.
+//!
+//! This is fine because:
+//!
+//! * The [`Writer::flush`] call must successfully update the [`MetaNode`]
+//!   on disk with the updated [`FreeList`] for it to be accessible by
+//!   future readers/writers. That is, a partially written free-list is not
+//!   accessible upon crash recovery.
+//! * _(TODO)_ Upon opening a database file, the free-list is re-built
+//!   from scratch, thus reclaiming garbage introduced in an uncommitted
+//!   write transaction prior to crashing.
 
 use std::{
     marker::PhantomData,

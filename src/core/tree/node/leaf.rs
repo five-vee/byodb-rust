@@ -1,3 +1,7 @@
+//! A [`Leaf`] node holds a sub-range of key-value pairs of the B+ tree.
+//! All key-values of the tree are stored in one or more leaf nodes.
+//!
+//! The tree is initialized as an empty leaf node.
 use std::iter::Peekable;
 use std::ops::Deref as _;
 
@@ -95,8 +99,8 @@ impl<'g> Leaf<'g> {
         self.iter().find(|&(k, _)| k == key).map(|(_, v)| v)
     }
 
-    /// Creates the leaf (or leaves) resulting from either left stealing from
-    /// right, or left merging with right.
+    /// Creates the leaf (or leaves) resulting from either `left` stealing from
+    /// `right`, or `left` merging with `right`.
     pub fn steal_or_merge(left: Leaf, right: Leaf, writer: &'g Writer) -> LeafEffect<'g> {
         let itr_func = || left.iter().chain(right.iter());
         let num_keys = left.get_num_keys() + right.get_num_keys();
@@ -216,12 +220,13 @@ impl<'a> TryFrom<ReadOnlyPage<'a>> for Leaf<'a> {
 /// An enum representing the effect of a leaf node operation.
 pub enum LeafEffect<'r> {
     /// A leaf with 0 keys after a delete was performed on it.
-    /// This is a special-case of `Underflow` done to avoid unnecessary
-    /// page allocations, since empty non-root nodes aren't allowed.
+    /// This is a special-case of [`super::Sufficiency::Underflow`] done to
+    /// avoid unnecessary page allocations, since empty non-root nodes aren't
+    /// allowed.
     Empty,
     /// A newly created leaf that remained  "intact", i.e. it did not split.
     Intact(Leaf<'r>),
-    /// The left and right splits of a leaf that was created.
+    /// The `left` and `right` splits of a leaf that was created.
     Split { left: Leaf<'r>, right: Leaf<'r> },
 }
 

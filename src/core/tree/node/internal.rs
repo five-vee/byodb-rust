@@ -1,3 +1,8 @@
+//! An [`Internal`] node is a non-leaf node that points to multiple
+//! [`crate::core::tree::node::leaf::Leaf`] children nodes.
+//!
+//! The internal node will always have at least 2 keys, and therefore at least
+//! 2 children.
 use std::{iter::Peekable, ops::Deref as _, rc::Rc};
 
 use crate::core::{
@@ -254,7 +259,7 @@ impl<'w> Builder<'w> {
         self
     }
 
-    /// Builds a leaf.
+    /// Builds an internal node.
     fn build(self) -> Internal<'w> {
         let n = header::get_num_keys(&self.page);
         assert!(
