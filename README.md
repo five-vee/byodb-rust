@@ -2,38 +2,36 @@
 
 https://build-your-own.org/database/, but instead of Go, use Rust. This a personal project to learn both database internals and the Rust programming language.
 
-## Database Design and Usage
+## Database Design
 
 This database implements a **Copy-on-Write (COW) B+ Tree** stored within a **memory-mapped file**. This design provides several key features for robustness, concurrency, and efficient data management.
-
-### Core Architectural Concepts
 
 1.  **Memory-Mapped File**:
     *   The entire database resides in a single file on disk. This file is **memory-mapped**, allowing the database to treat portions of the file as if they were directly in memory. This approach minimizes explicit read/write system calls for data access, leveraging the operating system's virtual memory management.
     *   The file structure begins with a special **meta page**, followed by a series of fixed-size data pages used for B+ Tree nodes and free list management.
 
-2.  **Copy-on-Write (COW) B+ Tree**:
+1.  **Copy-on-Write (COW) B+ Tree**:
     *   The primary data structure is a B+ Tree, optimized for efficient key-value storage, lookups, and range scans.
     *   A **Copy-on-Write (COW)** strategy is employed for all modifications (inserts, updates, deletes). Instead of altering existing B+ Tree nodes in place, the system creates modified copies of the affected nodes (and their parent nodes up to the root). The original nodes remain unchanged.
     *   This COW mechanism is crucial for enabling snapshot isolation and simplifying concurrent access, as readers can continue to see a stable version of the tree while modifications are in progress.
 
-3.  **Durability via Meta Node**:
+1.  **Durability via Meta Node**:
     *   The **meta page**, located at the beginning of the database file, is vital for ensuring data **durability** and atomicity of writes. It stores essential metadata, including a pointer to the current root page of the B+ Tree and information about the free list's state.
     *   Database updates are committed by first ensuring all modified data pages are written to disk, and then atomically updating the meta page to reflect the new state (e.g., the new root page). If a crash occurs, the database can recover to the last successfully committed state by reading the meta page.
 
-4.  **Multiversion Concurrency Control (MVCC)**:
+1.  **Multiversion Concurrency Control (MVCC)**:
     *   The database supports concurrent read and write operations using an MVCC-like approach.
     *   **Readers** (operating within read-only transactions) are provided with a consistent **snapshot** of the database. They do not block writers, and writers do not block them.
     *   This is achieved by allowing readers to access older versions of the memory-mapped data if a writer has concurrently made changes. The `arc_swap` mechanism is used to manage different versions of the memory map, ensuring that active readers can continue using their snapshot even if the underlying file is extended or its active version changes due to a writer's commit. Readers only see data that has been fully "flushed" and committed.
     *   **Writers** (operating within read-write transactions) obtain exclusive access for modifications, ensuring that write operations are serialized.
 
-5.  **Free List and Garbage Collection**:
+1.  **Free List and Garbage Collection**:
     *   When data is updated or deleted, B+ Tree pages previously holding that data become unused.
     *   These unused pages are not immediately overwritten or removed from the file. Instead, they are marked for **garbage collection**.
     *   A **free list** is maintained within the database file. This is a linked list structure where each node (itself a page) points to other pages that are free and can be reused for new data.
     *   A reclamation mechanism (utilizing the `seize` crate) ensures that pages are only added to the free list once it's guaranteed that no active transaction is still referencing them. This allows for efficient reuse of disk space.
 
-### API Usage
+## API Usage
 
 Interacting with the database is done through the `DB` struct and `Txn` (transaction) struct.
 
@@ -75,6 +73,17 @@ let db: DB = DB::open_or_create(path)?;
 # Ok(())
 # }
 ```
+
+## Caveats/Limitations
+
+*   **Not production ready**: This project is primarily a learning exercise and lacks the robustness, extensive testing, and feature completeness required for production environments.
+*   **No checksum in pages yet**: Data pages do not currently include checksums, making it harder to detect silent data corruption on disk.
+*   **No disaster/corruption recovery**: Beyond basic meta page integrity for atomic commits, there are no advanced mechanisms for recovering from significant file corruption or disasters.
+*   **No network replication/CDC**: The database operates as a single-node instance; there's no support for replicating data to other nodes or Change Data Capture (CDC) for external systems.
+*   **No journaling mode (for performance)**: Lacks a write-ahead log (WAL) or similar journaling, which could offer different performance trade-offs and recovery strategies.
+*   **No profiling/monitoring**: No built-in tools or hooks for performance profiling or operational monitoring.
+*   **No robust testing or CI/CD**: While some tests exist, comprehensive testing (e.g., stress testing, fuzz testing) and a CI/CD pipeline are not implemented.
+*   **No buffer caching mode**: Relies solely on the OS's mmap capabilities for page caching. An explicit buffer cache could offer more control over memory usage and caching strategies.
 
 ## Completed tasks
 
