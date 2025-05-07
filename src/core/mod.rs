@@ -3,7 +3,7 @@
 //!
 //! [`mmap`] is a file-backed memory-mapped region that serves as the
 //! underlying data layer of the B+ [`tree`].
-mod consts;
+pub mod consts;
 pub(crate) mod error;
 mod header;
 pub(crate) mod mmap;

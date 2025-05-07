@@ -11,4 +11,11 @@ seize = "0.5.0"
 thiserror = "2.0.12"
 
 [dev-dependencies]
+anyhow = "1.0.98"
+divan = "0.1.21"
+rand_chacha = "0.9.0"
 tempfile = "3.19.1"
+
+[[bench]]
+name = "txn"
+harness = false

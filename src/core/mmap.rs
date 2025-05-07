@@ -108,7 +108,6 @@ const MIN_FILE_GROWTH_SIZE: usize = (1 << 14) * consts::PAGE_SIZE;
 #[cfg(test)]
 const MIN_FILE_GROWTH_SIZE: usize = 2 * consts::PAGE_SIZE;
 
-#[allow(dead_code)]
 type Result<T> = std::result::Result<T, MmapError>;
 
 /// A wrapper around a memory-mapped region (mmap).
@@ -373,7 +372,7 @@ impl Store {
 
     /// Adds pages to the free list.
     fn reclaim_pages(self: &Arc<Self>) {
-        let mut w = self.writer();
+        let w = self.writer();
         let (mut fl, pages) = {
             let mut borrow = w.state_guard.borrow_mut();
             if borrow.reclaimable_pages.is_empty() {

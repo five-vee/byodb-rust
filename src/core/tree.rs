@@ -458,7 +458,7 @@ pub struct InOrder<'q, 'g, G: Guard> {
     end_bound: std::ops::Bound<&'q [u8]>,
 }
 
-impl<'q, 'g, G: Guard> Iterator for InOrder<'q, 'g, G> {
+impl<'g, G: Guard> Iterator for InOrder<'_, 'g, G> {
     type Item = (&'g [u8], &'g [u8]);
     fn next(&mut self) -> Option<Self::Item> {
         while let Some((i, tree)) = self.stack.pop() {

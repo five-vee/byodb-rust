@@ -1,6 +1,6 @@
 //! Errors returned by functions in the [`crate::core`] module.
 
-use std::{io, rc::Rc};
+use std::io;
 
 /// An error type for `mod tree`.
 #[derive(thiserror::Error, Debug)]
@@ -30,5 +30,5 @@ pub enum MmapError {
     #[error(transparent)]
     IOError(#[from] io::Error),
     #[error("Invalid file: {0}")]
-    InvalidFile(Rc<str>),
+    InvalidFile(String),
 }

@@ -10,6 +10,7 @@ use std::{ops::RangeBounds, path::Path, sync::Arc};
 
 use error::TxnError;
 
+pub use crate::core::consts;
 use crate::core::{
     mmap::{Guard, Mmap, Reader, Store, Writer},
     tree::Tree,

@@ -10,7 +10,7 @@
 //! |     8B    |     8B    |    8B     |    8B    |     8B    |    8B    |
 //! ```
 use crate::core::error::MmapError;
-use std::{convert::TryFrom, ptr, rc::Rc};
+use std::{convert::TryFrom, ptr};
 
 use super::free_list::FreeList;
 
@@ -96,11 +96,11 @@ impl TryFrom<&[u8]> for MetaNode {
 
     fn try_from(value: &[u8]) -> Result<Self> {
         if value.len() < META_PAGE_SIZE {
-            return Err(MmapError::InvalidFile(Rc::from(format!(
+            return Err(MmapError::InvalidFile(format!(
                 "Input slice too small for MetaNode. Expected at least {} bytes, got {}",
                 META_PAGE_SIZE,
                 value.len()
-            ))));
+            )));
         }
 
         let mut meta_node = MetaNode::default();
