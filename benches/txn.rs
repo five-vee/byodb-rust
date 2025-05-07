@@ -8,7 +8,10 @@ use rand::{
 use rand_chacha::ChaCha8Rng;
 use tempfile::NamedTempFile;
 
-use byodb_rust::{DB, consts};
+use byodb_rust::{
+    DB, DBBuilder, consts,
+    error::{NodeError, TreeError, TxnError},
+};
 
 const DEFAULT_SEED: u64 = 1;
 
@@ -16,23 +19,10 @@ fn main() {
     divan::main()
 }
 
-#[divan::bench(args = [1, 2, 4, 8, 16, 32])]
-fn bench_fibonacci(n: u64) -> u64 {
-    fibonacci(black_box(n))
-}
-
-fn fibonacci(n: u64) -> u64 {
-    if n <= 1 {
-        1
-    } else {
-        fibonacci(n - 2) + fibonacci(n - 1)
-    }
-}
-
 fn new_test_db() -> (DB, NamedTempFile) {
     let temp_file = NamedTempFile::new().unwrap();
     let path = temp_file.path();
-    let db = DB::open_or_create(path).unwrap();
+    let db = DBBuilder::new(path).build().unwrap();
     (db, temp_file)
 }
 
@@ -49,11 +39,18 @@ impl Seeder {
         }
     }
 
-    fn seed(self, db: &DB) -> Result<()> {
+    fn seed_db(self, db: &DB) -> Result<()> {
         let mut t = db.rw_txn();
         for (i, (k, v)) in self.enumerate() {
-            t.insert(k.as_bytes(), v.as_bytes())
-                .with_context(|| format!("failed to insert {i}th ({k}, {v})"))?;
+            let result = t.insert(k.as_bytes(), v.as_bytes());
+            if matches!(
+                result,
+                Err(TxnError::Tree(TreeError::Node(NodeError::AlreadyExists)))
+            ) {
+                // Skip
+                continue;
+            }
+            result.with_context(|| format!("failed to insert {i}th ({k}, {v})"))?;
         }
         t.commit();
         Ok(())
@@ -75,14 +72,16 @@ impl Iterator for Seeder {
     }
 }
 
-#[divan::bench(args = [1, 2])]
-fn bench_single_reader(b: Bencher, n: usize) {
+#[divan::bench(threads = [1, 2, 4], args = [1000, 4000, 10000, 40000])]
+fn bench_reader(b: Bencher, n: usize) {
     let (db, _temp_file) = new_test_db();
-    Seeder::new(n, DEFAULT_SEED).seed(&db).unwrap();
-    let r = db.r_txn();
-    b.counter(n).bench_local(move || {
-        for (k, v) in black_box(r.in_order_iter()) {
-            let (_k, _v) = (black_box(k), black_box(v));
+    Seeder::new(n, DEFAULT_SEED).seed_db(&db).unwrap();
+    b.counter(n).bench({
+        move || {
+            let t = db.r_txn();
+            for (k, v) in t.in_order_iter() {
+                let (_k, _v) = (black_box(k), black_box(v));
+            }
         }
     });
 }

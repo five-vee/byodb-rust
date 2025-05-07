@@ -71,18 +71,16 @@ impl FreeList {
         node.set_pointer(seq_to_index(self.tail_seq), ptr);
         self.tail_seq += 1;
 
-        // add a new tail node if it's full (the list is never empty)
         if seq_to_index(self.tail_seq) != 0 {
             return;
         }
+        // add a new tail node if it's full (the list is never empty)
 
         // try to reuse from the list head
         let (next, head) = self.pop_helper(writer);
         let next = next.unwrap_or_else(|| {
             // or allocate a new node by appending
-            let mut page = writer.new_page();
-            init_empty_list_node(&mut page);
-            page.read_only().page_num()
+            writer.new_page().read_only().page_num()
         });
 
         // link to the new tail node
@@ -92,18 +90,27 @@ impl FreeList {
         // have any concurrent readers accessing it.
         // Also, &mut self ensures there is only one mutable reference to the
         // underlying page.
-        node = unsafe { writer.overwrite_page(self.tail_page) }.into();
+        let mut node_page = unsafe { writer.overwrite_page(self.tail_page) };
+        init_empty_list_node(&mut node_page);
+        node = node_page.into();
 
         // also add the head node if it's removed
         if let Some(head) = head {
-            node.set_pointer(0, head);
-            self.tail_seq += 1; // previously seq_to_index(self.tail_seq) == 0
+            node.set_pointer(seq_to_index(self.tail_seq), head);
+            self.tail_seq += 1;
         }
     }
 
-    // remove 1 item from the head node, and remove the head node if empty.
+    /// Removes 1 item from the head node,
+    /// and may remove the head node if empty.
     fn pop_helper(&mut self, writer: &Writer) -> (Option<usize>, Option<usize>) {
         if self.head_seq == self.tail_seq {
+            return (None, None); // cannot advance
+        }
+        // A linked list with 0 nodes implies nasty special cases.
+        // In practice, it’s easier to design the linked list to have at least
+        // 1 node than to deal with special cases.
+        if self.head_seq == self.tail_seq - 1 {
             return (None, None); // cannot advance
         }
         // Safety: &mut self ensures exclusive access to the head list node page.
@@ -115,19 +122,8 @@ impl FreeList {
         let mut head = None;
         if seq_to_index(self.head_seq) == 0 {
             head = Some(self.head_page);
-
-            let next = node.get_next();
-            if next == INVALID_NEXT {
-                // allocate a new node by appending
-                let mut page = writer.new_page();
-                init_empty_list_node(&mut page);
-                self.head_page = page.read_only().page_num();
-                self.tail_page = self.head_page;
-            } else {
-                self.head_page = next;
-            };
-
-            // assert_ne!(self.head_page, INVALID_NEXT);
+            self.head_page = node.get_next();
+            assert_ne!(self.head_page, INVALID_NEXT);
         }
         (Some(ptr), head)
     }

@@ -102,17 +102,20 @@ use crate::core::{
 use free_list::FreeList;
 use meta_node::MetaNode;
 
+// 64MB
 #[cfg(not(test))]
-const MIN_FILE_GROWTH_SIZE: usize = (1 << 14) * consts::PAGE_SIZE;
+pub(crate) const DEFAULT_MIN_FILE_GROWTH_SIZE: usize = (1 << 14) * consts::PAGE_SIZE;
 
+// 8KB
 #[cfg(test)]
-const MIN_FILE_GROWTH_SIZE: usize = 2 * consts::PAGE_SIZE;
+pub(crate) const DEFAULT_MIN_FILE_GROWTH_SIZE: usize = 2 * consts::PAGE_SIZE;
 
 type Result<T> = std::result::Result<T, MmapError>;
 
 /// A wrapper around a memory-mapped region (mmap).
 /// It is backed by a file.
 pub struct Mmap {
+    min_file_growth_size: usize,
     file: Rc<RefCell<File>>,
     mmap: MmapMut,
 }
@@ -132,7 +135,7 @@ impl DerefMut for Mmap {
 
 impl Mmap {
     /// Opens or creates (if not exists) a file that holds a B+ tree.
-    pub fn open_or_create<P: AsRef<Path>>(path: P) -> Result<Self> {
+    pub fn open_or_create<P: AsRef<Path>>(path: P, min_file_growth_size: usize) -> Result<Self> {
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -173,6 +176,7 @@ impl Mmap {
         let mmap = unsafe { MmapOptions::new().map_mut(&file).unwrap() };
 
         Ok(Mmap {
+            min_file_growth_size,
             file: Rc::new(RefCell::new(file)),
             mmap,
         })
@@ -203,6 +207,7 @@ impl Mmap {
             }
         };
         Mmap {
+            min_file_growth_size: self.min_file_growth_size,
             file: self.file.clone(),
             mmap,
         }
@@ -270,7 +275,7 @@ impl WriterState {
         if meta_node::META_PAGE_SIZE + self.new_offset + consts::PAGE_SIZE <= m.len() {
             return false;
         }
-        let expand = max(m.len(), MIN_FILE_GROWTH_SIZE);
+        let expand = max(m.len(), DEFAULT_MIN_FILE_GROWTH_SIZE);
         let new_len = m.len() + expand;
 
         m.flush();
@@ -313,7 +318,7 @@ pub struct Store {
 
 impl Store {
     /// Creates a new store from a specified `Mmap`.
-    pub fn new(mmap: Mmap) -> Self {
+    pub fn new(mmap: Mmap, collector: Collector) -> Self {
         let node = MetaNode::try_from(mmap.deref()).expect("there should exist a meta node");
         let flush_offset = node.num_pages * consts::PAGE_SIZE;
 
@@ -332,8 +337,7 @@ impl Store {
                 reclaimable_pages: Vec::new(),
                 free_list: FreeList::from(node),
             }),
-            // TODO: dependency inject collector
-            collector: Collector::new().batch_size(1),
+            collector,
             // Remember to manually drop this leaked box in Store::drop.
             root_page: AtomicPtr::new(Box::into_raw(Box::new(node.root_page))),
         }
@@ -733,8 +737,12 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let path = temp_file.path();
         println!("Created temporary file {path:?}");
-        let mmap = Mmap::open_or_create(path).unwrap();
-        let store = Arc::new(Store::new(mmap));
+        let mmap = Mmap::open_or_create(path, DEFAULT_MIN_FILE_GROWTH_SIZE).unwrap();
+
+        // Use batch size of 1 to trigger garbage collection ASAP.
+        let collector = Collector::new().batch_size(1);
+
+        let store = Arc::new(Store::new(mmap, collector));
         (store, temp_file)
     }
 
@@ -761,8 +769,9 @@ mod tests {
 
         // Scope 2: Reopen and verify
         {
-            let mmap = Mmap::open_or_create(path).unwrap();
-            let store = Arc::new(Store::new(mmap));
+            let mmap = Mmap::open_or_create(path, DEFAULT_MIN_FILE_GROWTH_SIZE).unwrap();
+            let collector = Collector::new();
+            let store = Arc::new(Store::new(mmap, collector));
             let reader = store.reader();
 
             // Verify the meta node
@@ -795,7 +804,7 @@ mod tests {
             file.write_all(&small_data).unwrap();
             file.sync_all().unwrap();
 
-            let result = Mmap::open_or_create(temp_file.path());
+            let result = Mmap::open_or_create(temp_file.path(), DEFAULT_MIN_FILE_GROWTH_SIZE);
             assert!(matches!(result, Err(MmapError::InvalidFile(_))));
         }
     }
@@ -1124,7 +1133,8 @@ mod tests {
         }
         // Read disk free list; it should be empty.
         {
-            let mmap = Mmap::open_or_create(temp_file.path()).unwrap();
+            let mmap =
+                Mmap::open_or_create(temp_file.path(), DEFAULT_MIN_FILE_GROWTH_SIZE).unwrap();
             let meta_node = MetaNode::try_from(mmap.as_ref()).unwrap();
             assert_eq!(meta_node.head_seq, meta_node.tail_seq);
         }
@@ -1142,7 +1152,8 @@ mod tests {
         // Verify that meta node's num_pages == 4 + 2,
         // where 2 is the starting page count.
         {
-            let mmap = Mmap::open_or_create(temp_file.path()).unwrap();
+            let mmap =
+                Mmap::open_or_create(temp_file.path(), DEFAULT_MIN_FILE_GROWTH_SIZE).unwrap();
             let meta_node = MetaNode::try_from(mmap.as_ref()).unwrap();
             assert!(
                 meta_node.tail_seq - meta_node.head_seq == 2,
@@ -1163,7 +1174,8 @@ mod tests {
         // Verify that meta node's num_pages == 4 + 2,
         // where 2 is the starting page count.
         {
-            let mmap = Mmap::open_or_create(temp_file.path()).unwrap();
+            let mmap =
+                Mmap::open_or_create(temp_file.path(), DEFAULT_MIN_FILE_GROWTH_SIZE).unwrap();
             let meta_node = MetaNode::try_from(mmap.as_ref()).unwrap();
             assert!(
                 meta_node.tail_seq - meta_node.head_seq == 1,
@@ -1198,7 +1210,8 @@ mod tests {
         // Verify that meta node's num_pages == 3 + 2,
         // where 2 is the starting page count.
         {
-            let mmap = Mmap::open_or_create(temp_file.path()).unwrap();
+            let mmap =
+                Mmap::open_or_create(temp_file.path(), DEFAULT_MIN_FILE_GROWTH_SIZE).unwrap();
             let meta_node = MetaNode::try_from(mmap.as_ref()).unwrap();
             assert!(
                 meta_node.tail_seq - meta_node.head_seq == 1,
@@ -1220,7 +1233,8 @@ mod tests {
                 writer.mark_free(page_num);
             }
             writer.flush(0 /* dummy */);
-            let mmap = Mmap::open_or_create(temp_file.path()).unwrap();
+            let mmap =
+                Mmap::open_or_create(temp_file.path(), DEFAULT_MIN_FILE_GROWTH_SIZE).unwrap();
             let node = MetaNode::try_from(mmap.as_ref()).unwrap();
             assert_ne!(node.head_page, node.tail_page);
             assert!(node.tail_seq > node.head_seq);
@@ -1232,7 +1246,8 @@ mod tests {
                 let _ = writer.new_page();
             }
             writer.flush(0 /* dummy */);
-            let mmap = Mmap::open_or_create(temp_file.path()).unwrap();
+            let mmap =
+                Mmap::open_or_create(temp_file.path(), DEFAULT_MIN_FILE_GROWTH_SIZE).unwrap();
             let node = MetaNode::try_from(mmap.as_ref()).unwrap();
             assert_eq!(node.head_page, node.tail_page);
             assert!(node.tail_seq > prev_tail_seq);
@@ -1256,7 +1271,8 @@ mod tests {
             writer.mark_free(page_num);
             writer.flush(0 /* dummy */);
             i += 1;
-            let mmap = Mmap::open_or_create(temp_file.path()).unwrap();
+            let mmap =
+                Mmap::open_or_create(temp_file.path(), DEFAULT_MIN_FILE_GROWTH_SIZE).unwrap();
             let node = MetaNode::try_from(mmap.as_ref()).unwrap();
             if node.tail_page != node.head_page {
                 break;

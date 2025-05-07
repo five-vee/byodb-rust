@@ -50,11 +50,11 @@ impl<'a> Internal<'a> {
         let delta_size = entries
             .iter()
             .map(|ce| match ce {
-                ChildEntry::Insert { key, .. } => key.len() as isize + 8,
+                ChildEntry::Insert { key, .. } => key.len() as isize + 10,
                 ChildEntry::Update { i, key, .. } => {
                     key.len() as isize - self.get_key(*i).len() as isize
                 }
-                ChildEntry::Delete { i } => -8 - (self.get_key(*i).len() as isize),
+                ChildEntry::Delete { i } => -10 - (self.get_key(*i).len() as isize),
             })
             .sum::<isize>();
         let itr_func = || self.merge_iter(entries);
@@ -490,9 +490,10 @@ fn get_num_bytes(page: &[u8]) -> usize {
 mod tests {
     use std::sync::Arc;
 
+    use seize::Collector;
     use tempfile::NamedTempFile;
 
-    use crate::core::mmap::{Mmap, Store};
+    use crate::core::mmap::{DEFAULT_MIN_FILE_GROWTH_SIZE, Mmap, Store};
 
     use super::*;
 
@@ -500,8 +501,12 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let path = temp_file.path();
         println!("Created temporary file {path:?}");
-        let mmap = Mmap::open_or_create(path).unwrap();
-        let store = Arc::new(Store::new(mmap));
+        let mmap = Mmap::open_or_create(path, DEFAULT_MIN_FILE_GROWTH_SIZE).unwrap();
+
+        // Use batch size of 1 to trigger garbage collection ASAP.
+        let collector = Collector::new().batch_size(1);
+
+        let store = Arc::new(Store::new(mmap, collector));
         (store, temp_file)
     }
 

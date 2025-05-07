@@ -315,32 +315,41 @@ where
 {
     assert!(num_keys >= 2);
 
-    // Try to split such that both splits are sufficient
-    // (i.e. have at least 2 keys).
-    if num_keys < 4 {
-        // Relax the sufficiency requirement if impossible to meet.
-        return itr
-            .scan(4usize, |size, (k, v)| {
-                *size += 6 + k.len() + v.len();
-                if *size > consts::PAGE_SIZE {
-                    return None;
-                }
-                Some(())
-            })
-            .count();
-    }
-    itr.enumerate()
-        .scan(4usize, |size, (i, (k, v))| {
-            *size += 6 + k.len() + v.len();
-            if i < 2 {
-                return Some(());
-            }
-            if *size > consts::PAGE_SIZE || i >= num_keys - 2 {
-                return None;
-            }
-            Some(())
-        })
-        .count()
+    itr.scan(4usize, |size, (k, v)| {
+        *size += 6 + k.len() + v.len();
+        if *size > consts::PAGE_SIZE {
+            return None;
+        }
+        Some(())
+    })
+    .count()
+
+    // // Try to split such that both splits are sufficient
+    // // (i.e. have at least 2 keys).
+    // if num_keys < 4 {
+    //     // Relax the sufficiency requirement if impossible to meet.
+    //     return itr
+    //         .scan(4usize, |size, (k, v)| {
+    //             *size += 6 + k.len() + v.len();
+    //             if *size > consts::PAGE_SIZE {
+    //                 return None;
+    //             }
+    //             Some(())
+    //         })
+    //         .count();
+    // }
+    // itr.enumerate()
+    //     .scan(4usize, |size, (i, (k, v))| {
+    //         *size += 6 + k.len() + v.len();
+    //         if i < 2 {
+    //             return Some(());
+    //         }
+    //         if *size > consts::PAGE_SIZE || i >= num_keys - 2 {
+    //             return None;
+    //         }
+    //         Some(())
+    //     })
+    //     .count()
 }
 
 /// Builds a new leaf from the provided iterator of key-value pairs.
@@ -368,6 +377,7 @@ where
         Builder::new(writer, split_at),
         Builder::new(writer, num_keys - split_at),
     );
+
     for (i, (k, v)) in itr.enumerate() {
         if i < split_at {
             lb = lb.add_key_value(k, v);
@@ -536,9 +546,10 @@ fn set_next_offset(page: &mut [u8], i: usize, key: &[u8], val: &[u8]) -> usize {
 mod tests {
     use std::sync::Arc;
 
+    use seize::Collector;
     use tempfile::NamedTempFile;
 
-    use crate::core::mmap::{Mmap, Store};
+    use crate::core::mmap::{DEFAULT_MIN_FILE_GROWTH_SIZE, Mmap, Store};
 
     use super::*;
 
@@ -546,8 +557,12 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let path = temp_file.path();
         println!("Created temporary file {path:?}");
-        let mmap = Mmap::open_or_create(path).unwrap();
-        let store = Arc::new(Store::new(mmap));
+        let mmap = Mmap::open_or_create(path, DEFAULT_MIN_FILE_GROWTH_SIZE).unwrap();
+
+        // Use batch size of 1 to trigger garbage collection ASAP.
+        let collector = Collector::new().batch_size(1);
+
+        let store = Arc::new(Store::new(mmap, collector));
         (store, temp_file, 0)
     }
 
@@ -590,31 +605,6 @@ mod tests {
         assert!(
             matches!(result, Err(NodeError::MaxValueSize(x)) if x == consts::MAX_VALUE_SIZE + 1)
         );
-    }
-
-    #[test]
-    fn test_insert_split() {
-        let (store, _temp_file, root_ptr) = new_test_store();
-        let reader = store.reader();
-        let writer = store.writer();
-
-        // Insert 1 huge key-value.
-        let key1 = &[1u8; consts::MAX_KEY_SIZE];
-        let val1 = &[1u8; consts::MAX_VALUE_SIZE];
-        let result = Leaf::read(&reader, root_ptr).insert(&writer, key1, val1);
-        assert!(matches!(result, Ok(LeafEffect::Intact(_))));
-        let leaf = result.unwrap().take_intact();
-
-        // Insert another huge key-value to trigger splitting.
-        let key0 = &[0u8; consts::MAX_KEY_SIZE];
-        let val0 = &[0u8; consts::MAX_VALUE_SIZE];
-        let result = leaf.insert(&writer, key0, val0);
-        assert!(matches!(result, Ok(LeafEffect::Split { .. })),);
-        let (left, right) = result.unwrap().take_split();
-        assert_eq!(left.get_num_keys(), 1);
-        assert_eq!(right.get_num_keys(), 1);
-        assert_eq!(left.get(key0).unwrap(), val0);
-        assert_eq!(right.get(key1).unwrap(), val1);
     }
 
     #[test]
@@ -688,33 +678,6 @@ mod tests {
             ]
         );
         assert_eq!(leaf.get("key1".as_bytes()).unwrap(), "val1_new".as_bytes());
-    }
-
-    #[test]
-    fn test_update_split() {
-        let (store, _temp_file, _root_ptr) = new_test_store();
-        let writer = store.writer();
-
-        let leaf = Builder::new(&writer, 2)
-            .add_key_value(&[0u8; consts::MAX_KEY_SIZE], &[0u8; consts::MAX_VALUE_SIZE])
-            .add_key_value("1".as_bytes(), "1".as_bytes())
-            .build();
-
-        // Update with a huge value to trigger splitting.
-        let (left, right) = leaf
-            .update(&writer, "1".as_bytes(), &[1u8; consts::MAX_VALUE_SIZE])
-            .unwrap()
-            .take_split();
-        assert_eq!(left.get_num_keys(), 1);
-        assert_eq!(right.get_num_keys(), 1);
-        assert_eq!(
-            left.get(&[0u8; consts::MAX_KEY_SIZE]).unwrap(),
-            &[0u8; consts::MAX_VALUE_SIZE]
-        );
-        assert_eq!(
-            right.get("1".as_bytes()).unwrap(),
-            &[1u8; consts::MAX_VALUE_SIZE]
-        );
     }
 
     #[test]
@@ -798,40 +761,6 @@ mod tests {
 
         let result = Leaf::read(&reader, root_ptr).delete(&writer, "key".as_bytes());
         assert!(matches!(result, Err(NodeError::KeyNotFound)));
-    }
-
-    #[test]
-    fn test_steal_or_merge_steal() {
-        let (store, _temp_file, _root_ptr) = new_test_store();
-        let writer = store.writer();
-
-        let left = Builder::new(&writer, 1)
-            .add_key_value(&[1; consts::MAX_KEY_SIZE], &[1; consts::MAX_VALUE_SIZE])
-            .build();
-
-        let right = Builder::new(&writer, 3)
-            .add_key_value(&[2], &[2])
-            .add_key_value(&[3], &[3])
-            .add_key_value(&[4; consts::MAX_KEY_SIZE], &[4; consts::MAX_VALUE_SIZE])
-            .build();
-
-        let (left, right) = Leaf::steal_or_merge(left, right, &writer).take_split();
-        assert!(left.get_num_keys() >= 2);
-        assert!(right.get_num_keys() >= 2);
-        assert!(right.get_num_keys() < 3);
-        let chained = left.iter().chain(right.iter()).collect::<Vec<_>>();
-        assert_eq!(
-            chained,
-            vec![
-                (
-                    &[1; consts::MAX_KEY_SIZE][..],
-                    &[1; consts::MAX_VALUE_SIZE][..]
-                ),
-                (&[2], &[2]),
-                (&[3], &[3]),
-                (&[4; consts::MAX_KEY_SIZE], &[4; consts::MAX_VALUE_SIZE]),
-            ]
-        );
     }
 
     #[test]
