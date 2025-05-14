@@ -8,7 +8,7 @@
       }
     },
     "hook": {
-      "on-activate": "  export PATH=\"$PWD/target/debug:$PATH\"\n"
+      "on-activate": "  export PATH=\"$PWD/target/debug:${HOME}/.cargo/bin:$PATH\"\n"
     },
     "profile": {},
     "options": {
@@ -26,17 +26,17 @@
     {
       "attr_path": "just",
       "broken": false,
-      "derivation": "/nix/store/q3dbyqyhyxrmjalymhz0705vmw9rpr44-just-1.40.0.drv",
+      "derivation": "/nix/store/apfq7k22qj29qf5w6g5dpxyy5v78zlq8-just-1.40.0.drv",
       "description": "Handy way to save and run project-specific commands",
       "install_id": "just",
       "license": "CC0-1.0",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=063dece00c5a77e4a0ea24e5e5a5bd75232806f8",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=d89fc19e405cb2d55ce7cc114356846a0ee5e956",
       "name": "just-1.40.0",
       "pname": "just",
-      "rev": "063dece00c5a77e4a0ea24e5e5a5bd75232806f8",
-      "rev_count": 780010,
-      "rev_date": "2025-04-06T18:34:07Z",
-      "scrape_date": "2025-04-08T01:14:38.975675Z",
+      "rev": "d89fc19e405cb2d55ce7cc114356846a0ee5e956",
+      "rev_count": 797896,
+      "rev_date": "2025-05-10T19:10:37Z",
+      "scrape_date": "2025-05-13T04:25:17.605391Z",
       "stabilities": [
         "unstable"
       ],
@@ -47,9 +47,9 @@
         "out"
       ],
       "outputs": {
-        "doc": "/nix/store/7rml6irvlhrplla9wwyxqqp3fxhgm50a-just-1.40.0-doc",
-        "man": "/nix/store/dq0yj54hfh4s1k9ybq4qy503b3vrh0zn-just-1.40.0-man",
-        "out": "/nix/store/cfgdrg4j0bjf7izz26vcdfr2klwyhnil-just-1.40.0"
+        "doc": "/nix/store/vski9kzna45sznszx4mp1rf1gbk30gvc-just-1.40.0-doc",
+        "man": "/nix/store/h04dsg7zl4f26sairdzsqgqmy75gy1pw-just-1.40.0-man",
+        "out": "/nix/store/2962ca92j2cd3xczq9nlka01vpywbn4d-just-1.40.0"
       },
       "system": "aarch64-darwin",
       "group": "toplevel",
@@ -58,17 +58,17 @@
     {
       "attr_path": "just",
       "broken": false,
-      "derivation": "/nix/store/ikvzl9igcyabrsdnm4b4sl5s769fpdbp-just-1.40.0.drv",
+      "derivation": "/nix/store/bji0dzr4zjwcyzhdf9j8k4ppw92jaicq-just-1.40.0.drv",
       "description": "Handy way to save and run project-specific commands",
       "install_id": "just",
       "license": "CC0-1.0",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=063dece00c5a77e4a0ea24e5e5a5bd75232806f8",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=d89fc19e405cb2d55ce7cc114356846a0ee5e956",
       "name": "just-1.40.0",
       "pname": "just",
-      "rev": "063dece00c5a77e4a0ea24e5e5a5bd75232806f8",
-      "rev_count": 780010,
-      "rev_date": "2025-04-06T18:34:07Z",
-      "scrape_date": "2025-04-08T01:54:08.304807Z",
+      "rev": "d89fc19e405cb2d55ce7cc114356846a0ee5e956",
+      "rev_count": 797896,
+      "rev_date": "2025-05-10T19:10:37Z",
+      "scrape_date": "2025-05-13T05:08:12.311325Z",
       "stabilities": [
         "unstable"
       ],
@@ -79,9 +79,9 @@
         "out"
       ],
       "outputs": {
-        "doc": "/nix/store/dl41yapm6jl5fx1pzk6zx1c461hvf6sx-just-1.40.0-doc",
-        "man": "/nix/store/krhp0yy3i73v5wabhj69mcrh863s1xrh-just-1.40.0-man",
-        "out": "/nix/store/9224477pfqcwljayr91d8xjp7bg72wdb-just-1.40.0"
+        "doc": "/nix/store/26nxx8kdsq7qm7h0p11hfdzvhjl5ncjs-just-1.40.0-doc",
+        "man": "/nix/store/fcc2g4lgi7z773azhqgsz42q4lzms61x-just-1.40.0-man",
+        "out": "/nix/store/435q9gysb62lz321952p7y7lbjw4mwgy-just-1.40.0"
       },
       "system": "x86_64-darwin",
       "group": "toplevel",

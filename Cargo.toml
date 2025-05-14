@@ -19,3 +19,7 @@ tempfile = "3.19.1"
 [[bench]]
 name = "txn"
 harness = false
+
+[profile.profiling]
+inherits = "release"
+debug = true
