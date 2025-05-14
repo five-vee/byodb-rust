@@ -6,19 +6,25 @@
 
 pub mod error;
 
-use std::{ops::RangeBounds, path::Path, sync::Arc};
+use std::{marker::PhantomData, ops::RangeBounds, path::Path, sync::Arc};
 
 use error::TxnError;
 use seize::Collector;
 
 pub use crate::core::consts;
 use crate::core::{
-    mmap::{self, Guard, Mmap, Reader, Store, Writer},
+    mmap::{self, Guard, Mmap, Page, ReadOnlyPage, Reader, ReaderPage, Store, Writer},
     tree::Tree,
 };
 
 /// A specialized `Result` type for database operations within this module.
 pub type Result<T> = std::result::Result<T, TxnError>;
+/// A read-write transaction. It must live as long as the [`DB`] that created
+/// it (via [`DB::rw_txn`]).
+pub type RWTxn<'t, 'd> = Txn<'t, Page<'t>, Writer<'d>>;
+/// A read-only transaction. It must live as long as the [`DB`] that created
+/// it (via [`DB::r_txn`]).
+pub type RTxn<'t, 'd> = Txn<'t, ReaderPage<'t>, Reader<'d>>;
 
 /// Represents the main database instance.
 ///
@@ -56,11 +62,12 @@ impl DB {
     /// other readers or writers.
     ///
     /// # Returns
-    /// A `Txn<Reader>` instance for performing read operations.
-    pub fn r_txn(&self) -> Txn<Reader> {
+    /// A [`RTxn`] instance for performing read operations.
+    pub fn r_txn(&self) -> RTxn<'_, '_> {
         let reader = self.store.reader();
         let root_page = reader.root_page();
         Txn {
+            _phantom: PhantomData,
             guard: reader,
             root_page,
         }
@@ -72,11 +79,12 @@ impl DB {
     /// within this transaction are isolated until `commit` is called.
     ///
     /// # Returns
-    /// A `Txn<Writer>` instance for performing read and write operations.
-    pub fn rw_txn(&self) -> Txn<Writer> {
+    /// A [`RWTxn`] instance for performing read and write operations.
+    pub fn rw_txn(&self) -> RWTxn<'_, '_> {
         let writer = self.store.writer();
         let root_page = writer.root_page();
         Txn {
+            _phantom: PhantomData,
             guard: writer,
             root_page,
         }
@@ -139,14 +147,15 @@ impl<P: AsRef<Path>> DBBuilder<P> {
 /// Represents a database transaction.
 ///
 /// A transaction provides a consistent view of the database. It can be
-/// either read-only (`Txn<Reader>`) or read-write (`Txn<Writer>`).
+/// either read-only ([`RTxn`]) or read-write ([`RWTxn`]).
 /// All operations on the database are performed within a transaction.
-pub struct Txn<G: Guard> {
+pub struct Txn<'g, P: ReadOnlyPage<'g>, G: Guard<'g, P>> {
+    _phantom: PhantomData<&'g P>,
     guard: G,
     root_page: usize,
 }
 
-impl<G: Guard> Txn<G> {
+impl<'g, P: ReadOnlyPage<'g>, G: Guard<'g, P>> Txn<'g, P, G> {
     /// Retrieves the value associated with the given key.
     ///
     /// # Parameters
@@ -160,7 +169,7 @@ impl<G: Guard> Txn<G> {
     /// # Safety
     /// The returned slice `&[u8]` is valid as long as the transaction [`Txn`]
     /// is alive, as it points directly into the memory-mapped region.
-    pub fn get(&self, key: &[u8]) -> Result<Option<&[u8]>> {
+    pub fn get(&'g self, key: &[u8]) -> Result<Option<&'g [u8]>> {
         let tree = Tree::new(&self.guard, self.root_page);
         let val = tree.get(key)?.map(|val| {
             // Safety: The underlying data is in the mmap, which
@@ -174,7 +183,7 @@ impl<G: Guard> Txn<G> {
     /// Returns an iterator over all key-value pairs in the database, in key order.
     ///
     /// The iterator yields tuples of `(&[u8], &[u8])` representing key-value pairs.
-    pub fn in_order_iter(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
+    pub fn in_order_iter(&'g self) -> impl Iterator<Item = (&'g [u8], &'g [u8])> {
         Tree::new(&self.guard, self.root_page).in_order_iter()
     }
 
@@ -186,14 +195,14 @@ impl<G: Guard> Txn<G> {
     ///
     /// The iterator yields tuples of `(&[u8], &[u8])` representing key-value pairs.
     pub fn in_order_range_iter<R: RangeBounds<[u8]>>(
-        &self,
+        &'g self,
         range: &R,
-    ) -> impl Iterator<Item = (&[u8], &[u8])> {
+    ) -> impl Iterator<Item = (&'g [u8], &'g [u8])> {
         Tree::new(&self.guard, self.root_page).in_order_range_iter(range)
     }
 }
 
-impl Txn<Writer<'_>> {
+impl<'w> Txn<'w, Page<'w>, Writer<'_>> {
     /// Inserts a new key-value pair into the database.
     ///
     /// # Parameters

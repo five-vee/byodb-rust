@@ -101,7 +101,7 @@ mod leaf;
 use std::rc::Rc;
 
 use crate::core::error::NodeError;
-use crate::core::mmap::{Guard, ReadOnlyPage, Writer};
+use crate::core::mmap::{Guard, Page, ReadOnlyPage, Reader, ReaderPage, Writer};
 use crate::core::{consts, header};
 use header::NodeType;
 pub(crate) use internal::ChildEntry;
@@ -113,19 +113,22 @@ use leaf::LeafEffect;
 type Result<T> = std::result::Result<T, NodeError>;
 
 /// An enum representing the type of B+ tree node.
-pub enum Node<'a> {
+pub enum Node<'g, P: ReadOnlyPage<'g>> {
     /// A B+ tree leaf node.
-    Leaf(Leaf<'a>),
+    Leaf(Leaf<'g, P>),
     /// A B+ tree internal node.
-    Internal(Internal<'a>),
+    Internal(Internal<'g, P>),
 }
 
-impl<'a> Node<'a> {
+impl<'g, P: ReadOnlyPage<'g>> Node<'g, P> {
     /// Reads the page at `page_num` and returns it represented as a `Node`.
     /// This is unsafe for the same reason [`Guard::read_page`] is unsafe.
-    pub unsafe fn read<G: Guard>(guard: &'a G, page_num: usize) -> Node<'a> {
+    pub unsafe fn read<G: Guard<'g, P>>(guard: &'g G, page_num: usize) -> Node<'g, P> {
         let page = unsafe { guard.read_page(page_num) };
-        Self::try_from(page).unwrap()
+        match header::get_node_type(&page).unwrap() {
+            NodeType::Leaf => Node::Leaf(Leaf::read(guard, page_num)),
+            NodeType::Internal => Node::Internal(Internal::read(guard, page_num)),
+        }
     }
 
     pub fn page_num(&self) -> usize {
@@ -158,29 +161,21 @@ impl<'a> Node<'a> {
     }
 }
 
-impl<'a> TryFrom<ReadOnlyPage<'a>> for Node<'a> {
-    type Error = NodeError;
-
-    fn try_from(page: ReadOnlyPage<'a>) -> Result<Self> {
-        match header::get_node_type(&page)? {
-            NodeType::Leaf => Ok(Node::Leaf(Leaf::try_from(page)?)),
-            NodeType::Internal => Ok(Node::Internal(Internal::try_from(page)?)),
-        }
-    }
-}
-
 /// An enum representing the effect of a node operation.
-pub enum NodeEffect<'a> {
+pub enum NodeEffect<'g> {
     /// A node without 0 keys after a delete was performed on it.
     /// This is a special-case of `Underflow` done to avoid unnecessary
     /// page allocations, since empty non-root nodes aren't allowed.
     Empty,
     /// A newly created node that remained  "intact", i.e. it did not split.
-    Intact(Node<'a>),
+    Intact(Node<'g, Page<'g>>),
     /// The left and right splits of a node that was created.
     ///
     /// The left and right nodes are the same type.
-    Split { left: Node<'a>, right: Node<'a> },
+    Split {
+        left: Node<'g, Page<'g>>,
+        right: Node<'g, Page<'g>>,
+    },
 }
 
 impl NodeEffect<'_> {
@@ -255,7 +250,7 @@ pub enum Sufficiency {
 }
 
 // Returns how sufficient a node is.
-pub fn sufficiency(n: &Node) -> Sufficiency {
+pub fn sufficiency<'w>(n: &Node<'w, Page<'w>>) -> Sufficiency {
     match n.get_num_keys() {
         0 => Sufficiency::Empty,
         1 => Sufficiency::Underflow,
@@ -266,7 +261,11 @@ pub fn sufficiency(n: &Node) -> Sufficiency {
 /// Merges `left` and `right` into a possibly-overflowed node and splits if
 /// needed. This is modeled as a Deletion b/c it is (so far) only useful in the
 /// context of deletion.
-pub fn steal_or_merge<'w>(left: Node, right: Node, writer: &'w Writer) -> NodeEffect<'w> {
+pub fn steal_or_merge<'w>(
+    left: Node<'w, Page<'w>>,
+    right: Node<'w, Page<'w>>,
+    writer: &'w Writer,
+) -> NodeEffect<'w> {
     match (left, right) {
         (Node::Leaf(left), Node::Leaf(right)) => Leaf::steal_or_merge(left, right, writer).into(),
         (Node::Internal(left), Node::Internal(right)) => {
@@ -279,7 +278,7 @@ pub fn steal_or_merge<'w>(left: Node, right: Node, writer: &'w Writer) -> NodeEf
 /// Checks whether `to` can steal a key from `from`.
 /// `steal_end` determines whether to steal the end key of `from`,
 /// otherwise the beginning key.
-pub fn can_steal(from: &Node, to: &Node, steal_end: bool) -> bool {
+pub fn can_steal<'w>(from: &Node<'w, Page<'w>>, to: &Node<'w, Page<'w>>, steal_end: bool) -> bool {
     if from.get_num_keys() <= 2 {
         return false;
     }
@@ -301,6 +300,6 @@ pub fn can_steal(from: &Node, to: &Node, steal_end: bool) -> bool {
 }
 
 /// Checks whether the merging of `left` and `right` doesn't overflow.
-pub fn can_merge(left: &Node, right: &Node) -> bool {
+pub fn can_merge<'w>(left: &Node<'w, Page<'w>>, right: &Node<'w, Page<'w>>) -> bool {
     left.get_num_bytes() + right.get_num_bytes() - 4 < consts::PAGE_SIZE
 }

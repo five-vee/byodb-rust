@@ -3,120 +3,37 @@
 //!
 //! The tree is initialized as an empty leaf node.
 use std::iter::Peekable;
-use std::ops::Deref as _;
+use std::marker::PhantomData;
 
 use crate::core::consts;
 use crate::core::error::NodeError;
-use crate::core::mmap::{Page, ReadOnlyPage, Writer};
-
-#[cfg(test)]
-use crate::core::mmap::Guard;
+use crate::core::mmap::{Guard, Page, ReadOnlyPage, Writer};
 
 use super::header::{self, NodeType};
 
 type Result<T> = std::result::Result<T, NodeError>;
 
 /// A B+ tree leaf node.
-pub struct Leaf<'g> {
-    page: ReadOnlyPage<'g>,
+pub struct Leaf<'g, P: ReadOnlyPage<'g>> {
+    _phantom: PhantomData<&'g ()>,
+    page: P,
 }
 
-impl<'g> Leaf<'g> {
-    /// Inserts a key-value pair.
-    pub fn insert(self, writer: &'g Writer, key: &[u8], val: &[u8]) -> Result<LeafEffect<'g>> {
-        if key.len() > consts::MAX_KEY_SIZE {
-            return Err(NodeError::MaxKeySize(key.len()));
+impl<'g, P: ReadOnlyPage<'g>> Leaf<'g, P> {
+    /// Reads a page as a leaf node type.
+    pub fn read<G: Guard<'g, P>>(guard: &'g G, page_num: usize) -> Leaf<'g, P> {
+        let page = unsafe { guard.read_page(page_num) };
+        let node_type = header::get_node_type(page.as_ref()).unwrap();
+        assert_eq!(node_type, NodeType::Leaf);
+        Leaf {
+            _phantom: PhantomData,
+            page,
         }
-        if val.len() > consts::MAX_VALUE_SIZE {
-            return Err(NodeError::MaxValueSize(val.len()));
-        }
-        if self.get(key).is_some() {
-            return Err(NodeError::AlreadyExists);
-        }
-        let itr_func = || self.insert_iter(key, val);
-        let num_keys = self.get_num_keys() + 1;
-        let overflow = self.get_num_bytes() + 6 + key.len() + val.len() > consts::PAGE_SIZE;
-        Ok(self.build_then_free(writer, itr_func, num_keys, overflow))
-    }
-
-    /// Updates the value corresponding to a key.
-    pub fn update(self, writer: &'g Writer, key: &[u8], val: &[u8]) -> Result<LeafEffect<'g>> {
-        if key.len() > consts::MAX_KEY_SIZE {
-            return Err(NodeError::MaxKeySize(key.len()));
-        }
-        if val.len() > consts::MAX_VALUE_SIZE {
-            return Err(NodeError::MaxValueSize(val.len()));
-        }
-        let old_val = self.get(key);
-        if old_val.is_none() {
-            return Err(NodeError::KeyNotFound);
-        }
-        let old_val = old_val.unwrap();
-        let itr_func = || self.update_iter(key, val);
-        let num_keys = self.get_num_keys();
-        let overflow = self.get_num_bytes() - old_val.len() + val.len() > consts::PAGE_SIZE;
-        Ok(self.build_then_free(writer, itr_func, num_keys, overflow))
-    }
-
-    /// Deletes a key and its corresponding value.
-    pub fn delete<'w>(self, writer: &'w Writer, key: &[u8]) -> Result<LeafEffect<'w>> {
-        let page_num = self.page_num();
-        let effect = self.delete_inner(writer, key);
-        if effect.is_ok() {
-            // Now that self is no longer used, free it.
-            writer.mark_free(page_num);
-        }
-        effect
-    }
-
-    fn delete_inner<'w>(self, writer: &'w Writer, key: &[u8]) -> Result<LeafEffect<'w>> {
-        if key.len() > consts::MAX_KEY_SIZE {
-            return Err(NodeError::MaxKeySize(key.len()));
-        }
-        if self.get(key).is_none() {
-            return Err(NodeError::KeyNotFound);
-        }
-        // Optimization: avoid memory allocation and
-        // just return Deletion::Empty if only 1 key.
-        let n = self.get_num_keys();
-        if n == 1 {
-            return Ok(LeafEffect::Empty);
-        }
-        let mut b = Builder::new(writer, n - 1);
-        let mut added = false;
-        for (k, v) in self.iter() {
-            if !added && key == k {
-                added = true;
-                continue;
-            }
-            b = b.add_key_value(k, v);
-        }
-        Ok(LeafEffect::Intact(b.build()))
     }
 
     /// Gets the value corresponding to the queried key.
     pub fn get(&self, key: &[u8]) -> Option<&'g [u8]> {
         self.iter().find(|&(k, _)| k == key).map(|(_, v)| v)
-    }
-
-    /// Creates the leaf (or leaves) resulting from either `left` stealing from
-    /// `right`, or `left` merging with `right`.
-    pub fn steal_or_merge(left: Leaf, right: Leaf, writer: &'g Writer) -> LeafEffect<'g> {
-        let itr_func = || left.iter().chain(right.iter());
-        let num_keys = left.get_num_keys() + right.get_num_keys();
-        let overflow = left.get_num_bytes() + right.get_num_bytes() - 4 > consts::PAGE_SIZE;
-        let effect = if overflow {
-            // Steal
-            build_split(writer, &itr_func, num_keys)
-        } else {
-            // Merge
-            build(writer, itr_func(), num_keys)
-        };
-        // Now that left and right are no longer used, free them.
-        writer.mark_free(left.page_num());
-        writer.mark_free(right.page_num());
-
-        effect
     }
 
     /// Gets the `i`th key.
@@ -145,16 +62,114 @@ impl<'g> Leaf<'g> {
     }
 
     /// Returns a key-value iterator of the leaf.
-    pub fn iter(&self) -> LeafIterator<'_, 'g> {
+    pub fn iter(&self) -> LeafIterator<'_, 'g, P> {
         LeafIterator {
             node: self,
             i: 0,
             n: self.get_num_keys(),
         }
     }
+}
+
+impl<'w> Leaf<'w, Page<'w>> {
+    /// Inserts a key-value pair.
+    pub fn insert(self, writer: &'w Writer, key: &[u8], val: &[u8]) -> Result<LeafEffect<'w>> {
+        if key.len() > consts::MAX_KEY_SIZE {
+            return Err(NodeError::MaxKeySize(key.len()));
+        }
+        if val.len() > consts::MAX_VALUE_SIZE {
+            return Err(NodeError::MaxValueSize(val.len()));
+        }
+        if self.get(key).is_some() {
+            return Err(NodeError::AlreadyExists);
+        }
+        let itr_func = || self.insert_iter(key, val);
+        let num_keys = self.get_num_keys() + 1;
+        let overflow = self.get_num_bytes() + 6 + key.len() + val.len() > consts::PAGE_SIZE;
+        Ok(self.build_then_free(writer, itr_func, num_keys, overflow))
+    }
+
+    /// Updates the value corresponding to a key.
+    pub fn update(self, writer: &'w Writer, key: &[u8], val: &[u8]) -> Result<LeafEffect<'w>> {
+        if key.len() > consts::MAX_KEY_SIZE {
+            return Err(NodeError::MaxKeySize(key.len()));
+        }
+        if val.len() > consts::MAX_VALUE_SIZE {
+            return Err(NodeError::MaxValueSize(val.len()));
+        }
+        let old_val = self.get(key);
+        if old_val.is_none() {
+            return Err(NodeError::KeyNotFound);
+        }
+        let old_val = old_val.unwrap();
+        let itr_func = || self.update_iter(key, val);
+        let num_keys = self.get_num_keys();
+        let overflow = self.get_num_bytes() - old_val.len() + val.len() > consts::PAGE_SIZE;
+        Ok(self.build_then_free(writer, itr_func, num_keys, overflow))
+    }
+
+    /// Deletes a key and its corresponding value.
+    pub fn delete(self, writer: &'w Writer, key: &[u8]) -> Result<LeafEffect<'w>> {
+        let page_num = self.page_num();
+        let effect = self.delete_inner(writer, key);
+        if effect.is_ok() {
+            // Now that self is no longer used, free it.
+            writer.mark_free(page_num);
+        }
+        effect
+    }
+
+    fn delete_inner(self, writer: &'w Writer, key: &[u8]) -> Result<LeafEffect<'w>> {
+        if key.len() > consts::MAX_KEY_SIZE {
+            return Err(NodeError::MaxKeySize(key.len()));
+        }
+        if self.get(key).is_none() {
+            return Err(NodeError::KeyNotFound);
+        }
+        // Optimization: avoid memory allocation and
+        // just return Deletion::Empty if only 1 key.
+        let n = self.get_num_keys();
+        if n == 1 {
+            return Ok(LeafEffect::Empty);
+        }
+        let mut b = Builder::new(writer, n - 1);
+        let mut added = false;
+        for (k, v) in self.iter() {
+            if !added && key == k {
+                added = true;
+                continue;
+            }
+            b = b.add_key_value(k, v);
+        }
+        Ok(LeafEffect::Intact(b.build()))
+    }
+
+    /// Creates the leaf (or leaves) resulting from either `left` stealing from
+    /// `right`, or `left` merging with `right`.
+    pub fn steal_or_merge(
+        left: Leaf<'w, Page<'w>>,
+        right: Leaf<'w, Page<'w>>,
+        writer: &'w Writer,
+    ) -> LeafEffect<'w> {
+        let itr_func = || left.iter().chain(right.iter());
+        let num_keys = left.get_num_keys() + right.get_num_keys();
+        let overflow = left.get_num_bytes() + right.get_num_bytes() - 4 > consts::PAGE_SIZE;
+        let effect = if overflow {
+            // Steal
+            build_split(writer, &itr_func, num_keys)
+        } else {
+            // Merge
+            build(writer, itr_func(), num_keys)
+        };
+        // Now that left and right are no longer used, free them.
+        writer.mark_free(left.page_num());
+        writer.mark_free(right.page_num());
+
+        effect
+    }
 
     /// Returns a key-value insert-iterator of the leaf.
-    fn insert_iter<'l>(&'l self, key: &'g [u8], val: &'g [u8]) -> InsertIterator<'l, 'g> {
+    fn insert_iter<'l>(&'l self, key: &'w [u8], val: &'w [u8]) -> InsertIterator<'l, 'w> {
         InsertIterator {
             leaf_itr: self.iter().peekable(),
             key,
@@ -164,7 +179,7 @@ impl<'g> Leaf<'g> {
     }
 
     /// Returns a key-value update-iterator of the leaf.
-    fn update_iter<'l>(&'l self, key: &'g [u8], val: &'g [u8]) -> UpdateIterator<'l, 'g> {
+    fn update_iter<'l>(&'l self, key: &'w [u8], val: &'w [u8]) -> UpdateIterator<'l, 'w> {
         UpdateIterator {
             leaf_itr: self.iter().peekable(),
             key,
@@ -176,11 +191,11 @@ impl<'g> Leaf<'g> {
     /// Builds an [`LeafEffect`], then frees self back to the store.
     fn build_then_free<'l, I, F>(
         &'l self,
-        writer: &'g Writer,
+        writer: &'w Writer,
         itr_func: F,
         num_keys: usize,
         overflow: bool,
-    ) -> LeafEffect<'g>
+    ) -> LeafEffect<'w>
     where
         I: Iterator<Item = (&'l [u8], &'l [u8])>,
         F: Fn() -> I,
@@ -195,44 +210,25 @@ impl<'g> Leaf<'g> {
     }
 }
 
-#[cfg(test)]
-impl<'g> Leaf<'g> {
-    /// Reads a page as a leaf node type.
-    fn read<G: Guard>(guard: &'g G, page_num: usize) -> Leaf<'g> {
-        let page = unsafe { guard.read_page(page_num) };
-        let node_type = header::get_node_type(page.as_ref()).unwrap();
-        assert_eq!(node_type, NodeType::Leaf);
-        Leaf { page }
-    }
-}
-
-impl<'a> TryFrom<ReadOnlyPage<'a>> for Leaf<'a> {
-    type Error = NodeError;
-    fn try_from(page: ReadOnlyPage<'a>) -> Result<Self> {
-        let node_type = header::get_node_type(page.deref())?;
-        if node_type != NodeType::Leaf {
-            return Err(NodeError::UnexpectedNodeType(node_type as u16));
-        }
-        Ok(Leaf { page })
-    }
-}
-
 /// An enum representing the effect of a leaf node operation.
-pub enum LeafEffect<'r> {
+pub enum LeafEffect<'w> {
     /// A leaf with 0 keys after a delete was performed on it.
     /// This is a special-case of [`super::Sufficiency::Underflow`] done to
     /// avoid unnecessary page allocations, since empty non-root nodes aren't
     /// allowed.
     Empty,
     /// A newly created leaf that remained  "intact", i.e. it did not split.
-    Intact(Leaf<'r>),
+    Intact(Leaf<'w, Page<'w>>),
     /// The `left` and `right` splits of a leaf that was created.
-    Split { left: Leaf<'r>, right: Leaf<'r> },
+    Split {
+        left: Leaf<'w, Page<'w>>,
+        right: Leaf<'w, Page<'w>>,
+    },
 }
 
-impl<'r> LeafEffect<'r> {
+impl<'w> LeafEffect<'w> {
     #[allow(dead_code)]
-    fn take_intact(self) -> Leaf<'r> {
+    fn take_intact(self) -> Leaf<'w, Page<'w>> {
         match self {
             LeafEffect::Intact(leaf) => leaf,
             _ => panic!("is not LeafEffect::Intact"),
@@ -240,7 +236,7 @@ impl<'r> LeafEffect<'r> {
     }
 
     #[allow(dead_code)]
-    fn take_split(self) -> (Leaf<'r>, Leaf<'r>) {
+    fn take_split(self) -> (Leaf<'w, Page<'w>>, Leaf<'w, Page<'w>>) {
         match self {
             LeafEffect::Split { left, right } => (left, right),
             _ => panic!("is not LeafEffect::Split"),
@@ -294,7 +290,7 @@ impl<'w> Builder<'w> {
     }
 
     /// Builds a leaf.
-    fn build(self) -> Leaf<'w> {
+    fn build(self) -> Leaf<'w, Page<'w>> {
         let n = header::get_num_keys(&self.page);
         assert!(
             self.i == n,
@@ -303,7 +299,10 @@ impl<'w> Builder<'w> {
             n
         );
         assert_ne!(n, 0, "This case should be handled by Leaf::delete instead.");
-        self.page.read_only().try_into().unwrap()
+        Leaf {
+            _phantom: PhantomData,
+            page: self.page.read_only(),
+        }
     }
 }
 
@@ -390,14 +389,14 @@ where
 }
 
 /// A key-value iterator for a leaf node.
-pub struct LeafIterator<'l, 'a> {
-    node: &'l Leaf<'a>,
+pub struct LeafIterator<'l, 'w, P: ReadOnlyPage<'w>> {
+    node: &'l Leaf<'w, P>,
     i: usize,
     n: usize,
 }
 
-impl<'a> Iterator for LeafIterator<'_, 'a> {
-    type Item = (&'a [u8], &'a [u8]);
+impl<'w, P: ReadOnlyPage<'w>> Iterator for LeafIterator<'_, 'w, P> {
+    type Item = (&'w [u8], &'w [u8]);
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.i >= self.n {
@@ -410,15 +409,15 @@ impl<'a> Iterator for LeafIterator<'_, 'a> {
 }
 
 /// A key-value iterator for a leaf node that has inserted a new key-value.
-struct InsertIterator<'l, 'a> {
-    leaf_itr: Peekable<LeafIterator<'l, 'a>>,
-    key: &'a [u8],
-    val: &'a [u8],
+struct InsertIterator<'l, 'w> {
+    leaf_itr: Peekable<LeafIterator<'l, 'w, Page<'w>>>,
+    key: &'w [u8],
+    val: &'w [u8],
     added: bool,
 }
 
-impl<'a> Iterator for InsertIterator<'_, 'a> {
-    type Item = (&'a [u8], &'a [u8]);
+impl<'w> Iterator for InsertIterator<'_, 'w> {
+    type Item = (&'w [u8], &'w [u8]);
     fn next(&mut self) -> Option<Self::Item> {
         if self.added {
             return self.leaf_itr.next();
@@ -441,15 +440,15 @@ impl<'a> Iterator for InsertIterator<'_, 'a> {
 }
 
 /// A key-value iterator for a leaf node that has updated a key-value.
-struct UpdateIterator<'l, 'a> {
-    leaf_itr: Peekable<LeafIterator<'l, 'a>>,
-    key: &'a [u8],
-    val: &'a [u8],
+struct UpdateIterator<'l, 'w> {
+    leaf_itr: Peekable<LeafIterator<'l, 'w, Page<'w>>>,
+    key: &'w [u8],
+    val: &'w [u8],
     skip: bool,
 }
 
-impl<'a> Iterator for UpdateIterator<'_, 'a> {
-    type Item = (&'a [u8], &'a [u8]);
+impl<'w> Iterator for UpdateIterator<'_, 'w> {
+    type Item = (&'w [u8], &'w [u8]);
     fn next(&mut self) -> Option<Self::Item> {
         match self.leaf_itr.peek() {
             None => None,
@@ -470,7 +469,7 @@ impl<'a> Iterator for UpdateIterator<'_, 'a> {
 }
 
 /// Gets the `i`th key in a leaf page buffer.
-fn get_key<'a>(page: &ReadOnlyPage<'a>, i: usize) -> &'a [u8] {
+fn get_key<'g, P: ReadOnlyPage<'g>>(page: &P, i: usize) -> &'g [u8] {
     let offset = get_offset(page, i);
     let num_keys = header::get_num_keys(page);
     let key_len = u16::from_le_bytes([
@@ -492,7 +491,7 @@ fn get_key<'a>(page: &ReadOnlyPage<'a>, i: usize) -> &'a [u8] {
 }
 
 /// Gets the `i`th value in a leaf page buffer.
-fn get_value<'a>(page: &ReadOnlyPage<'a>, i: usize) -> &'a [u8] {
+fn get_value<'g, P: ReadOnlyPage<'g>>(page: &P, i: usize) -> &'g [u8] {
     let offset = get_offset(page, i);
     let num_keys = header::get_num_keys(page);
     let key_len = u16::from_le_bytes([
@@ -569,10 +568,9 @@ mod tests {
     #[test]
     fn test_insert_intact() {
         let (store, _temp_file, root_ptr) = new_test_store();
-        let reader = store.reader();
         let writer = store.writer();
 
-        let leaf = Leaf::read(&reader, root_ptr)
+        let leaf = Leaf::read(&writer, root_ptr)
             .insert(&writer, "hello".as_bytes(), "world".as_bytes())
             .unwrap()
             .take_intact();
@@ -586,22 +584,20 @@ mod tests {
     #[test]
     fn test_insert_max_key_size() {
         let (store, _temp_file, root_ptr) = new_test_store();
-        let reader = store.reader();
         let writer = store.writer();
 
         let key = &[0u8; consts::MAX_KEY_SIZE + 1];
-        let result = Leaf::read(&reader, root_ptr).insert(&writer, key, "val".as_bytes());
+        let result = Leaf::read(&writer, root_ptr).insert(&writer, key, "val".as_bytes());
         assert!(matches!(result, Err(NodeError::MaxKeySize(x)) if x == consts::MAX_KEY_SIZE + 1));
     }
 
     #[test]
     fn test_insert_max_value_size() {
         let (store, _temp_file, root_ptr) = new_test_store();
-        let reader = store.reader();
         let writer = store.writer();
 
         let val = &[0u8; consts::MAX_VALUE_SIZE + 1];
-        let result = Leaf::read(&reader, root_ptr).insert(&writer, "key".as_bytes(), val);
+        let result = Leaf::read(&writer, root_ptr).insert(&writer, "key".as_bytes(), val);
         assert!(
             matches!(result, Err(NodeError::MaxValueSize(x)) if x == consts::MAX_VALUE_SIZE + 1)
         );
@@ -683,11 +679,10 @@ mod tests {
     #[test]
     fn test_update_max_key_size() {
         let (store, _temp_file, root_ptr) = new_test_store();
-        let reader = store.reader();
         let writer = store.writer();
 
         let key = &[0u8; consts::MAX_KEY_SIZE + 1];
-        let result = Leaf::read(&reader, root_ptr).update(&writer, key, "val".as_bytes());
+        let result = Leaf::read(&writer, root_ptr).update(&writer, key, "val".as_bytes());
         assert!(matches!(result, Err(NodeError::MaxKeySize(x)) if x == consts::MAX_KEY_SIZE + 1));
     }
 
@@ -710,11 +705,10 @@ mod tests {
     #[test]
     fn test_update_non_existent() {
         let (store, _temp_file, root_ptr) = new_test_store();
-        let reader = store.reader();
         let writer = store.writer();
 
         let result =
-            Leaf::read(&reader, root_ptr).update(&writer, "key".as_bytes(), "val".as_bytes());
+            Leaf::read(&writer, root_ptr).update(&writer, "key".as_bytes(), "val".as_bytes());
         assert!(matches!(result, Err(NodeError::KeyNotFound)));
     }
 
@@ -756,10 +750,9 @@ mod tests {
     #[test]
     fn test_delete_non_existent() {
         let (store, _temp_file, root_ptr) = new_test_store();
-        let reader = store.reader();
         let writer = store.writer();
 
-        let result = Leaf::read(&reader, root_ptr).delete(&writer, "key".as_bytes());
+        let result = Leaf::read(&writer, root_ptr).delete(&writer, "key".as_bytes());
         assert!(matches!(result, Err(NodeError::KeyNotFound)));
     }
 

@@ -37,7 +37,7 @@ use std::{
 
 use crate::core::{consts, mmap::Page};
 
-use super::{Guard as _, ReadOnlyPage, WriteablePageType, Writer, meta_node::MetaNode};
+use super::{meta_node::MetaNode, Guard as _, ReadOnlyPage as _, Writer};
 
 pub(crate) const FREE_LIST_CAP: usize = (consts::PAGE_SIZE - 8) / 8;
 const INVALID_NEXT: usize = usize::MAX;
@@ -194,8 +194,8 @@ impl<P: Deref<Target = [u8]>> ListNode<'_, P> {
     }
 }
 
-impl<'w> From<ReadOnlyPage<'w>> for ListNode<'w, ReadOnlyPage<'w>> {
-    fn from(page: ReadOnlyPage<'w>) -> Self {
+impl<'w> From<Page<'w>> for ListNode<'w, Page<'w>> {
+    fn from(page: Page<'w>) -> Self {
         ListNode {
             _phantom: PhantomData,
             page,
@@ -212,15 +212,6 @@ impl<P: DerefMut<Target = [u8]>> ListNode<'_, P> {
     /// Sets the value of `i`th pointer.
     fn set_pointer(&mut self, i: usize, ptr: usize) {
         self.page[8 + 8 * i..8 + 8 * (i + 1)].copy_from_slice(&ptr.to_le_bytes());
-    }
-}
-
-impl<'w> From<Page<'w, WriteablePageType>> for ListNode<'w, Page<'w, WriteablePageType>> {
-    fn from(page: Page<'w, WriteablePageType>) -> Self {
-        ListNode {
-            _phantom: PhantomData,
-            page,
-        }
     }
 }
 

@@ -3,12 +3,12 @@
 //!
 //! The internal node will always have at least 2 keys, and therefore at least
 //! 2 children.
-use std::{iter::Peekable, ops::Deref as _, rc::Rc};
+use std::{iter::Peekable, marker::PhantomData, ops::Deref as _, rc::Rc};
 
 use crate::core::{
     consts,
     error::NodeError,
-    mmap::{Page, ReadOnlyPage, Writer},
+    mmap::{Guard, Page, ReadOnlyPage, ReaderPage, Writer},
 };
 
 use super::header::{self, NodeType};
@@ -16,14 +16,67 @@ use super::header::{self, NodeType};
 type Result<T> = std::result::Result<T, NodeError>;
 
 /// A B+ tree internal node.
-pub struct Internal<'a> {
-    page: ReadOnlyPage<'a>,
+pub struct Internal<'g, P: ReadOnlyPage<'g>> {
+    _phantom: PhantomData<&'g ()>,
+    page: P,
 }
 
-impl<'a> Internal<'a> {
+impl<'g, P: ReadOnlyPage<'g>> Internal<'g, P> {
+    pub fn read<G: Guard<'g, P>>(guard: &'g G, page_num: usize) -> Internal<'g, P> {
+        let page = unsafe { guard.read_page(page_num) };
+        let node_type = header::get_node_type(page.deref()).unwrap();
+        assert_eq!(node_type, NodeType::Internal);
+        Internal {
+            _phantom: PhantomData,
+            page,
+        }
+    }
+
+    /// Finds the index of the child that contains the key.
+    pub fn find(&self, key: &[u8]) -> usize {
+        let n = self.get_num_keys();
+        assert_ne!(n, 0);
+        (1..n).rev().find(|&i| self.get_key(i) <= key).unwrap_or(0)
+    }
+
+    /// Gets the child pointer at an index.
+    pub fn get_child_pointer(&self, i: usize) -> usize {
+        get_child_pointer(&self.page, i)
+    }
+
+    /// Gets the number of keys.
+    pub fn get_num_keys(&self) -> usize {
+        header::get_num_keys(&self.page)
+    }
+
+    /// Gets the `i`th key in the internal buffer.
+    pub fn get_key(&self, i: usize) -> &'g [u8] {
+        get_key(&self.page, i)
+    }
+
+    pub fn get_num_bytes(&self) -> usize {
+        get_num_bytes(&self.page)
+    }
+
+    /// Gets the page number associated to the internal node.
+    pub fn page_num(&self) -> usize {
+        self.page.page_num()
+    }
+
+    /// Creates a child-entry iterator for the internal node.
+    pub fn iter(&self) -> InternalIterator<'_, 'g, P> {
+        InternalIterator {
+            node: self,
+            i: 0,
+            n: self.get_num_keys(),
+        }
+    }
+}
+
+impl<'w> Internal<'w, Page<'w>> {
     /// Creates an internal node that is the parent of two splits.
     pub fn parent_of_split(
-        writer: &'a Writer,
+        writer: &'w Writer,
         keys: [&[u8]; 2],
         child_pointers: [usize; 2],
     ) -> Self {
@@ -36,9 +89,9 @@ impl<'a> Internal<'a> {
     /// Merges child entries into the internal node.
     pub fn merge_child_entries(
         self,
-        writer: &'a Writer,
+        writer: &'w Writer,
         entries: &[ChildEntry],
-    ) -> InternalEffect<'a> {
+    ) -> InternalEffect<'w> {
         let delta_keys = entries
             .iter()
             .map(|ce| match ce {
@@ -66,10 +119,10 @@ impl<'a> Internal<'a> {
     /// Resolves underflow of either `left` or `right` by either having one
     /// steal from the other, or merging the two.
     pub fn steal_or_merge(
-        left: Internal,
-        right: Internal,
-        writer: &'a Writer,
-    ) -> InternalEffect<'a> {
+        left: Internal<'w, Page<'w>>,
+        right: Internal<'w, Page<'w>>,
+        writer: &'w Writer,
+    ) -> InternalEffect<'w> {
         let itr_func = || left.iter().chain(right.iter());
         let num_keys = left.get_num_keys() + right.get_num_keys();
         let effect = if left.get_num_bytes() + right.get_num_bytes() - 4 > consts::PAGE_SIZE {
@@ -85,52 +138,13 @@ impl<'a> Internal<'a> {
         effect
     }
 
-    /// Finds the index of the child that contains the key.
-    pub fn find(&self, key: &[u8]) -> usize {
-        let n = self.get_num_keys();
-        assert_ne!(n, 0);
-        (1..n).rev().find(|&i| self.get_key(i) <= key).unwrap_or(0)
-    }
-
-    /// Gets the child pointer at an index.
-    pub fn get_child_pointer(&self, i: usize) -> usize {
-        get_child_pointer(&self.page, i)
-    }
-
-    /// Gets the number of keys.
-    pub fn get_num_keys(&self) -> usize {
-        header::get_num_keys(&self.page)
-    }
-
-    /// Gets the `i`th key in the internal buffer.
-    pub fn get_key(&self, i: usize) -> &'a [u8] {
-        get_key(&self.page, i)
-    }
-
-    pub fn get_num_bytes(&self) -> usize {
-        get_num_bytes(&self.page)
-    }
-
-    /// Gets the page number associated to the internal node.
-    pub fn page_num(&self) -> usize {
-        self.page.page_num()
-    }
-
-    /// Creates a child-entry iterator for the internal node.
-    pub fn iter(&self) -> InternalIterator<'_, 'a> {
-        InternalIterator {
-            node: self,
-            i: 0,
-            n: self.get_num_keys(),
-        }
-    }
-
     /// Creates a child-entry iterator for the internal node merged with
     /// the specified child entries.
     fn merge_iter<'i>(
         &'i self,
-        entries: &'a [ChildEntry],
-    ) -> MergeIterator<'a, InternalIterator<'i, 'a>, std::slice::Iter<'a, ChildEntry>> {
+        entries: &'w [ChildEntry],
+    ) -> MergeIterator<'w, InternalIterator<'i, 'w, Page<'w>>, std::slice::Iter<'w, ChildEntry>>
+    {
         MergeIterator {
             node_iter: self.iter().enumerate().peekable(),
             entries_iter: entries.iter().peekable(),
@@ -140,11 +154,11 @@ impl<'a> Internal<'a> {
     /// Builds an [`InternalEffect`], then frees self back to the store.
     fn build_then_free<'i, I, F>(
         &'i self,
-        writer: &'a Writer,
+        writer: &'w Writer,
         itr_func: F,
         num_keys: usize,
         overflow: bool,
-    ) -> InternalEffect<'a>
+    ) -> InternalEffect<'w>
     where
         I: Iterator<Item = (&'i [u8], usize)>,
         F: Fn() -> I,
@@ -159,32 +173,21 @@ impl<'a> Internal<'a> {
     }
 }
 
-impl<'a> TryFrom<ReadOnlyPage<'a>> for Internal<'a> {
-    type Error = NodeError;
-    fn try_from(page: ReadOnlyPage<'a>) -> Result<Self> {
-        let node_type = header::get_node_type(page.deref())?;
-        if node_type != NodeType::Internal {
-            return Err(NodeError::UnexpectedNodeType(node_type as u16));
-        }
-        Ok(Internal { page })
-    }
-}
-
 /// An enum representing the effect of an internal node operation.
-pub enum InternalEffect<'a> {
+pub enum InternalEffect<'w> {
     /// A newly created internal node that remained  "intact",
     /// i.e. it did not split.
-    Intact(Internal<'a>),
+    Intact(Internal<'w, Page<'w>>),
     /// The left and right splits of an internal node that was created.
     Split {
-        left: Internal<'a>,
-        right: Internal<'a>,
+        left: Internal<'w, Page<'w>>,
+        right: Internal<'w, Page<'w>>,
     },
 }
 
-impl<'a> InternalEffect<'a> {
+impl<'w> InternalEffect<'w> {
     #[allow(dead_code)]
-    fn take_intact(self) -> Internal<'a> {
+    fn take_intact(self) -> Internal<'w, Page<'w>> {
         match self {
             InternalEffect::Intact(internal) => internal,
             _ => panic!("is not InternalEffect::Intact"),
@@ -192,7 +195,7 @@ impl<'a> InternalEffect<'a> {
     }
 
     #[allow(dead_code)]
-    fn take_split(self) -> (Internal<'a>, Internal<'a>) {
+    fn take_split(self) -> (Internal<'w, Page<'w>>, Internal<'w, Page<'w>>) {
         match self {
             InternalEffect::Split { left, right } => (left, right),
             _ => panic!("is not InternalEffect::Split"),
@@ -260,7 +263,7 @@ impl<'w> Builder<'w> {
     }
 
     /// Builds an internal node.
-    fn build(self) -> Internal<'w> {
+    fn build(self) -> Internal<'w, Page<'w>> {
         let n = header::get_num_keys(&self.page);
         assert!(
             self.i == n,
@@ -268,7 +271,10 @@ impl<'w> Builder<'w> {
             self.i,
             n
         );
-        self.page.read_only().try_into().unwrap()
+        Internal {
+            _phantom: PhantomData,
+            page: self.page.read_only(),
+        }
     }
 }
 
@@ -337,14 +343,14 @@ where
 }
 
 /// A child-entry iterator of an internal node.
-pub struct InternalIterator<'i, 'a> {
-    node: &'i Internal<'a>,
+pub struct InternalIterator<'i, 'g, P: ReadOnlyPage<'g>> {
+    node: &'i Internal<'g, P>,
     i: usize,
     n: usize,
 }
 
-impl<'a> Iterator for InternalIterator<'_, 'a> {
-    type Item = (&'a [u8], usize);
+impl<'g, P: ReadOnlyPage<'g>> Iterator for InternalIterator<'_, 'g, P> {
+    type Item = (&'g [u8], usize);
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.i >= self.n {
@@ -423,7 +429,7 @@ where
 }
 
 /// Gets the `i`th key in an internal node's page buffer.
-fn get_key<'a>(page: &ReadOnlyPage<'a>, i: usize) -> &'a [u8] {
+fn get_key<'g, P: ReadOnlyPage<'g>>(page: &P, i: usize) -> &'g [u8] {
     let n = header::get_num_keys(page);
     let offset = get_offset(page, i);
     let key_len = get_offset(page, i + 1) - offset;
@@ -442,7 +448,7 @@ fn get_key<'a>(page: &ReadOnlyPage<'a>, i: usize) -> &'a [u8] {
 }
 
 /// Gets the `i`th child pointer in an internal node's page buffer.
-fn get_child_pointer(page: &ReadOnlyPage, i: usize) -> usize {
+fn get_child_pointer<'g, P: ReadOnlyPage<'g>>(page: &P, i: usize) -> usize {
     u64::from_le_bytes([
         page[4 + i * 8],
         page[4 + i * 8 + 1],
