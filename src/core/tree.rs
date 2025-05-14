@@ -27,7 +27,7 @@ use crate::core::error::TreeError;
 use crate::core::mmap::{self, Guard, Writer};
 use node::{ChildEntry, Internal, Node, NodeEffect, Sufficiency};
 
-use super::mmap::{Page, ReadOnlyPage, Reader, ReaderPage};
+use super::mmap::{Page, ReadOnlyPage};
 
 type Result<T> = std::result::Result<T, TreeError>;
 
@@ -432,7 +432,11 @@ impl<'w> Tree<'w, Page<'w>, Writer<'_>> {
 
     /// Creates a new internal root node whose children are split nodes
     /// newly-created due to an operation on the tree.
-    fn parent_of_split(writer: &'w Writer, left: &Node<'w, Page<'w>>, right: &Node<'w, Page<'w>>) -> Node<'w, Page<'w>> {
+    fn parent_of_split(
+        writer: &'w Writer,
+        left: &Node<'w, Page<'w>>,
+        right: &Node<'w, Page<'w>>,
+    ) -> Node<'w, Page<'w>> {
         let keys = [left.get_key(0), right.get_key(0)];
         let child_pointers = [left.page_num(), right.page_num()];
         let root = Internal::parent_of_split(writer, keys, child_pointers);

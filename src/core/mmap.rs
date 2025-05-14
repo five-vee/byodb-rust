@@ -444,7 +444,7 @@ pub struct Reader<'s> {
     _collector_guard: LocalGuard<'s>,
 }
 
-impl<'s, 'r> Guard<'r, ReaderPage<'r>> for Reader<'s> {
+impl<'r> Guard<'r, ReaderPage<'r>> for Reader<'_> {
     unsafe fn read_page(&self, page_num: usize) -> ReaderPage<'_> {
         let guard = &self.state_guard;
         assert!(
@@ -579,7 +579,7 @@ impl Writer<'_> {
     }
 }
 
-impl<'w, 's> Guard<'w, Page<'w>> for Writer<'s> {
+impl<'w> Guard<'w, Page<'w>> for Writer<'_> {
     unsafe fn read_page(&self, page_num: usize) -> Page<'_> {
         let borrow = self.state_guard.borrow();
         assert!(
@@ -937,7 +937,6 @@ mod tests {
                 &pattern1,
                 "Second reader should still be able to read the first flushed page"
             );
-            drop(read_page1_again);
         }
     }
 

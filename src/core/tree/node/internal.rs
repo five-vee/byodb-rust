@@ -3,16 +3,17 @@
 //!
 //! The internal node will always have at least 2 keys, and therefore at least
 //! 2 children.
-use std::{iter::Peekable, marker::PhantomData, ops::Deref as _, rc::Rc};
+use std::{iter::Peekable, marker::PhantomData, rc::Rc};
 
 use crate::core::{
     consts,
     error::NodeError,
-    mmap::{Guard, Page, ReadOnlyPage, ReaderPage, Writer},
+    mmap::{Guard, Page, ReadOnlyPage, Writer},
 };
 
 use super::header::{self, NodeType};
 
+#[allow(dead_code)]
 type Result<T> = std::result::Result<T, NodeError>;
 
 /// A B+ tree internal node.

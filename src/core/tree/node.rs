@@ -101,7 +101,7 @@ mod leaf;
 use std::rc::Rc;
 
 use crate::core::error::NodeError;
-use crate::core::mmap::{Guard, Page, ReadOnlyPage, Reader, ReaderPage, Writer};
+use crate::core::mmap::{Guard, Page, ReadOnlyPage, Writer};
 use crate::core::{consts, header};
 use header::NodeType;
 pub(crate) use internal::ChildEntry;
@@ -110,6 +110,7 @@ use internal::InternalEffect;
 pub(crate) use leaf::Leaf;
 use leaf::LeafEffect;
 
+#[allow(dead_code)]
 type Result<T> = std::result::Result<T, NodeError>;
 
 /// An enum representing the type of B+ tree node.
