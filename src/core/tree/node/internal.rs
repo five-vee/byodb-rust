@@ -8,7 +8,7 @@ use std::{iter::Peekable, marker::PhantomData, rc::Rc};
 use crate::core::{
     consts,
     error::NodeError,
-    mmap::{Guard, Page, ReadOnlyPage, Writer},
+    mmap::{Guard, ImmutablePage, Writer, WriterPage},
 };
 
 use super::header::{self, NodeType};
@@ -17,12 +17,12 @@ use super::header::{self, NodeType};
 type Result<T> = std::result::Result<T, NodeError>;
 
 /// A B+ tree internal node.
-pub struct Internal<'g, P: ReadOnlyPage<'g>> {
+pub struct Internal<'g, P: ImmutablePage<'g>> {
     _phantom: PhantomData<&'g ()>,
     page: P,
 }
 
-impl<'g, P: ReadOnlyPage<'g>> Internal<'g, P> {
+impl<'g, P: ImmutablePage<'g>> Internal<'g, P> {
     pub fn read<G: Guard<'g, P>>(guard: &'g G, page_num: usize) -> Internal<'g, P> {
         let page = unsafe { guard.read_page(page_num) };
         let node_type = header::get_node_type(page.deref()).unwrap();
@@ -74,7 +74,7 @@ impl<'g, P: ReadOnlyPage<'g>> Internal<'g, P> {
     }
 }
 
-impl<'w> Internal<'w, Page<'w>> {
+impl<'w> Internal<'w, WriterPage<'w>> {
     /// Creates an internal node that is the parent of two splits.
     pub fn parent_of_split(
         writer: &'w Writer,
@@ -120,8 +120,8 @@ impl<'w> Internal<'w, Page<'w>> {
     /// Resolves underflow of either `left` or `right` by either having one
     /// steal from the other, or merging the two.
     pub fn steal_or_merge(
-        left: Internal<'w, Page<'w>>,
-        right: Internal<'w, Page<'w>>,
+        left: Internal<'w, WriterPage<'w>>,
+        right: Internal<'w, WriterPage<'w>>,
         writer: &'w Writer,
     ) -> InternalEffect<'w> {
         let itr_func = || left.iter().chain(right.iter());
@@ -144,7 +144,7 @@ impl<'w> Internal<'w, Page<'w>> {
     fn merge_iter<'i>(
         &'i self,
         entries: &'w [ChildEntry],
-    ) -> MergeIterator<'w, InternalIterator<'i, 'w, Page<'w>>, std::slice::Iter<'w, ChildEntry>>
+    ) -> MergeIterator<'w, InternalIterator<'i, 'w, WriterPage<'w>>, std::slice::Iter<'w, ChildEntry>>
     {
         MergeIterator {
             node_iter: self.iter().enumerate().peekable(),
@@ -178,17 +178,17 @@ impl<'w> Internal<'w, Page<'w>> {
 pub enum InternalEffect<'w> {
     /// A newly created internal node that remained  "intact",
     /// i.e. it did not split.
-    Intact(Internal<'w, Page<'w>>),
+    Intact(Internal<'w, WriterPage<'w>>),
     /// The left and right splits of an internal node that was created.
     Split {
-        left: Internal<'w, Page<'w>>,
-        right: Internal<'w, Page<'w>>,
+        left: Internal<'w, WriterPage<'w>>,
+        right: Internal<'w, WriterPage<'w>>,
     },
 }
 
 impl<'w> InternalEffect<'w> {
     #[allow(dead_code)]
-    fn take_intact(self) -> Internal<'w, Page<'w>> {
+    fn take_intact(self) -> Internal<'w, WriterPage<'w>> {
         match self {
             InternalEffect::Intact(internal) => internal,
             _ => panic!("is not InternalEffect::Intact"),
@@ -196,7 +196,7 @@ impl<'w> InternalEffect<'w> {
     }
 
     #[allow(dead_code)]
-    fn take_split(self) -> (Internal<'w, Page<'w>>, Internal<'w, Page<'w>>) {
+    fn take_split(self) -> (Internal<'w, WriterPage<'w>>, Internal<'w, WriterPage<'w>>) {
         match self {
             InternalEffect::Split { left, right } => (left, right),
             _ => panic!("is not InternalEffect::Split"),
@@ -224,7 +224,7 @@ pub enum ChildEntry {
 // A builder of a B+ tree internal node.
 struct Builder<'w> {
     i: usize,
-    page: Page<'w>,
+    page: WriterPage<'w>,
 }
 
 impl<'w> Builder<'w> {
@@ -264,7 +264,7 @@ impl<'w> Builder<'w> {
     }
 
     /// Builds an internal node.
-    fn build(self) -> Internal<'w, Page<'w>> {
+    fn build(self) -> Internal<'w, WriterPage<'w>> {
         let n = header::get_num_keys(&self.page);
         assert!(
             self.i == n,
@@ -344,13 +344,13 @@ where
 }
 
 /// A child-entry iterator of an internal node.
-pub struct InternalIterator<'i, 'g, P: ReadOnlyPage<'g>> {
+pub struct InternalIterator<'i, 'g, P: ImmutablePage<'g>> {
     node: &'i Internal<'g, P>,
     i: usize,
     n: usize,
 }
 
-impl<'g, P: ReadOnlyPage<'g>> Iterator for InternalIterator<'_, 'g, P> {
+impl<'g, P: ImmutablePage<'g>> Iterator for InternalIterator<'_, 'g, P> {
     type Item = (&'g [u8], usize);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -430,13 +430,13 @@ where
 }
 
 /// Gets the `i`th key in an internal node's page buffer.
-fn get_key<'g, P: ReadOnlyPage<'g>>(page: &P, i: usize) -> &'g [u8] {
+fn get_key<'g, P: ImmutablePage<'g>>(page: &P, i: usize) -> &'g [u8] {
     let n = header::get_num_keys(page);
     let offset = get_offset(page, i);
     let key_len = get_offset(page, i + 1) - offset;
     let key = &page[4 + n * 10 + offset..4 + n * 10 + offset + key_len];
     // Safety: key borrows from page,
-    // which itself borrows from a Reader/Writer (with lifetime 'a),
+    // which itself borrows from a Reader/Writer (with lifetime 'g),
     // which itself has a reference to a Store,
     // which itself is modeled as a slice of bytes.
     // So long as the reader/writer is alive,
@@ -444,12 +444,12 @@ fn get_key<'g, P: ReadOnlyPage<'g>>(page: &P, i: usize) -> &'g [u8] {
     // meaning the underlying slice of bytes cannot either.
     // Thus, casting the borrow lifetime from 'l
     // (the lifetime of leaf node)
-    // to 'a (the lifetime of the reader/writer) is safe.
+    // to 'g (the lifetime of the reader/writer) is safe.
     unsafe { std::slice::from_raw_parts(key.as_ptr(), key.len()) }
 }
 
 /// Gets the `i`th child pointer in an internal node's page buffer.
-fn get_child_pointer<'g, P: ReadOnlyPage<'g>>(page: &P, i: usize) -> usize {
+fn get_child_pointer<'g, P: ImmutablePage<'g>>(page: &P, i: usize) -> usize {
     u64::from_le_bytes([
         page[4 + i * 8],
         page[4 + i * 8 + 1],

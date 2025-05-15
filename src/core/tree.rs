@@ -27,7 +27,7 @@ use crate::core::error::TreeError;
 use crate::core::mmap::{self, Guard, Writer};
 use node::{ChildEntry, Internal, Node, NodeEffect, Sufficiency};
 
-use super::mmap::{Page, ReadOnlyPage};
+use super::mmap::{ImmutablePage, WriterPage};
 
 type Result<T> = std::result::Result<T, TreeError>;
 
@@ -45,13 +45,13 @@ type Result<T> = std::result::Result<T, TreeError>;
 /// accessing the tree will continue to see the consistent, older version of
 /// the data until they reach a point where they would naturally access the
 /// newly written parts.
-pub struct Tree<'g, P: ReadOnlyPage<'g>, G: Guard<'g, P>> {
+pub struct Tree<'g, P: ImmutablePage<'g>, G: Guard<'g, P>> {
     _phantom: PhantomData<P>,
     guard: &'g G,
     page_num: usize,
 }
 
-impl<'g, P: ReadOnlyPage<'g>, G: Guard<'g, P>> Tree<'g, P, G> {
+impl<'g, P: ImmutablePage<'g>, G: Guard<'g, P>> Tree<'g, P, G> {
     /// Loads the root of the tree at a specified root page num.
     pub fn new(guard: &'g G, page_num: usize) -> Self {
         Tree {
@@ -160,7 +160,7 @@ impl<'g, P: ReadOnlyPage<'g>, G: Guard<'g, P>> Tree<'g, P, G> {
     }
 }
 
-impl<'w> Tree<'w, Page<'w>, Writer<'_>> {
+impl<'w> Tree<'w, WriterPage<'w>, Writer<'_>> {
     /// Inserts a key-value pair. The resulting tree won't be visible to
     /// readers until the writer is externally flushed.
     pub fn insert(self, key: &[u8], val: &[u8]) -> Result<Self> {
@@ -340,8 +340,8 @@ impl<'w> Tree<'w, Page<'w>, Writer<'_>> {
     /// parent (internal) node.
     fn try_fix_underflow(
         &self,
-        parent: Internal<'w, Page<'w>>,
-        child: Node<'w, Page<'w>>,
+        parent: Internal<'w, WriterPage<'w>>,
+        child: Node<'w, WriterPage<'w>>,
         child_idx: usize,
     ) -> NodeEffect<'w> {
         // Try to steal from or merge with a sibling.
@@ -378,10 +378,10 @@ impl<'w> Tree<'w, Page<'w>, Writer<'_>> {
     /// one of its direct siblings.
     fn steal_or_merge(
         &self,
-        parent: Internal<'w, Page<'w>>,
-        child: Node<'w, Page<'w>>,
+        parent: Internal<'w, WriterPage<'w>>,
+        child: Node<'w, WriterPage<'w>>,
         child_idx: usize,
-        sibling: Node<'w, Page<'w>>,
+        sibling: Node<'w, WriterPage<'w>>,
         sibling_idx: usize,
     ) -> NodeEffect<'w> {
         let (mut left_idx, mut right_idx) = (sibling_idx, child_idx);
@@ -434,9 +434,9 @@ impl<'w> Tree<'w, Page<'w>, Writer<'_>> {
     /// newly-created due to an operation on the tree.
     fn parent_of_split(
         writer: &'w Writer,
-        left: &Node<'w, Page<'w>>,
-        right: &Node<'w, Page<'w>>,
-    ) -> Node<'w, Page<'w>> {
+        left: &Node<'w, WriterPage<'w>>,
+        right: &Node<'w, WriterPage<'w>>,
+    ) -> Node<'w, WriterPage<'w>> {
         let keys = [left.get_key(0), right.get_key(0)];
         let child_pointers = [left.page_num(), right.page_num()];
         let root = Internal::parent_of_split(writer, keys, child_pointers);
@@ -445,7 +445,7 @@ impl<'w> Tree<'w, Page<'w>, Writer<'_>> {
 }
 
 #[cfg(test)]
-impl<'g, P: ReadOnlyPage<'g>, G: Guard<'g, P>> Tree<'g, P, G> {
+impl<'g, P: ImmutablePage<'g>, G: Guard<'g, P>> Tree<'g, P, G> {
     /// Gets the height of the tree.
     /// This performs a scan of the entire tree, so it's not really efficient.
     #[allow(dead_code)]
@@ -475,12 +475,12 @@ impl<'g, P: ReadOnlyPage<'g>, G: Guard<'g, P>> Tree<'g, P, G> {
 }
 
 /// An in-order iterator over a tree.
-pub struct InOrder<'q, 'g, P: ReadOnlyPage<'g>, G: Guard<'g, P>> {
+pub struct InOrder<'q, 'g, P: ImmutablePage<'g>, G: Guard<'g, P>> {
     stack: Vec<(usize, Tree<'g, P, G>)>,
     end_bound: std::ops::Bound<&'q [u8]>,
 }
 
-impl<'g, P: ReadOnlyPage<'g>, G: Guard<'g, P>> Iterator for InOrder<'_, 'g, P, G> {
+impl<'g, P: ImmutablePage<'g>, G: Guard<'g, P>> Iterator for InOrder<'_, 'g, P, G> {
     type Item = (&'g [u8], &'g [u8]);
     fn next(&mut self) -> Option<Self::Item> {
         while let Some((i, tree)) = self.stack.pop() {

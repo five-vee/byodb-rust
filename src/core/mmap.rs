@@ -404,13 +404,9 @@ impl Drop for Store {
     }
 }
 
-pub trait ReadOnlyPage<'g>: Deref<Target = [u8]> {
-    fn page_num(&self) -> usize;
-}
-
 /// Guard is a trait common to both Reader and Writer.
 /// It provides guarded read-only access to the mmap region.
-pub trait Guard<'g, P: ReadOnlyPage<'g>> {
+pub trait Guard<'g, P: ImmutablePage<'g>> {
     /// Reads a page at `page_num`.
     ///
     /// This function is unsafe b/c if used incorrectly, it can access pages
@@ -492,7 +488,7 @@ pub struct Writer<'s> {
 
 impl Writer<'_> {
     /// Allocates a new page for write.
-    pub fn new_page(&self) -> Page<'_> {
+    pub fn new_page(&self) -> WriterPage<'_> {
         let guard = &self.state_guard;
         // Try from the free list first.
         let mut fl = guard.borrow_mut().free_list;
@@ -504,7 +500,7 @@ impl Writer<'_> {
             (borrow.new_offset - 1) / consts::PAGE_SIZE
         });
         guard.borrow_mut().free_list = fl;
-        Page {
+        WriterPage {
             _phantom: PhantomData,
             mmap: guard.borrow().mmap.clone(),
             page_num,
@@ -541,10 +537,10 @@ impl Writer<'_> {
     /// immutable. As such, please only use this on non-B+-tree pages,
     /// i.e. free list pages. Also, make sure there exists only one mutable
     /// reference at a time to the underlying page.
-    pub unsafe fn overwrite_page(&self, page_num: usize) -> Page {
+    pub unsafe fn overwrite_page(&self, page_num: usize) -> WriterPage {
         let guard = self.state_guard.borrow();
         assert!(page_num * consts::PAGE_SIZE < guard.new_offset);
-        Page {
+        WriterPage {
             _phantom: PhantomData,
             mmap: guard.mmap.clone(),
             page_num,
@@ -579,8 +575,8 @@ impl Writer<'_> {
     }
 }
 
-impl<'w> Guard<'w, Page<'w>> for Writer<'_> {
-    unsafe fn read_page(&self, page_num: usize) -> Page<'_> {
+impl<'w> Guard<'w, WriterPage<'w>> for Writer<'_> {
+    unsafe fn read_page(&self, page_num: usize) -> WriterPage<'_> {
         let borrow = self.state_guard.borrow();
         assert!(
             page_num * consts::PAGE_SIZE < borrow.new_offset,
@@ -588,7 +584,7 @@ impl<'w> Guard<'w, Page<'w>> for Writer<'_> {
             page_num,
             borrow.new_offset / consts::PAGE_SIZE
         );
-        Page {
+        WriterPage {
             _phantom: PhantomData,
             mmap: borrow.mmap.clone(),
             page_num,
@@ -641,29 +637,41 @@ impl Drop for Writer<'_> {
         // Safety: prev_root_page has already been replaced in the flush() call,
         // so it is safe to defer its retirement.
         unsafe {
-            self.collector_guard
-                .defer_retire(reclaimable, |r, _collector| {
-                    let r = Box::from_raw(r); // so r can be auto-dropped
-                    if let Some(root_page) = r.root_page {
-                        drop(Box::from_raw(root_page)); // must manually be dropped
-                    }
-                    if r.reclaim_pages {
-                        r.store.reclaim_pages();
-                    }
-                });
+            self.collector_guard.defer_retire(reclaimable, |r, _| {
+                let r = Box::from_raw(r); // so r can be auto-dropped
+                if let Some(root_page) = r.root_page {
+                    drop(Box::from_raw(root_page)); // must manually be dropped
+                }
+                if r.reclaim_pages {
+                    r.store.reclaim_pages();
+                }
+            });
         }
     }
 }
 
+/// A container to be passed to [`seize::LocalGuard::defer_retire`]
+/// so that its underlying garbage can be collected.
 struct Reclaimable {
     store: Arc<Store>,
     root_page: Option<*mut usize>,
     reclaim_pages: bool,
 }
 
-pub struct ReaderPage<'a> {
-    _phantom: PhantomData<&'a ()>,
-    mmap: &'a Arc<UnsafeCell<Mmap>>,
+/// A page that provides read-only access to its data.
+/// This trait is implemented only by [`ReaderPage`]
+/// and [`WriterPage`].
+pub trait ImmutablePage<'g>: Deref<Target = [u8]> {
+    /// Returns the page number of this page.
+    fn page_num(&self) -> usize;
+}
+
+/// A page inside the mmap region that allows for only reads.
+/// Only flushed pages are accessible by readers.
+/// This is also an implementation of [`ImmutablePage`] on the reader side.
+pub struct ReaderPage<'r> {
+    _phantom: PhantomData<&'r ()>,
+    mmap: &'r Arc<UnsafeCell<Mmap>>,
     page_num: usize,
 }
 
@@ -687,7 +695,7 @@ impl Deref for ReaderPage<'_> {
     }
 }
 
-impl ReadOnlyPage<'_> for ReaderPage<'_> {
+impl ImmutablePage<'_> for ReaderPage<'_> {
     fn page_num(&self) -> usize {
         self.page_num
     }
@@ -695,15 +703,16 @@ impl ReadOnlyPage<'_> for ReaderPage<'_> {
 
 /// A page inside the mmap region that allows for reads and possibly writes.
 /// A page is not accessible to readers until flushed.
-pub struct Page<'w> {
+/// This is also an implementation of [`ImmutablePage`] on the writer side.
+pub struct WriterPage<'w> {
     _phantom: PhantomData<&'w ()>,
     mmap: Arc<UnsafeCell<Mmap>>,
     page_num: usize,
 }
 
-impl<'w> Page<'w> {
-    pub fn read_only(self) -> Page<'w> {
-        Page {
+impl<'w> WriterPage<'w> {
+    pub fn read_only(self) -> WriterPage<'w> {
+        WriterPage {
             _phantom: PhantomData,
             mmap: self.mmap,
             page_num: self.page_num,
@@ -711,7 +720,7 @@ impl<'w> Page<'w> {
     }
 }
 
-impl Deref for Page<'_> {
+impl Deref for WriterPage<'_> {
     type Target = [u8];
     fn deref(&self) -> &Self::Target {
         // Safety: [page_ptr, page_ptr + PAGE_SIZE) is a guaranteed valid region in the mmap.
@@ -725,7 +734,7 @@ impl Deref for Page<'_> {
     }
 }
 
-impl DerefMut for Page<'_> {
+impl DerefMut for WriterPage<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         // Safety: [page_ptr, page_ptr + PAGE_SIZE) is a guaranteed valid region in the mmap.
         // Due to the mutex guard in Writer, at most one mutable reference can
@@ -738,7 +747,7 @@ impl DerefMut for Page<'_> {
     }
 }
 
-impl ReadOnlyPage<'_> for Page<'_> {
+impl ImmutablePage<'_> for WriterPage<'_> {
     fn page_num(&self) -> usize {
         self.page_num
     }

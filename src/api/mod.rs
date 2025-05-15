@@ -13,7 +13,7 @@ use seize::Collector;
 
 pub use crate::core::consts;
 use crate::core::{
-    mmap::{self, Guard, Mmap, Page, ReadOnlyPage, Reader, ReaderPage, Store, Writer},
+    mmap::{self, Guard, ImmutablePage, Mmap, Reader, ReaderPage, Store, Writer, WriterPage},
     tree::Tree,
 };
 
@@ -21,7 +21,7 @@ use crate::core::{
 pub type Result<T> = std::result::Result<T, TxnError>;
 /// A read-write transaction. It must live as long as the [`DB`] that created
 /// it (via [`DB::rw_txn`]).
-pub type RWTxn<'t, 'd> = Txn<'t, Page<'t>, Writer<'d>>;
+pub type RWTxn<'t, 'd> = Txn<'t, WriterPage<'t>, Writer<'d>>;
 /// A read-only transaction. It must live as long as the [`DB`] that created
 /// it (via [`DB::r_txn`]).
 pub type RTxn<'t, 'd> = Txn<'t, ReaderPage<'t>, Reader<'d>>;
@@ -149,13 +149,13 @@ impl<P: AsRef<Path>> DBBuilder<P> {
 /// A transaction provides a consistent view of the database. It can be
 /// either read-only ([`RTxn`]) or read-write ([`RWTxn`]).
 /// All operations on the database are performed within a transaction.
-pub struct Txn<'g, P: ReadOnlyPage<'g>, G: Guard<'g, P>> {
+pub struct Txn<'g, P: ImmutablePage<'g>, G: Guard<'g, P>> {
     _phantom: PhantomData<&'g P>,
     guard: G,
     root_page: usize,
 }
 
-impl<'g, P: ReadOnlyPage<'g>, G: Guard<'g, P>> Txn<'g, P, G> {
+impl<'g, P: ImmutablePage<'g>, G: Guard<'g, P>> Txn<'g, P, G> {
     /// Retrieves the value associated with the given key.
     ///
     /// # Parameters
@@ -202,7 +202,7 @@ impl<'g, P: ReadOnlyPage<'g>, G: Guard<'g, P>> Txn<'g, P, G> {
     }
 }
 
-impl<'w> Txn<'w, Page<'w>, Writer<'_>> {
+impl<'w> Txn<'w, WriterPage<'w>, Writer<'_>> {
     /// Inserts a new key-value pair into the database.
     ///
     /// # Parameters

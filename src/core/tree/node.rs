@@ -101,7 +101,7 @@ mod leaf;
 use std::rc::Rc;
 
 use crate::core::error::NodeError;
-use crate::core::mmap::{Guard, Page, ReadOnlyPage, Writer};
+use crate::core::mmap::{Guard, WriterPage, ImmutablePage, Writer};
 use crate::core::{consts, header};
 use header::NodeType;
 pub(crate) use internal::ChildEntry;
@@ -114,14 +114,14 @@ use leaf::LeafEffect;
 type Result<T> = std::result::Result<T, NodeError>;
 
 /// An enum representing the type of B+ tree node.
-pub enum Node<'g, P: ReadOnlyPage<'g>> {
+pub enum Node<'g, P: ImmutablePage<'g>> {
     /// A B+ tree leaf node.
     Leaf(Leaf<'g, P>),
     /// A B+ tree internal node.
     Internal(Internal<'g, P>),
 }
 
-impl<'g, P: ReadOnlyPage<'g>> Node<'g, P> {
+impl<'g, P: ImmutablePage<'g>> Node<'g, P> {
     /// Reads the page at `page_num` and returns it represented as a `Node`.
     /// This is unsafe for the same reason [`Guard::read_page`] is unsafe.
     pub unsafe fn read<G: Guard<'g, P>>(guard: &'g G, page_num: usize) -> Node<'g, P> {
@@ -169,13 +169,13 @@ pub enum NodeEffect<'g> {
     /// page allocations, since empty non-root nodes aren't allowed.
     Empty,
     /// A newly created node that remained  "intact", i.e. it did not split.
-    Intact(Node<'g, Page<'g>>),
+    Intact(Node<'g, WriterPage<'g>>),
     /// The left and right splits of a node that was created.
     ///
     /// The left and right nodes are the same type.
     Split {
-        left: Node<'g, Page<'g>>,
-        right: Node<'g, Page<'g>>,
+        left: Node<'g, WriterPage<'g>>,
+        right: Node<'g, WriterPage<'g>>,
     },
 }
 
@@ -209,8 +209,8 @@ impl NodeEffect<'_> {
     }
 }
 
-impl<'a> From<LeafEffect<'a>> for NodeEffect<'a> {
-    fn from(value: LeafEffect<'a>) -> Self {
+impl<'w> From<LeafEffect<'w>> for NodeEffect<'w> {
+    fn from(value: LeafEffect<'w>) -> Self {
         match value {
             LeafEffect::Empty => NodeEffect::Empty,
             LeafEffect::Intact(leaf) => NodeEffect::Intact(Node::Leaf(leaf)),
@@ -222,8 +222,8 @@ impl<'a> From<LeafEffect<'a>> for NodeEffect<'a> {
     }
 }
 
-impl<'a> From<InternalEffect<'a>> for NodeEffect<'a> {
-    fn from(value: InternalEffect<'a>) -> Self {
+impl<'w> From<InternalEffect<'w>> for NodeEffect<'w> {
+    fn from(value: InternalEffect<'w>) -> Self {
         match value {
             InternalEffect::Intact(internal) => NodeEffect::Intact(Node::Internal(internal)),
             InternalEffect::Split { left, right } => NodeEffect::Split {
@@ -251,7 +251,7 @@ pub enum Sufficiency {
 }
 
 // Returns how sufficient a node is.
-pub fn sufficiency<'w>(n: &Node<'w, Page<'w>>) -> Sufficiency {
+pub fn sufficiency<'w>(n: &Node<'w, WriterPage<'w>>) -> Sufficiency {
     match n.get_num_keys() {
         0 => Sufficiency::Empty,
         1 => Sufficiency::Underflow,
@@ -263,8 +263,8 @@ pub fn sufficiency<'w>(n: &Node<'w, Page<'w>>) -> Sufficiency {
 /// needed. This is modeled as a Deletion b/c it is (so far) only useful in the
 /// context of deletion.
 pub fn steal_or_merge<'w>(
-    left: Node<'w, Page<'w>>,
-    right: Node<'w, Page<'w>>,
+    left: Node<'w, WriterPage<'w>>,
+    right: Node<'w, WriterPage<'w>>,
     writer: &'w Writer,
 ) -> NodeEffect<'w> {
     match (left, right) {
@@ -279,7 +279,7 @@ pub fn steal_or_merge<'w>(
 /// Checks whether `to` can steal a key from `from`.
 /// `steal_end` determines whether to steal the end key of `from`,
 /// otherwise the beginning key.
-pub fn can_steal<'w>(from: &Node<'w, Page<'w>>, to: &Node<'w, Page<'w>>, steal_end: bool) -> bool {
+pub fn can_steal<'w>(from: &Node<'w, WriterPage<'w>>, to: &Node<'w, WriterPage<'w>>, steal_end: bool) -> bool {
     if from.get_num_keys() <= 2 {
         return false;
     }
@@ -301,6 +301,6 @@ pub fn can_steal<'w>(from: &Node<'w, Page<'w>>, to: &Node<'w, Page<'w>>, steal_e
 }
 
 /// Checks whether the merging of `left` and `right` doesn't overflow.
-pub fn can_merge<'w>(left: &Node<'w, Page<'w>>, right: &Node<'w, Page<'w>>) -> bool {
+pub fn can_merge<'w>(left: &Node<'w, WriterPage<'w>>, right: &Node<'w, WriterPage<'w>>) -> bool {
     left.get_num_bytes() + right.get_num_bytes() - 4 < consts::PAGE_SIZE
 }

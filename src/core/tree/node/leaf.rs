@@ -7,19 +7,19 @@ use std::marker::PhantomData;
 
 use crate::core::consts;
 use crate::core::error::NodeError;
-use crate::core::mmap::{Guard, Page, ReadOnlyPage, Writer};
+use crate::core::mmap::{Guard, WriterPage, ImmutablePage, Writer};
 
 use super::header::{self, NodeType};
 
 type Result<T> = std::result::Result<T, NodeError>;
 
 /// A B+ tree leaf node.
-pub struct Leaf<'g, P: ReadOnlyPage<'g>> {
+pub struct Leaf<'g, P: ImmutablePage<'g>> {
     _phantom: PhantomData<&'g ()>,
     page: P,
 }
 
-impl<'g, P: ReadOnlyPage<'g>> Leaf<'g, P> {
+impl<'g, P: ImmutablePage<'g>> Leaf<'g, P> {
     /// Reads a page as a leaf node type.
     pub fn read<G: Guard<'g, P>>(guard: &'g G, page_num: usize) -> Leaf<'g, P> {
         let page = unsafe { guard.read_page(page_num) };
@@ -71,7 +71,7 @@ impl<'g, P: ReadOnlyPage<'g>> Leaf<'g, P> {
     }
 }
 
-impl<'w> Leaf<'w, Page<'w>> {
+impl<'w> Leaf<'w, WriterPage<'w>> {
     /// Inserts a key-value pair.
     pub fn insert(self, writer: &'w Writer, key: &[u8], val: &[u8]) -> Result<LeafEffect<'w>> {
         if key.len() > consts::MAX_KEY_SIZE {
@@ -147,8 +147,8 @@ impl<'w> Leaf<'w, Page<'w>> {
     /// Creates the leaf (or leaves) resulting from either `left` stealing from
     /// `right`, or `left` merging with `right`.
     pub fn steal_or_merge(
-        left: Leaf<'w, Page<'w>>,
-        right: Leaf<'w, Page<'w>>,
+        left: Leaf<'w, WriterPage<'w>>,
+        right: Leaf<'w, WriterPage<'w>>,
         writer: &'w Writer,
     ) -> LeafEffect<'w> {
         let itr_func = || left.iter().chain(right.iter());
@@ -218,17 +218,17 @@ pub enum LeafEffect<'w> {
     /// allowed.
     Empty,
     /// A newly created leaf that remained  "intact", i.e. it did not split.
-    Intact(Leaf<'w, Page<'w>>),
+    Intact(Leaf<'w, WriterPage<'w>>),
     /// The `left` and `right` splits of a leaf that was created.
     Split {
-        left: Leaf<'w, Page<'w>>,
-        right: Leaf<'w, Page<'w>>,
+        left: Leaf<'w, WriterPage<'w>>,
+        right: Leaf<'w, WriterPage<'w>>,
     },
 }
 
 impl<'w> LeafEffect<'w> {
     #[allow(dead_code)]
-    fn take_intact(self) -> Leaf<'w, Page<'w>> {
+    fn take_intact(self) -> Leaf<'w, WriterPage<'w>> {
         match self {
             LeafEffect::Intact(leaf) => leaf,
             _ => panic!("is not LeafEffect::Intact"),
@@ -236,7 +236,7 @@ impl<'w> LeafEffect<'w> {
     }
 
     #[allow(dead_code)]
-    fn take_split(self) -> (Leaf<'w, Page<'w>>, Leaf<'w, Page<'w>>) {
+    fn take_split(self) -> (Leaf<'w, WriterPage<'w>>, Leaf<'w, WriterPage<'w>>) {
         match self {
             LeafEffect::Split { left, right } => (left, right),
             _ => panic!("is not LeafEffect::Split"),
@@ -247,7 +247,7 @@ impl<'w> LeafEffect<'w> {
 // A builder of a B+ tree leaf node.
 struct Builder<'w> {
     i: usize,
-    page: Page<'w>,
+    page: WriterPage<'w>,
 }
 
 impl<'w> Builder<'w> {
@@ -290,7 +290,7 @@ impl<'w> Builder<'w> {
     }
 
     /// Builds a leaf.
-    fn build(self) -> Leaf<'w, Page<'w>> {
+    fn build(self) -> Leaf<'w, WriterPage<'w>> {
         let n = header::get_num_keys(&self.page);
         assert!(
             self.i == n,
@@ -389,13 +389,13 @@ where
 }
 
 /// A key-value iterator for a leaf node.
-pub struct LeafIterator<'l, 'w, P: ReadOnlyPage<'w>> {
+pub struct LeafIterator<'l, 'w, P: ImmutablePage<'w>> {
     node: &'l Leaf<'w, P>,
     i: usize,
     n: usize,
 }
 
-impl<'w, P: ReadOnlyPage<'w>> Iterator for LeafIterator<'_, 'w, P> {
+impl<'w, P: ImmutablePage<'w>> Iterator for LeafIterator<'_, 'w, P> {
     type Item = (&'w [u8], &'w [u8]);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -410,7 +410,7 @@ impl<'w, P: ReadOnlyPage<'w>> Iterator for LeafIterator<'_, 'w, P> {
 
 /// A key-value iterator for a leaf node that has inserted a new key-value.
 struct InsertIterator<'l, 'w> {
-    leaf_itr: Peekable<LeafIterator<'l, 'w, Page<'w>>>,
+    leaf_itr: Peekable<LeafIterator<'l, 'w, WriterPage<'w>>>,
     key: &'w [u8],
     val: &'w [u8],
     added: bool,
@@ -441,7 +441,7 @@ impl<'w> Iterator for InsertIterator<'_, 'w> {
 
 /// A key-value iterator for a leaf node that has updated a key-value.
 struct UpdateIterator<'l, 'w> {
-    leaf_itr: Peekable<LeafIterator<'l, 'w, Page<'w>>>,
+    leaf_itr: Peekable<LeafIterator<'l, 'w, WriterPage<'w>>>,
     key: &'w [u8],
     val: &'w [u8],
     skip: bool,
@@ -469,7 +469,7 @@ impl<'w> Iterator for UpdateIterator<'_, 'w> {
 }
 
 /// Gets the `i`th key in a leaf page buffer.
-fn get_key<'g, P: ReadOnlyPage<'g>>(page: &P, i: usize) -> &'g [u8] {
+fn get_key<'g, P: ImmutablePage<'g>>(page: &P, i: usize) -> &'g [u8] {
     let offset = get_offset(page, i);
     let num_keys = header::get_num_keys(page);
     let key_len = u16::from_le_bytes([
@@ -478,7 +478,7 @@ fn get_key<'g, P: ReadOnlyPage<'g>>(page: &P, i: usize) -> &'g [u8] {
     ]) as usize;
     let key = &page[4 + num_keys * 2 + offset + 4..4 + num_keys * 2 + offset + 4 + key_len];
     // Safety: key borrows from page,
-    // which itself borrows from a Reader/Writer (with lifetime 'a),
+    // which itself borrows from a Reader/Writer (with lifetime 'g),
     // which itself has a reference to a Store,
     // which itself is modeled as a slice of bytes.
     // So long as the reader/writer is alive,
@@ -486,12 +486,12 @@ fn get_key<'g, P: ReadOnlyPage<'g>>(page: &P, i: usize) -> &'g [u8] {
     // meaning the underlying slice of bytes cannot either.
     // Thus, casting the borrow lifetime from 'l
     // (the lifetime of leaf node)
-    // to 'a (the lifetime of the reader/writer) is safe.
+    // to 'g (the lifetime of the reader/writer) is safe.
     unsafe { std::slice::from_raw_parts(key.as_ptr(), key.len()) }
 }
 
 /// Gets the `i`th value in a leaf page buffer.
-fn get_value<'g, P: ReadOnlyPage<'g>>(page: &P, i: usize) -> &'g [u8] {
+fn get_value<'g, P: ImmutablePage<'g>>(page: &P, i: usize) -> &'g [u8] {
     let offset = get_offset(page, i);
     let num_keys = header::get_num_keys(page);
     let key_len = u16::from_le_bytes([
@@ -505,7 +505,7 @@ fn get_value<'g, P: ReadOnlyPage<'g>>(page: &P, i: usize) -> &'g [u8] {
     let val = &page[4 + num_keys * 2 + offset + 4 + key_len
         ..4 + num_keys * 2 + offset + 4 + key_len + val_len];
     // Safety: val borrows from page,
-    // which itself borrows from a Reader/Writer (with lifetime 'a),
+    // which itself borrows from a Reader/Writer (with lifetime 'g),
     // which itself has a reference to a Store,
     // which itself is modeled as a slice of bytes.
     // So long as the reader/writer is alive,
@@ -513,7 +513,7 @@ fn get_value<'g, P: ReadOnlyPage<'g>>(page: &P, i: usize) -> &'g [u8] {
     // meaning the underlying slice of bytes cannot either.
     // Thus, casting the borrow lifetime from 'l
     // (the lifetime of leaf node)
-    // to 'a (the lifetime of the reader/writer) is safe.
+    // to 'g (the lifetime of the reader/writer) is safe.
     unsafe { std::slice::from_raw_parts(val.as_ptr(), val.len()) }
 }
 

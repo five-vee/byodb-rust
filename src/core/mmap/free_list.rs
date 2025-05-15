@@ -30,14 +30,11 @@
 //!   from scratch, thus reclaiming garbage introduced in an uncommitted
 //!   write transaction prior to crashing.
 
-use std::{
-    marker::PhantomData,
-    ops::{Deref, DerefMut},
-};
+use std::ops::{Deref, DerefMut};
 
-use crate::core::{consts, mmap::Page};
+use crate::core::{consts, mmap::WriterPage};
 
-use super::{meta_node::MetaNode, Guard as _, ReadOnlyPage as _, Writer};
+use super::{Guard as _, ImmutablePage as _, Writer, meta_node::MetaNode};
 
 pub(crate) const FREE_LIST_CAP: usize = (consts::PAGE_SIZE - 8) / 8;
 const INVALID_NEXT: usize = usize::MAX;
@@ -67,7 +64,7 @@ impl FreeList {
         // add it to the tail node
         // Safety: tail_page points to a page that is guaranteed to never
         // have any concurrent readers accessing it.
-        let mut node: ListNode<'_, _> = unsafe { writer.overwrite_page(self.tail_page) }.into();
+        let mut node: ListNode<_> = unsafe { writer.overwrite_page(self.tail_page) }.into();
         node.set_pointer(seq_to_index(self.tail_seq), ptr);
         self.tail_seq += 1;
 
@@ -114,7 +111,7 @@ impl FreeList {
             return (None, None); // cannot advance
         }
         // Safety: &mut self ensures exclusive access to the head list node page.
-        let node: ListNode<'_, _> = unsafe { writer.read_page(self.head_page) }.into();
+        let node: ListNode<_> = unsafe { writer.read_page(self.head_page) }.into();
         let ptr = node.get_pointer(seq_to_index(self.head_seq));
         self.head_seq += 1;
 
@@ -159,12 +156,11 @@ fn seq_to_index(seq: usize) -> usize {
 
 /// A linked list node representing free pages that can be used to
 /// store B+ tree nodes.
-struct ListNode<'a, P: Deref<Target = [u8]>> {
-    _phantom: PhantomData<&'a ()>,
+struct ListNode<P: Deref<Target = [u8]>> {
     page: P,
 }
 
-impl<P: Deref<Target = [u8]>> ListNode<'_, P> {
+impl<P: Deref<Target = [u8]>> ListNode<P> {
     /// Gets the page num of the next linked list node.
     fn get_next(&self) -> usize {
         usize::from_le_bytes([
@@ -194,16 +190,13 @@ impl<P: Deref<Target = [u8]>> ListNode<'_, P> {
     }
 }
 
-impl<'w> From<Page<'w>> for ListNode<'w, Page<'w>> {
-    fn from(page: Page<'w>) -> Self {
-        ListNode {
-            _phantom: PhantomData,
-            page,
-        }
+impl<'w> From<WriterPage<'w>> for ListNode<WriterPage<'w>> {
+    fn from(page: WriterPage<'w>) -> Self {
+        ListNode { page }
     }
 }
 
-impl<P: DerefMut<Target = [u8]>> ListNode<'_, P> {
+impl<P: DerefMut<Target = [u8]>> ListNode<P> {
     /// Sets the next pointer.
     fn set_next(&mut self, next: usize) {
         self.page[0..8].copy_from_slice(&next.to_le_bytes());
@@ -217,9 +210,6 @@ impl<P: DerefMut<Target = [u8]>> ListNode<'_, P> {
 
 /// Writes into page to initialize it as an empty list node.
 pub fn init_empty_list_node(page: &mut [u8]) {
-    let mut ln = ListNode {
-        _phantom: PhantomData,
-        page,
-    };
+    let mut ln = ListNode { page };
     ln.set_next(INVALID_NEXT);
 }
