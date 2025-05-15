@@ -645,6 +645,11 @@ impl Drop for Writer<'_> {
     }
 }
 
+// Safety: This is needed b/c `prev_root_page` is `*mut usize`. Fortunately,
+// this pointer isn't self referential, and it is never mutated.
+unsafe impl Send for Writer<'_> {}
+unsafe impl Sync for Writer<'_> {}
+
 /// A container to be passed to [`seize::LocalGuard::defer_retire`]
 /// so that its underlying garbage can be collected.
 struct Reclaimable {

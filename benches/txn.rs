@@ -1,3 +1,5 @@
+use std::{rc::Rc, sync::Arc};
+
 use anyhow::{Context, Result};
 use divan::{Bencher, black_box};
 use rand::{
@@ -73,7 +75,7 @@ impl Iterator for Seeder {
 }
 
 #[divan::bench(threads = [1, 2, 4], args = [1000, 4000, 10000, 40000])]
-fn bench_reader(b: Bencher, n: usize) {
+fn bench_readers(b: Bencher, n: usize) {
     let (db, _temp_file) = new_test_db();
     Seeder::new(n, DEFAULT_SEED).seed_db(&db).unwrap();
     b.counter(n).bench({
@@ -84,4 +86,47 @@ fn bench_reader(b: Bencher, n: usize) {
             }
         }
     });
+}
+
+#[divan::bench(threads = [1, 2, 4], args = [1000, 4000, 10000, 40000])]
+fn bench_writer_and_readers(b: Bencher, n: usize) {
+    // Setup.
+    let (db, _temp_file) = new_test_db();
+    let db = Arc::new(db);
+    Seeder::new(n, DEFAULT_SEED).seed_db(&db).unwrap();
+
+    // Have a background rw txn aimlessly spinning.
+    use std::sync::mpsc::{self, Receiver, Sender};
+    use std::thread;
+    let (sender, receiver): (Sender<()>, Receiver<()>) = mpsc::channel();
+    let background_thread = thread::spawn({
+        let db = db.clone();
+        move || {
+            let mut t = db.rw_txn();
+            // Get one key.
+            let (k, _) = t.in_order_iter().next().unwrap();
+            let k: Rc<[u8]> = k.into();
+            let dummy_val = [1u8; 100];
+            // Mindlessly do some busy work until termination.
+            while receiver.try_recv().is_err() {
+                t.update(&k, &dummy_val).unwrap();
+            }
+            t.abort();
+        }
+    });
+
+    // Run the readers.
+    b.counter(n).bench({
+        let db = db.clone();
+        move || {
+            let t = db.r_txn();
+            for (k, v) in t.in_order_iter() {
+                let (_k, _v) = (black_box(k), black_box(v));
+            }
+        }
+    });
+
+    // Cleanup.
+    sender.send(()).unwrap();
+    background_thread.join().unwrap();
 }
