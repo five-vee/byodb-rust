@@ -101,7 +101,7 @@ mod leaf;
 use std::rc::Rc;
 
 use crate::core::error::NodeError;
-use crate::core::mmap::{Guard, WriterPage, ImmutablePage, Writer};
+use crate::core::mmap::{Guard, ImmutablePage, Writer, WriterPage};
 use crate::core::{consts, header};
 use header::NodeType;
 pub(crate) use internal::ChildEntry;
@@ -163,23 +163,23 @@ impl<'g, P: ImmutablePage<'g>> Node<'g, P> {
 }
 
 /// An enum representing the effect of a node operation.
-pub enum NodeEffect<'g> {
+pub enum NodeEffect<'w, 's> {
     /// A node without 0 keys after a delete was performed on it.
     /// This is a special-case of `Underflow` done to avoid unnecessary
     /// page allocations, since empty non-root nodes aren't allowed.
     Empty,
     /// A newly created node that remained  "intact", i.e. it did not split.
-    Intact(Node<'g, WriterPage<'g>>),
+    Intact(Node<'w, WriterPage<'w, 's>>),
     /// The left and right splits of a node that was created.
     ///
     /// The left and right nodes are the same type.
     Split {
-        left: Node<'g, WriterPage<'g>>,
-        right: Node<'g, WriterPage<'g>>,
+        left: Node<'w, WriterPage<'w, 's>>,
+        right: Node<'w, WriterPage<'w, 's>>,
     },
 }
 
-impl NodeEffect<'_> {
+impl NodeEffect<'_, '_> {
     /// Converts the node(s) created during an operation into child
     /// entries of a B+ tree internal node.
     ///
@@ -209,9 +209,9 @@ impl NodeEffect<'_> {
     }
 }
 
-impl<'w> From<LeafEffect<'w>> for NodeEffect<'w> {
-    fn from(value: LeafEffect<'w>) -> Self {
-        match value {
+impl<'w, 's> From<LeafEffect<'w, 's>> for NodeEffect<'w, 's> {
+    fn from(effect: LeafEffect<'w, 's>) -> Self {
+        match effect {
             LeafEffect::Empty => NodeEffect::Empty,
             LeafEffect::Intact(leaf) => NodeEffect::Intact(Node::Leaf(leaf)),
             LeafEffect::Split { left, right } => NodeEffect::Split {
@@ -222,9 +222,9 @@ impl<'w> From<LeafEffect<'w>> for NodeEffect<'w> {
     }
 }
 
-impl<'w> From<InternalEffect<'w>> for NodeEffect<'w> {
-    fn from(value: InternalEffect<'w>) -> Self {
-        match value {
+impl<'w, 's> From<InternalEffect<'w, 's>> for NodeEffect<'w, 's> {
+    fn from(effect: InternalEffect<'w, 's>) -> Self {
+        match effect {
             InternalEffect::Intact(internal) => NodeEffect::Intact(Node::Internal(internal)),
             InternalEffect::Split { left, right } => NodeEffect::Split {
                 left: Node::Internal(left),
@@ -251,7 +251,7 @@ pub enum Sufficiency {
 }
 
 // Returns how sufficient a node is.
-pub fn sufficiency<'w>(n: &Node<'w, WriterPage<'w>>) -> Sufficiency {
+pub fn sufficiency(n: &Node<'_, WriterPage<'_, '_>>) -> Sufficiency {
     match n.get_num_keys() {
         0 => Sufficiency::Empty,
         1 => Sufficiency::Underflow,
@@ -262,11 +262,11 @@ pub fn sufficiency<'w>(n: &Node<'w, WriterPage<'w>>) -> Sufficiency {
 /// Merges `left` and `right` into a possibly-overflowed node and splits if
 /// needed. This is modeled as a Deletion b/c it is (so far) only useful in the
 /// context of deletion.
-pub fn steal_or_merge<'w>(
-    left: Node<'w, WriterPage<'w>>,
-    right: Node<'w, WriterPage<'w>>,
-    writer: &'w Writer,
-) -> NodeEffect<'w> {
+pub fn steal_or_merge<'w, 's>(
+    left: Node<'w, WriterPage<'w, 's>>,
+    right: Node<'w, WriterPage<'w, 's>>,
+    writer: &'w Writer<'s>,
+) -> NodeEffect<'w, 's> {
     match (left, right) {
         (Node::Leaf(left), Node::Leaf(right)) => Leaf::steal_or_merge(left, right, writer).into(),
         (Node::Internal(left), Node::Internal(right)) => {
@@ -279,7 +279,11 @@ pub fn steal_or_merge<'w>(
 /// Checks whether `to` can steal a key from `from`.
 /// `steal_end` determines whether to steal the end key of `from`,
 /// otherwise the beginning key.
-pub fn can_steal<'w>(from: &Node<'w, WriterPage<'w>>, to: &Node<'w, WriterPage<'w>>, steal_end: bool) -> bool {
+pub fn can_steal(
+    from: &Node<'_, WriterPage<'_, '_>>,
+    to: &Node<'_, WriterPage<'_, '_>>,
+    steal_end: bool,
+) -> bool {
     if from.get_num_keys() <= 2 {
         return false;
     }
@@ -301,6 +305,9 @@ pub fn can_steal<'w>(from: &Node<'w, WriterPage<'w>>, to: &Node<'w, WriterPage<'
 }
 
 /// Checks whether the merging of `left` and `right` doesn't overflow.
-pub fn can_merge<'w>(left: &Node<'w, WriterPage<'w>>, right: &Node<'w, WriterPage<'w>>) -> bool {
+pub fn can_merge(
+    left: &Node<'_, WriterPage<'_, '_>>,
+    right: &Node<'_, WriterPage<'_, '_>>,
+) -> bool {
     left.get_num_bytes() + right.get_num_bytes() - 4 < consts::PAGE_SIZE
 }

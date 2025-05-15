@@ -190,8 +190,8 @@ impl<P: Deref<Target = [u8]>> ListNode<P> {
     }
 }
 
-impl<'w> From<WriterPage<'w>> for ListNode<WriterPage<'w>> {
-    fn from(page: WriterPage<'w>) -> Self {
+impl<'w, 's> From<WriterPage<'w, 's>> for ListNode<WriterPage<'w, 's>> {
+    fn from(page: WriterPage<'w, 's>) -> Self {
         ListNode { page }
     }
 }

@@ -74,10 +74,10 @@ impl<'g, P: ImmutablePage<'g>> Internal<'g, P> {
     }
 }
 
-impl<'w> Internal<'w, WriterPage<'w>> {
+impl<'w, 's> Internal<'w, WriterPage<'w, 's>> {
     /// Creates an internal node that is the parent of two splits.
     pub fn parent_of_split(
-        writer: &'w Writer,
+        writer: &'w Writer<'s>,
         keys: [&[u8]; 2],
         child_pointers: [usize; 2],
     ) -> Self {
@@ -90,9 +90,9 @@ impl<'w> Internal<'w, WriterPage<'w>> {
     /// Merges child entries into the internal node.
     pub fn merge_child_entries(
         self,
-        writer: &'w Writer,
+        writer: &'w Writer<'s>,
         entries: &[ChildEntry],
-    ) -> InternalEffect<'w> {
+    ) -> InternalEffect<'w, 's> {
         let delta_keys = entries
             .iter()
             .map(|ce| match ce {
@@ -120,10 +120,10 @@ impl<'w> Internal<'w, WriterPage<'w>> {
     /// Resolves underflow of either `left` or `right` by either having one
     /// steal from the other, or merging the two.
     pub fn steal_or_merge(
-        left: Internal<'w, WriterPage<'w>>,
-        right: Internal<'w, WriterPage<'w>>,
-        writer: &'w Writer,
-    ) -> InternalEffect<'w> {
+        left: Internal<'w, WriterPage<'w, 's>>,
+        right: Internal<'w, WriterPage<'w, 's>>,
+        writer: &'w Writer<'s>,
+    ) -> InternalEffect<'w, 's> {
         let itr_func = || left.iter().chain(right.iter());
         let num_keys = left.get_num_keys() + right.get_num_keys();
         let effect = if left.get_num_bytes() + right.get_num_bytes() - 4 > consts::PAGE_SIZE {
@@ -144,7 +144,7 @@ impl<'w> Internal<'w, WriterPage<'w>> {
     fn merge_iter<'i>(
         &'i self,
         entries: &'w [ChildEntry],
-    ) -> MergeIterator<'w, InternalIterator<'i, 'w, WriterPage<'w>>, std::slice::Iter<'w, ChildEntry>>
+    ) -> MergeIterator<'w, InternalIterator<'i, 'w, WriterPage<'w, 's>>, std::slice::Iter<'w, ChildEntry>>
     {
         MergeIterator {
             node_iter: self.iter().enumerate().peekable(),
@@ -155,11 +155,11 @@ impl<'w> Internal<'w, WriterPage<'w>> {
     /// Builds an [`InternalEffect`], then frees self back to the store.
     fn build_then_free<'i, I, F>(
         &'i self,
-        writer: &'w Writer,
+        writer: &'w Writer<'s>,
         itr_func: F,
         num_keys: usize,
         overflow: bool,
-    ) -> InternalEffect<'w>
+    ) -> InternalEffect<'w, 's>
     where
         I: Iterator<Item = (&'i [u8], usize)>,
         F: Fn() -> I,
@@ -175,20 +175,20 @@ impl<'w> Internal<'w, WriterPage<'w>> {
 }
 
 /// An enum representing the effect of an internal node operation.
-pub enum InternalEffect<'w> {
+pub enum InternalEffect<'w, 's> {
     /// A newly created internal node that remained  "intact",
     /// i.e. it did not split.
-    Intact(Internal<'w, WriterPage<'w>>),
+    Intact(Internal<'w, WriterPage<'w, 's>>),
     /// The left and right splits of an internal node that was created.
     Split {
-        left: Internal<'w, WriterPage<'w>>,
-        right: Internal<'w, WriterPage<'w>>,
+        left: Internal<'w, WriterPage<'w, 's>>,
+        right: Internal<'w, WriterPage<'w, 's>>,
     },
 }
 
-impl<'w> InternalEffect<'w> {
+impl<'w, 's> InternalEffect<'w, 's> {
     #[allow(dead_code)]
-    fn take_intact(self) -> Internal<'w, WriterPage<'w>> {
+    fn take_intact(self) -> Internal<'w, WriterPage<'w, 's>> {
         match self {
             InternalEffect::Intact(internal) => internal,
             _ => panic!("is not InternalEffect::Intact"),
@@ -196,7 +196,7 @@ impl<'w> InternalEffect<'w> {
     }
 
     #[allow(dead_code)]
-    fn take_split(self) -> (Internal<'w, WriterPage<'w>>, Internal<'w, WriterPage<'w>>) {
+    fn take_split(self) -> (Internal<'w, WriterPage<'w, 's>>, Internal<'w, WriterPage<'w, 's>>) {
         match self {
             InternalEffect::Split { left, right } => (left, right),
             _ => panic!("is not InternalEffect::Split"),
@@ -222,14 +222,14 @@ pub enum ChildEntry {
 }
 
 // A builder of a B+ tree internal node.
-struct Builder<'w> {
+struct Builder<'w, 's> {
     i: usize,
-    page: WriterPage<'w>,
+    page: WriterPage<'w, 's>,
 }
 
-impl<'w> Builder<'w> {
+impl<'w, 's> Builder<'w, 's> {
     /// Creates a new internal node builder.
-    fn new(writer: &'w Writer, num_keys: usize) -> Self {
+    fn new(writer: &'w Writer<'s>, num_keys: usize) -> Self {
         let mut page = writer.new_page();
         header::set_node_type(&mut page, NodeType::Internal);
         header::set_num_keys(&mut page, num_keys);
@@ -264,7 +264,7 @@ impl<'w> Builder<'w> {
     }
 
     /// Builds an internal node.
-    fn build(self) -> Internal<'w, WriterPage<'w>> {
+    fn build(self) -> Internal<'w, WriterPage<'w, 's>> {
         let n = header::get_num_keys(&self.page);
         assert!(
             self.i == n,
@@ -304,7 +304,7 @@ where
 }
 
 /// Builds a new internal node from the provided iterator of child entries.
-fn build<'i, 'w, I>(writer: &'w Writer, itr: I, num_keys: usize) -> InternalEffect<'w>
+fn build<'i, 'w, 's, I>(writer: &'w Writer<'s>, itr: I, num_keys: usize) -> InternalEffect<'w, 's>
 where
     I: Iterator<Item = (&'i [u8], usize)>,
 {
@@ -317,11 +317,11 @@ where
 
 /// Builds two internal nodes by finding the split point from the provided iterator of
 /// child entries.
-fn build_split<'i, 'w, I, F>(
-    writer: &'w Writer,
+fn build_split<'i, 'w, 's, I, F>(
+    writer: &'w Writer<'s>,
     itr_func: &F,
     num_keys: usize,
-) -> InternalEffect<'w>
+) -> InternalEffect<'w, 's>
 where
     I: Iterator<Item = (&'i [u8], usize)>,
     F: Fn() -> I,

@@ -7,7 +7,7 @@ use std::marker::PhantomData;
 
 use crate::core::consts;
 use crate::core::error::NodeError;
-use crate::core::mmap::{Guard, WriterPage, ImmutablePage, Writer};
+use crate::core::mmap::{Guard, ImmutablePage, Writer, WriterPage};
 
 use super::header::{self, NodeType};
 
@@ -71,9 +71,14 @@ impl<'g, P: ImmutablePage<'g>> Leaf<'g, P> {
     }
 }
 
-impl<'w> Leaf<'w, WriterPage<'w>> {
+impl<'w, 's> Leaf<'w, WriterPage<'w, 's>> {
     /// Inserts a key-value pair.
-    pub fn insert(self, writer: &'w Writer, key: &[u8], val: &[u8]) -> Result<LeafEffect<'w>> {
+    pub fn insert(
+        self,
+        writer: &'w Writer<'s>,
+        key: &[u8],
+        val: &[u8],
+    ) -> Result<LeafEffect<'w, 's>> {
         if key.len() > consts::MAX_KEY_SIZE {
             return Err(NodeError::MaxKeySize(key.len()));
         }
@@ -90,7 +95,12 @@ impl<'w> Leaf<'w, WriterPage<'w>> {
     }
 
     /// Updates the value corresponding to a key.
-    pub fn update(self, writer: &'w Writer, key: &[u8], val: &[u8]) -> Result<LeafEffect<'w>> {
+    pub fn update(
+        self,
+        writer: &'w Writer<'s>,
+        key: &[u8],
+        val: &[u8],
+    ) -> Result<LeafEffect<'w, 's>> {
         if key.len() > consts::MAX_KEY_SIZE {
             return Err(NodeError::MaxKeySize(key.len()));
         }
@@ -109,7 +119,7 @@ impl<'w> Leaf<'w, WriterPage<'w>> {
     }
 
     /// Deletes a key and its corresponding value.
-    pub fn delete(self, writer: &'w Writer, key: &[u8]) -> Result<LeafEffect<'w>> {
+    pub fn delete(self, writer: &'w Writer<'s>, key: &[u8]) -> Result<LeafEffect<'w, 's>> {
         let page_num = self.page_num();
         let effect = self.delete_inner(writer, key);
         if effect.is_ok() {
@@ -119,7 +129,7 @@ impl<'w> Leaf<'w, WriterPage<'w>> {
         effect
     }
 
-    fn delete_inner(self, writer: &'w Writer, key: &[u8]) -> Result<LeafEffect<'w>> {
+    fn delete_inner(self, writer: &'w Writer<'s>, key: &[u8]) -> Result<LeafEffect<'w, 's>> {
         if key.len() > consts::MAX_KEY_SIZE {
             return Err(NodeError::MaxKeySize(key.len()));
         }
@@ -147,10 +157,10 @@ impl<'w> Leaf<'w, WriterPage<'w>> {
     /// Creates the leaf (or leaves) resulting from either `left` stealing from
     /// `right`, or `left` merging with `right`.
     pub fn steal_or_merge(
-        left: Leaf<'w, WriterPage<'w>>,
-        right: Leaf<'w, WriterPage<'w>>,
-        writer: &'w Writer,
-    ) -> LeafEffect<'w> {
+        left: Leaf<'w, WriterPage<'w, '_>>,
+        right: Leaf<'w, WriterPage<'w, '_>>,
+        writer: &'w Writer<'s>,
+    ) -> LeafEffect<'w, 's> {
         let itr_func = || left.iter().chain(right.iter());
         let num_keys = left.get_num_keys() + right.get_num_keys();
         let overflow = left.get_num_bytes() + right.get_num_bytes() - 4 > consts::PAGE_SIZE;
@@ -169,7 +179,7 @@ impl<'w> Leaf<'w, WriterPage<'w>> {
     }
 
     /// Returns a key-value insert-iterator of the leaf.
-    fn insert_iter<'l>(&'l self, key: &'w [u8], val: &'w [u8]) -> InsertIterator<'l, 'w> {
+    fn insert_iter<'l>(&'l self, key: &'w [u8], val: &'w [u8]) -> InsertIterator<'l, 'w, 's> {
         InsertIterator {
             leaf_itr: self.iter().peekable(),
             key,
@@ -179,7 +189,7 @@ impl<'w> Leaf<'w, WriterPage<'w>> {
     }
 
     /// Returns a key-value update-iterator of the leaf.
-    fn update_iter<'l>(&'l self, key: &'w [u8], val: &'w [u8]) -> UpdateIterator<'l, 'w> {
+    fn update_iter<'l>(&'l self, key: &'w [u8], val: &'w [u8]) -> UpdateIterator<'l, 'w, 's> {
         UpdateIterator {
             leaf_itr: self.iter().peekable(),
             key,
@@ -191,11 +201,11 @@ impl<'w> Leaf<'w, WriterPage<'w>> {
     /// Builds an [`LeafEffect`], then frees self back to the store.
     fn build_then_free<'l, I, F>(
         &'l self,
-        writer: &'w Writer,
+        writer: &'w Writer<'s>,
         itr_func: F,
         num_keys: usize,
         overflow: bool,
-    ) -> LeafEffect<'w>
+    ) -> LeafEffect<'w, 's>
     where
         I: Iterator<Item = (&'l [u8], &'l [u8])>,
         F: Fn() -> I,
@@ -211,24 +221,24 @@ impl<'w> Leaf<'w, WriterPage<'w>> {
 }
 
 /// An enum representing the effect of a leaf node operation.
-pub enum LeafEffect<'w> {
+pub enum LeafEffect<'w, 's> {
     /// A leaf with 0 keys after a delete was performed on it.
     /// This is a special-case of [`super::Sufficiency::Underflow`] done to
     /// avoid unnecessary page allocations, since empty non-root nodes aren't
     /// allowed.
     Empty,
     /// A newly created leaf that remained  "intact", i.e. it did not split.
-    Intact(Leaf<'w, WriterPage<'w>>),
+    Intact(Leaf<'w, WriterPage<'w, 's>>),
     /// The `left` and `right` splits of a leaf that was created.
     Split {
-        left: Leaf<'w, WriterPage<'w>>,
-        right: Leaf<'w, WriterPage<'w>>,
+        left: Leaf<'w, WriterPage<'w, 's>>,
+        right: Leaf<'w, WriterPage<'w, 's>>,
     },
 }
 
-impl<'w> LeafEffect<'w> {
+impl<'w, 's> LeafEffect<'w, 's> {
     #[allow(dead_code)]
-    fn take_intact(self) -> Leaf<'w, WriterPage<'w>> {
+    fn take_intact(self) -> Leaf<'w, WriterPage<'w, 's>> {
         match self {
             LeafEffect::Intact(leaf) => leaf,
             _ => panic!("is not LeafEffect::Intact"),
@@ -236,7 +246,7 @@ impl<'w> LeafEffect<'w> {
     }
 
     #[allow(dead_code)]
-    fn take_split(self) -> (Leaf<'w, WriterPage<'w>>, Leaf<'w, WriterPage<'w>>) {
+    fn take_split(self) -> (Leaf<'w, WriterPage<'w, 's>>, Leaf<'w, WriterPage<'w, 's>>) {
         match self {
             LeafEffect::Split { left, right } => (left, right),
             _ => panic!("is not LeafEffect::Split"),
@@ -245,14 +255,14 @@ impl<'w> LeafEffect<'w> {
 }
 
 // A builder of a B+ tree leaf node.
-struct Builder<'w> {
+struct Builder<'w, 's> {
     i: usize,
-    page: WriterPage<'w>,
+    page: WriterPage<'w, 's>,
 }
 
-impl<'w> Builder<'w> {
+impl<'w, 's> Builder<'w, 's> {
     /// Creates a new leaf builder.
-    fn new(writer: &'w Writer, num_keys: usize) -> Self {
+    fn new(writer: &'w Writer<'s>, num_keys: usize) -> Self {
         let mut page = writer.new_page();
         header::set_node_type(&mut page, NodeType::Leaf);
         header::set_num_keys(&mut page, num_keys);
@@ -290,7 +300,7 @@ impl<'w> Builder<'w> {
     }
 
     /// Builds a leaf.
-    fn build(self) -> Leaf<'w, WriterPage<'w>> {
+    fn build(self) -> Leaf<'w, WriterPage<'w, 's>> {
         let n = header::get_num_keys(&self.page);
         assert!(
             self.i == n,
@@ -352,7 +362,7 @@ where
 }
 
 /// Builds a new leaf from the provided iterator of key-value pairs.
-fn build<'l, 'w, I>(writer: &'w Writer, itr: I, num_keys: usize) -> LeafEffect<'w>
+fn build<'l, 'w, 's, I>(writer: &'w Writer<'s>, itr: I, num_keys: usize) -> LeafEffect<'w, 's>
 where
     I: Iterator<Item = (&'l [u8], &'l [u8])>,
 {
@@ -365,7 +375,11 @@ where
 
 /// Builds two leaves by finding the split point from the provided iterator of
 /// key-value pairs.
-fn build_split<'l, 'w, I, F>(writer: &'w Writer, itr_func: &F, num_keys: usize) -> LeafEffect<'w>
+fn build_split<'l, 'w, 's, I, F>(
+    writer: &'w Writer<'s>,
+    itr_func: &F,
+    num_keys: usize,
+) -> LeafEffect<'w, 's>
 where
     I: Iterator<Item = (&'l [u8], &'l [u8])>,
     F: Fn() -> I,
@@ -409,14 +423,14 @@ impl<'w, P: ImmutablePage<'w>> Iterator for LeafIterator<'_, 'w, P> {
 }
 
 /// A key-value iterator for a leaf node that has inserted a new key-value.
-struct InsertIterator<'l, 'w> {
-    leaf_itr: Peekable<LeafIterator<'l, 'w, WriterPage<'w>>>,
+struct InsertIterator<'l, 'w, 's> {
+    leaf_itr: Peekable<LeafIterator<'l, 'w, WriterPage<'w, 's>>>,
     key: &'w [u8],
     val: &'w [u8],
     added: bool,
 }
 
-impl<'w> Iterator for InsertIterator<'_, 'w> {
+impl<'w> Iterator for InsertIterator<'_, 'w, '_> {
     type Item = (&'w [u8], &'w [u8]);
     fn next(&mut self) -> Option<Self::Item> {
         if self.added {
@@ -440,14 +454,14 @@ impl<'w> Iterator for InsertIterator<'_, 'w> {
 }
 
 /// A key-value iterator for a leaf node that has updated a key-value.
-struct UpdateIterator<'l, 'w> {
-    leaf_itr: Peekable<LeafIterator<'l, 'w, WriterPage<'w>>>,
+struct UpdateIterator<'l, 'w, 's> {
+    leaf_itr: Peekable<LeafIterator<'l, 'w, WriterPage<'w, 's>>>,
     key: &'w [u8],
     val: &'w [u8],
     skip: bool,
 }
 
-impl<'w> Iterator for UpdateIterator<'_, 'w> {
+impl<'w> Iterator for UpdateIterator<'_, 'w, '_> {
     type Item = (&'w [u8], &'w [u8]);
     fn next(&mut self) -> Option<Self::Item> {
         match self.leaf_itr.peek() {

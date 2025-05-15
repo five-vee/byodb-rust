@@ -21,7 +21,7 @@ use crate::core::{
 pub type Result<T> = std::result::Result<T, TxnError>;
 /// A read-write transaction. It must live as long as the [`DB`] that created
 /// it (via [`DB::rw_txn`]).
-pub type RWTxn<'t, 'd> = Txn<'t, WriterPage<'t>, Writer<'d>>;
+pub type RWTxn<'t, 'd> = Txn<'t, WriterPage<'t, 'd>, Writer<'d>>;
 /// A read-only transaction. It must live as long as the [`DB`] that created
 /// it (via [`DB::r_txn`]).
 pub type RTxn<'t, 'd> = Txn<'t, ReaderPage<'t>, Reader<'d>>;
@@ -202,7 +202,7 @@ impl<'g, P: ImmutablePage<'g>, G: Guard<'g, P>> Txn<'g, P, G> {
     }
 }
 
-impl<'w> Txn<'w, WriterPage<'w>, Writer<'_>> {
+impl<'t, 'd> Txn<'t, WriterPage<'t, 'd>, Writer<'d>> {
     /// Inserts a new key-value pair into the database.
     ///
     /// # Parameters

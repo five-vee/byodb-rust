@@ -80,7 +80,6 @@ use std::{
     cmp::max,
     fs::{File, OpenOptions},
     io::{Seek, Write as _},
-    marker::PhantomData,
     ops::{Deref, DerefMut},
     path::Path,
     rc::Rc,
@@ -450,7 +449,6 @@ impl<'r> Guard<'r, ReaderPage<'r>> for Reader<'_> {
             guard.flush_offset / consts::PAGE_SIZE
         );
         ReaderPage {
-            _phantom: PhantomData,
             // Safety: The Arc cannot be dropped as long as Reader lives
             // (due to the ArcSwapGuard).
             mmap: unsafe {
@@ -486,9 +484,9 @@ pub struct Writer<'s> {
     collector_guard: LocalGuard<'s>,
 }
 
-impl Writer<'_> {
+impl<'s> Writer<'s> {
     /// Allocates a new page for write.
-    pub fn new_page(&self) -> WriterPage<'_> {
+    pub fn new_page(&self) -> WriterPage<'_, 's> {
         let guard = &self.state_guard;
         // Try from the free list first.
         let mut fl = guard.borrow_mut().free_list;
@@ -501,8 +499,7 @@ impl Writer<'_> {
         });
         guard.borrow_mut().free_list = fl;
         WriterPage {
-            _phantom: PhantomData,
-            mmap: guard.borrow().mmap.clone(),
+            writer: self,
             page_num,
         }
     }
@@ -537,12 +534,11 @@ impl Writer<'_> {
     /// immutable. As such, please only use this on non-B+-tree pages,
     /// i.e. free list pages. Also, make sure there exists only one mutable
     /// reference at a time to the underlying page.
-    pub unsafe fn overwrite_page(&self, page_num: usize) -> WriterPage {
+    pub unsafe fn overwrite_page(&self, page_num: usize) -> WriterPage<'_, 's> {
         let guard = self.state_guard.borrow();
         assert!(page_num * consts::PAGE_SIZE < guard.new_offset);
         WriterPage {
-            _phantom: PhantomData,
-            mmap: guard.mmap.clone(),
+            writer: self,
             page_num,
         }
     }
@@ -575,8 +571,8 @@ impl Writer<'_> {
     }
 }
 
-impl<'w> Guard<'w, WriterPage<'w>> for Writer<'_> {
-    unsafe fn read_page(&self, page_num: usize) -> WriterPage<'_> {
+impl<'w, 's> Guard<'w, WriterPage<'w, 's>> for Writer<'s> {
+    unsafe fn read_page(&'w self, page_num: usize) -> WriterPage<'w, 's> {
         let borrow = self.state_guard.borrow();
         assert!(
             page_num * consts::PAGE_SIZE < borrow.new_offset,
@@ -585,8 +581,7 @@ impl<'w> Guard<'w, WriterPage<'w>> for Writer<'_> {
             borrow.new_offset / consts::PAGE_SIZE
         );
         WriterPage {
-            _phantom: PhantomData,
-            mmap: borrow.mmap.clone(),
+            writer: self,
             page_num,
         }
     }
@@ -670,7 +665,6 @@ pub trait ImmutablePage<'g>: Deref<Target = [u8]> {
 /// Only flushed pages are accessible by readers.
 /// This is also an implementation of [`ImmutablePage`] on the reader side.
 pub struct ReaderPage<'r> {
-    _phantom: PhantomData<&'r ()>,
     mmap: &'r Arc<UnsafeCell<Mmap>>,
     page_num: usize,
 }
@@ -704,50 +698,44 @@ impl ImmutablePage<'_> for ReaderPage<'_> {
 /// A page inside the mmap region that allows for reads and possibly writes.
 /// A page is not accessible to readers until flushed.
 /// This is also an implementation of [`ImmutablePage`] on the writer side.
-pub struct WriterPage<'w> {
-    _phantom: PhantomData<&'w ()>,
-    mmap: Arc<UnsafeCell<Mmap>>,
+pub struct WriterPage<'w, 's> {
+    writer: &'w Writer<'s>,
     page_num: usize,
 }
 
-impl<'w> WriterPage<'w> {
-    pub fn read_only(self) -> WriterPage<'w> {
+impl<'w, 's> WriterPage<'w, 's> {
+    pub fn read_only(self) -> WriterPage<'w, 's> {
         WriterPage {
-            _phantom: PhantomData,
-            mmap: self.mmap,
+            writer: self.writer,
             page_num: self.page_num,
         }
     }
 }
 
-impl Deref for WriterPage<'_> {
+impl Deref for WriterPage<'_, '_> {
     type Target = [u8];
     fn deref(&self) -> &Self::Target {
-        // Safety: [page_ptr, page_ptr + PAGE_SIZE) is a guaranteed valid region in the mmap.
-        // Due to the mutex guard in Writer, at most one mutable reference can
-        // touch this region at a time.
-        // page_ptr cannot dangle b/c the mmap is never dropped/realloc'ed so long as
-        // the writer mutex guard (&'w Writer<'s>) exists.
-        &unsafe { &*self.mmap.get() }.mmap[meta_node::META_PAGE_SIZE
+        let borrow = self.writer.state_guard.borrow();
+        // Safety: Due to the mutex guard in Writer, at most one mutable
+        // reference can touch this region at a time.
+        &unsafe { &*(borrow.mmap() as *const Mmap) }.mmap[meta_node::META_PAGE_SIZE
             + self.page_num * consts::PAGE_SIZE
             ..meta_node::META_PAGE_SIZE + (self.page_num + 1) * consts::PAGE_SIZE]
     }
 }
 
-impl DerefMut for WriterPage<'_> {
+impl DerefMut for WriterPage<'_, '_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        // Safety: [page_ptr, page_ptr + PAGE_SIZE) is a guaranteed valid region in the mmap.
-        // Due to the mutex guard in Writer, at most one mutable reference can
-        // touch this region at a time.
-        // page_ptr cannot dangle b/c the mmap is never dropped/realloc'ed so long as
-        // the writer mutex guard (&'w Writer<'s>) exists.
-        &mut unsafe { &mut *self.mmap.get() }.mmap[meta_node::META_PAGE_SIZE
+        let borrow_mut = self.writer.state_guard.borrow_mut();
+        // Safety: Due to the mutex guard in Writer, at most one mutable
+        // reference can touch this region at a time.
+        &mut unsafe { &mut *(borrow_mut.mmap_mut() as *mut Mmap) }.mmap[meta_node::META_PAGE_SIZE
             + self.page_num * consts::PAGE_SIZE
             ..meta_node::META_PAGE_SIZE + (self.page_num + 1) * consts::PAGE_SIZE]
     }
 }
 
-impl ImmutablePage<'_> for WriterPage<'_> {
+impl ImmutablePage<'_> for WriterPage<'_, '_> {
     fn page_num(&self) -> usize {
         self.page_num
     }
@@ -870,7 +858,6 @@ mod tests {
             &pattern1,
             "Writer should be able to read its own written (but not flushed) page"
         );
-        drop(read_page1); // Drop the read guard
 
         // 2. Test writer can read a flushed page.
         let pattern2 = [0xDD, 0xEE, 0xFF];
@@ -891,11 +878,9 @@ mod tests {
             &pattern2,
             "Writer should be able to read a flushed page"
         );
-        drop(read_page2);
 
         // 3. Test writer CANNOT read a newly allocated page that hasn't been written yet.
-        let page3 = writer.new_page();
-        drop(page3); // Drop the mutable page guard
+        let _page3 = writer.new_page();
     }
 
     #[test]

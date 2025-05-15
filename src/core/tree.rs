@@ -160,7 +160,7 @@ impl<'g, P: ImmutablePage<'g>, G: Guard<'g, P>> Tree<'g, P, G> {
     }
 }
 
-impl<'w> Tree<'w, WriterPage<'w>, Writer<'_>> {
+impl<'w, 's> Tree<'w, WriterPage<'w, 's>, Writer<'s>> {
     /// Inserts a key-value pair. The resulting tree won't be visible to
     /// readers until the writer is externally flushed.
     pub fn insert(self, key: &[u8], val: &[u8]) -> Result<Self> {
@@ -183,7 +183,7 @@ impl<'w> Tree<'w, WriterPage<'w>, Writer<'_>> {
     /// the resulting tree.
     ///
     /// This is a recursive implementation of `insert`.
-    fn insert_helper(self, key: &[u8], val: &[u8]) -> Result<NodeEffect<'w>> {
+    fn insert_helper(self, key: &[u8], val: &[u8]) -> Result<NodeEffect<'w, 's>> {
         match Self::read(self.guard, self.page_num) {
             // Base case
             Node::Leaf(leaf) => Ok(leaf.insert(self.guard, key, val)?.into()),
@@ -225,7 +225,7 @@ impl<'w> Tree<'w, WriterPage<'w>, Writer<'_>> {
     /// the resulting tree.
     ///
     /// This is a recursive implementation of `update`.
-    fn update_helper(self, key: &[u8], val: &[u8]) -> Result<NodeEffect<'w>> {
+    fn update_helper(self, key: &[u8], val: &[u8]) -> Result<NodeEffect<'w, 's>> {
         match Self::read(self.guard, self.page_num) {
             // Base case
             Node::Leaf(leaf) => Ok(leaf.update(self.guard, key, val)?.into()),
@@ -275,7 +275,7 @@ impl<'w> Tree<'w, WriterPage<'w>, Writer<'_>> {
     /// the resulting tree.
     ///
     /// This is a recursive implementation of `delete`.
-    fn delete_helper(self, key: &[u8]) -> Result<NodeEffect<'w>> {
+    fn delete_helper(self, key: &[u8]) -> Result<NodeEffect<'w, 's>> {
         match Self::read(self.guard, self.page_num) {
             // Base case
             Node::Leaf(leaf) => Ok(leaf.delete(self.guard, key)?.into()),
@@ -340,10 +340,10 @@ impl<'w> Tree<'w, WriterPage<'w>, Writer<'_>> {
     /// parent (internal) node.
     fn try_fix_underflow(
         &self,
-        parent: Internal<'w, WriterPage<'w>>,
-        child: Node<'w, WriterPage<'w>>,
+        parent: Internal<'w, WriterPage<'w, 's>>,
+        child: Node<'w, WriterPage<'w, 's>>,
         child_idx: usize,
-    ) -> NodeEffect<'w> {
+    ) -> NodeEffect<'w, 's> {
         // Try to steal from or merge with a sibling.
         let sibling_idx = if child_idx > 0 {
             Some(child_idx - 1)
@@ -378,12 +378,12 @@ impl<'w> Tree<'w, WriterPage<'w>, Writer<'_>> {
     /// one of its direct siblings.
     fn steal_or_merge(
         &self,
-        parent: Internal<'w, WriterPage<'w>>,
-        child: Node<'w, WriterPage<'w>>,
+        parent: Internal<'w, WriterPage<'w, 's>>,
+        child: Node<'w, WriterPage<'w, 's>>,
         child_idx: usize,
-        sibling: Node<'w, WriterPage<'w>>,
+        sibling: Node<'w, WriterPage<'w, 's>>,
         sibling_idx: usize,
-    ) -> NodeEffect<'w> {
+    ) -> NodeEffect<'w, 's> {
         let (mut left_idx, mut right_idx) = (sibling_idx, child_idx);
         let (left, right) = if sibling_idx < child_idx {
             (sibling, child)
@@ -433,10 +433,10 @@ impl<'w> Tree<'w, WriterPage<'w>, Writer<'_>> {
     /// Creates a new internal root node whose children are split nodes
     /// newly-created due to an operation on the tree.
     fn parent_of_split(
-        writer: &'w Writer,
-        left: &Node<'w, WriterPage<'w>>,
-        right: &Node<'w, WriterPage<'w>>,
-    ) -> Node<'w, WriterPage<'w>> {
+        writer: &'w Writer<'s>,
+        left: &Node<'w, WriterPage<'w, 's>>,
+        right: &Node<'w, WriterPage<'w, 's>>,
+    ) -> Node<'w, WriterPage<'w, 's>> {
         let keys = [left.get_key(0), right.get_key(0)];
         let child_pointers = [left.page_num(), right.page_num()];
         let root = Internal::parent_of_split(writer, keys, child_pointers);
