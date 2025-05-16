@@ -41,25 +41,30 @@ impl<'g, P: ImmutablePage<'g>> Internal<'g, P> {
     }
 
     /// Gets the child pointer at an index.
+    #[inline]
     pub fn get_child_pointer(&self, i: usize) -> usize {
         get_child_pointer(&self.page, i)
     }
 
     /// Gets the number of keys.
+    #[inline]
     pub fn get_num_keys(&self) -> usize {
         header::get_num_keys(&self.page)
     }
 
     /// Gets the `i`th key in the internal buffer.
+    #[inline]
     pub fn get_key(&self, i: usize) -> &'g [u8] {
         get_key(&self.page, i)
     }
 
+    #[inline]
     pub fn get_num_bytes(&self) -> usize {
         get_num_bytes(&self.page)
     }
 
     /// Gets the page number associated to the internal node.
+    #[inline]
     pub fn page_num(&self) -> usize {
         self.page.page_num()
     }
@@ -144,8 +149,11 @@ impl<'w, 's> Internal<'w, WriterPage<'w, 's>> {
     fn merge_iter<'i>(
         &'i self,
         entries: &'w [ChildEntry],
-    ) -> MergeIterator<'w, InternalIterator<'i, 'w, WriterPage<'w, 's>>, std::slice::Iter<'w, ChildEntry>>
-    {
+    ) -> MergeIterator<
+        'w,
+        InternalIterator<'i, 'w, WriterPage<'w, 's>>,
+        std::slice::Iter<'w, ChildEntry>,
+    > {
         MergeIterator {
             node_iter: self.iter().enumerate().peekable(),
             entries_iter: entries.iter().peekable(),
@@ -196,7 +204,12 @@ impl<'w, 's> InternalEffect<'w, 's> {
     }
 
     #[allow(dead_code)]
-    fn take_split(self) -> (Internal<'w, WriterPage<'w, 's>>, Internal<'w, WriterPage<'w, 's>>) {
+    fn take_split(
+        self,
+    ) -> (
+        Internal<'w, WriterPage<'w, 's>>,
+        Internal<'w, WriterPage<'w, 's>>,
+    ) {
         match self {
             InternalEffect::Split { left, right } => (left, right),
             _ => panic!("is not InternalEffect::Split"),
@@ -239,18 +252,18 @@ impl<'w, 's> Builder<'w, 's> {
     /// Adds a child entry to the builder.
     fn add_child_entry(mut self, key: &[u8], page_num: usize) -> Self {
         let n = header::get_num_keys(&self.page);
-        assert!(
+        debug_assert!(
             self.i < n,
             "add_child_entry() called {} times, cannot be called more times than num_keys = {}",
             self.i,
             n
         );
-        assert!(key.len() <= consts::MAX_KEY_SIZE);
+        debug_assert!(key.len() <= consts::MAX_KEY_SIZE);
 
         let offset = set_next_offset(&mut self.page, self.i, n, key);
         set_child_pointer(&mut self.page, self.i, page_num);
         let pos = 4 + n * 10 + offset;
-        assert!(
+        debug_assert!(
             pos + key.len() <= consts::PAGE_SIZE,
             "builder unexpectedly overflowed: i = {}, n = {}",
             self.i,
@@ -266,7 +279,7 @@ impl<'w, 's> Builder<'w, 's> {
     /// Builds an internal node.
     fn build(self) -> Internal<'w, WriterPage<'w, 's>> {
         let n = header::get_num_keys(&self.page);
-        assert!(
+        debug_assert!(
             self.i == n,
             "build() called after calling add_child_entry() {} times < num_keys = {}",
             self.i,
@@ -285,7 +298,7 @@ fn find_split<'i, I>(itr: I, num_keys: usize) -> usize
 where
     I: Iterator<Item = (&'i [u8], usize)>,
 {
-    assert!(num_keys >= 4);
+    debug_assert!(num_keys >= 4);
 
     // Try to split such that both splits are sufficient
     // (i.e. have at least 2 keys).
@@ -463,11 +476,13 @@ fn get_child_pointer<'g, P: ImmutablePage<'g>>(page: &P, i: usize) -> usize {
 }
 
 /// Sets the `i`th child pointer in an internal node's page buffer.
+#[inline]
 fn set_child_pointer(page: &mut [u8], i: usize, page_num: usize) {
     page[4 + i * 8..4 + (i + 1) * 8].copy_from_slice(&(page_num as u64).to_le_bytes());
 }
 
 /// Gets the `i`th offset value.
+#[inline]
 fn get_offset(page: &[u8], i: usize) -> usize {
     if i == 0 {
         return 0;

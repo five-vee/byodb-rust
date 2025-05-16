@@ -61,6 +61,7 @@ impl<'g, P: ImmutablePage<'g>, G: Guard<'g, P>> Tree<'g, P, G> {
         }
     }
 
+    #[inline]
     pub fn page_num(&self) -> usize {
         self.page_num
     }
@@ -506,7 +507,7 @@ impl<'g, P: ImmutablePage<'g>, G: Guard<'g, P>> Iterator for InOrder<'_, 'g, P, 
                         std::ops::Bound::Unbounded => {}
                     }
                     self.stack.push((i + 1, tree));
-                    return Some((leaf.get_key(i), leaf.get_value(i)));
+                    return Some((key, leaf.get_value(i)));
                 }
                 Node::Internal(internal) => {
                     let pn = internal.get_child_pointer(i);

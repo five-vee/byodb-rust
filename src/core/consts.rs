@@ -1,7 +1,15 @@
 //! Constants related to memory page size and offsets.
 
 /// Size of a B+ tree node page.
+// 4KB
+#[cfg(test)]
 pub(crate) const PAGE_SIZE: usize = 4096;
+
+/// Size of a B+ tree node page.
+// 16KB
+#[cfg(not(test))]
+pub(crate) const PAGE_SIZE: usize = 16384;
+
 /// The maximum allowed key size in a tree.
 pub const MAX_KEY_SIZE: usize = 1000;
 /// The maximum allowed value size in a tree.

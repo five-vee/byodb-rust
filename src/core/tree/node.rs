@@ -132,6 +132,7 @@ impl<'g, P: ImmutablePage<'g>> Node<'g, P> {
         }
     }
 
+    #[inline]
     pub fn page_num(&self) -> usize {
         match self {
             Node::Leaf(leaf) => leaf.page_num(),
@@ -140,6 +141,7 @@ impl<'g, P: ImmutablePage<'g>> Node<'g, P> {
     }
 
     /// Gets the key at a specified node index.
+    #[inline]
     pub fn get_key(&self, i: usize) -> &[u8] {
         match self {
             Node::Leaf(leaf) => leaf.get_key(i),
@@ -147,6 +149,7 @@ impl<'g, P: ImmutablePage<'g>> Node<'g, P> {
         }
     }
 
+    #[inline]
     pub fn get_num_keys(&self) -> usize {
         match self {
             Node::Leaf(leaf) => leaf.get_num_keys(),
@@ -154,6 +157,7 @@ impl<'g, P: ImmutablePage<'g>> Node<'g, P> {
         }
     }
 
+    #[inline]
     pub fn get_num_bytes(&self) -> usize {
         match self {
             Node::Leaf(leaf) => leaf.get_num_bytes(),
@@ -250,7 +254,8 @@ pub enum Sufficiency {
     Sufficient,
 }
 
-// Returns how sufficient a node is.
+/// Returns how sufficient a node is.
+#[inline]
 pub fn sufficiency(n: &Node<'_, WriterPage<'_, '_>>) -> Sufficiency {
     match n.get_num_keys() {
         0 => Sufficiency::Empty,
@@ -305,6 +310,7 @@ pub fn can_steal(
 }
 
 /// Checks whether the merging of `left` and `right` doesn't overflow.
+#[inline]
 pub fn can_merge(
     left: &Node<'_, WriterPage<'_, '_>>,
     right: &Node<'_, WriterPage<'_, '_>>,

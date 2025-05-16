@@ -90,7 +90,7 @@ use std::{
 };
 
 use arc_swap::{ArcSwap, Guard as ArcSwapGuard};
-use memmap2::{MmapMut, MmapOptions};
+use memmap2::{Advice, MmapMut, MmapOptions};
 use seize::{Collector, Guard as _, LocalGuard};
 
 use crate::core::{
@@ -121,12 +121,14 @@ pub struct Mmap {
 
 impl Deref for Mmap {
     type Target = [u8];
+    #[inline]
     fn deref(&self) -> &Self::Target {
         self.mmap.deref()
     }
 }
 
 impl DerefMut for Mmap {
+    #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.mmap.deref_mut()
     }
@@ -173,6 +175,7 @@ impl Mmap {
 
         // Safety: it is assumed that no other process has a mutable mapping to the same file.
         let mmap = unsafe { MmapOptions::new().map_mut(&file).unwrap() };
+        mmap.advise(Advice::Random)?;
 
         Ok(Mmap {
             min_file_growth_size,
@@ -205,6 +208,7 @@ impl Mmap {
                     .expect("mmap is correctly created")
             }
         };
+        mmap.advise(Advice::Random).expect("mmap can advise random");
         Mmap {
             min_file_growth_size: self.min_file_growth_size,
             file: self.file.clone(),
@@ -246,6 +250,7 @@ unsafe impl Sync for WriterState {}
 impl WriterState {
     /// A convenient method to retrieve the Mmap
     /// since it's guarded by UnsafeCell.
+    #[inline]
     #[allow(clippy::mut_from_ref)] // This is the same as if inlined.
     fn mmap_mut(&self) -> &mut Mmap {
         // Safety: WriterState guarantees that mutable references of the mmap
@@ -256,6 +261,7 @@ impl WriterState {
 
     /// A convenient method to retrieve the Mmap
     /// since it's guarded by UnsafeCell.
+    #[inline]
     fn mmap(&self) -> &Mmap {
         self.mmap_mut()
     }
@@ -442,7 +448,7 @@ pub struct Reader<'s> {
 impl<'r> Guard<'r, ReaderPage<'r>> for Reader<'_> {
     unsafe fn read_page(&self, page_num: usize) -> ReaderPage<'_> {
         let guard = &self.state_guard;
-        assert!(
+        debug_assert!(
             page_num * consts::PAGE_SIZE < guard.flush_offset,
             "page_num = {} must be < {}",
             page_num,
@@ -459,6 +465,7 @@ impl<'r> Guard<'r, ReaderPage<'r>> for Reader<'_> {
         }
     }
 
+    #[inline]
     fn root_page(&self) -> usize {
         self.root_page
     }
@@ -536,7 +543,7 @@ impl<'s> Writer<'s> {
     /// reference at a time to the underlying page.
     pub unsafe fn overwrite_page(&self, page_num: usize) -> WriterPage<'_, 's> {
         let guard = self.state_guard.borrow();
-        assert!(page_num * consts::PAGE_SIZE < guard.new_offset);
+        debug_assert!(page_num * consts::PAGE_SIZE < guard.new_offset);
         WriterPage {
             writer: self,
             page_num,
@@ -548,7 +555,7 @@ impl<'s> Writer<'s> {
     pub fn mark_free(&self, page_num: usize) {
         let offset = page_num * consts::PAGE_SIZE;
         let mut borrow = self.state_guard.borrow_mut();
-        assert!(offset < borrow.new_offset);
+        debug_assert!(offset < borrow.new_offset);
         // We can put directly into the free list if it's not flushed,
         // i.e. not accessible by concurrent readers.
         if offset >= borrow.flush_offset {
@@ -566,6 +573,7 @@ impl<'s> Writer<'s> {
     }
 
     /// Aborts the write transaction.
+    #[inline]
     pub fn abort(mut self) {
         self.abort = true;
     }
@@ -574,7 +582,7 @@ impl<'s> Writer<'s> {
 impl<'w, 's> Guard<'w, WriterPage<'w, 's>> for Writer<'s> {
     unsafe fn read_page(&'w self, page_num: usize) -> WriterPage<'w, 's> {
         let borrow = self.state_guard.borrow();
-        assert!(
+        debug_assert!(
             page_num * consts::PAGE_SIZE < borrow.new_offset,
             "page_num = {} must be < {}",
             page_num,
@@ -586,6 +594,7 @@ impl<'w, 's> Guard<'w, WriterPage<'w, 's>> for Writer<'s> {
         }
     }
 
+    #[inline]
     fn root_page(&self) -> usize {
         self.curr_root_page
     }
@@ -675,6 +684,7 @@ pub struct ReaderPage<'r> {
 }
 
 impl ReaderPage<'_> {
+    #[inline]
     pub fn page_num(&self) -> usize {
         self.page_num
     }
@@ -682,6 +692,7 @@ impl ReaderPage<'_> {
 
 impl Deref for ReaderPage<'_> {
     type Target = [u8];
+    #[inline]
     fn deref(&self) -> &Self::Target {
         // Safety: [page_ptr, page_ptr + PAGE_SIZE) is a guaranteed valid region in the mmap.
         // Due to the mutex guard in Writer, at most one mutable reference can
@@ -695,6 +706,7 @@ impl Deref for ReaderPage<'_> {
 }
 
 impl ImmutablePage<'_> for ReaderPage<'_> {
+    #[inline]
     fn page_num(&self) -> usize {
         self.page_num
     }
@@ -709,6 +721,7 @@ pub struct WriterPage<'w, 's> {
 }
 
 impl<'w, 's> WriterPage<'w, 's> {
+    #[inline]
     pub fn read_only(self) -> WriterPage<'w, 's> {
         WriterPage {
             writer: self.writer,
@@ -719,6 +732,7 @@ impl<'w, 's> WriterPage<'w, 's> {
 
 impl Deref for WriterPage<'_, '_> {
     type Target = [u8];
+    #[inline]
     fn deref(&self) -> &Self::Target {
         let borrow = self.writer.state_guard.borrow();
         // Safety: Due to the mutex guard in Writer, at most one mutable
@@ -730,6 +744,7 @@ impl Deref for WriterPage<'_, '_> {
 }
 
 impl DerefMut for WriterPage<'_, '_> {
+    #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         let borrow_mut = self.writer.state_guard.borrow_mut();
         // Safety: Due to the mutex guard in Writer, at most one mutable
@@ -741,6 +756,7 @@ impl DerefMut for WriterPage<'_, '_> {
 }
 
 impl ImmutablePage<'_> for WriterPage<'_, '_> {
+    #[inline]
     fn page_num(&self) -> usize {
         self.page_num
     }

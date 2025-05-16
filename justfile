@@ -45,7 +45,8 @@ alias prof := cpu-profile
 
 [group('profile')]
 cpu-profile: _check-samply
-  samply record cargo bench --profile=profiling
+  cargo bench --profile=profiling --no-run
+  samply record $(ls target/profiling/deps/txn-* | grep -E '^target/profiling/deps/txn-[^.]+$')
 
 [group('profile')]
 _check-samply:

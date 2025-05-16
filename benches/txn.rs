@@ -74,7 +74,7 @@ impl Iterator for Seeder {
     }
 }
 
-#[divan::bench(threads = [1, 2, 4], args = [1000, 4000, 10000, 40000])]
+#[divan::bench(threads = [1, 4], args = [1000, 4000, 10000, 40000])]
 fn bench_readers(b: Bencher, n: usize) {
     let (db, _temp_file) = new_test_db();
     Seeder::new(n, DEFAULT_SEED).seed_db(&db).unwrap();
@@ -88,7 +88,7 @@ fn bench_readers(b: Bencher, n: usize) {
     });
 }
 
-#[divan::bench(threads = [1, 2, 4], args = [1000, 4000, 10000, 40000])]
+#[divan::bench(threads = [1, 4], args = [1000, 4000, 10000, 40000])]
 fn bench_writer_and_readers(b: Bencher, n: usize) {
     // Setup.
     let (db, _temp_file) = new_test_db();

@@ -24,7 +24,7 @@ impl<'g, P: ImmutablePage<'g>> Leaf<'g, P> {
     pub fn read<G: Guard<'g, P>>(guard: &'g G, page_num: usize) -> Leaf<'g, P> {
         let page = unsafe { guard.read_page(page_num) };
         let node_type = header::get_node_type(page.as_ref()).unwrap();
-        assert_eq!(node_type, NodeType::Leaf);
+        debug_assert_eq!(node_type, NodeType::Leaf);
         Leaf {
             _phantom: PhantomData,
             page,
@@ -37,26 +37,31 @@ impl<'g, P: ImmutablePage<'g>> Leaf<'g, P> {
     }
 
     /// Gets the `i`th key.
+    #[inline]
     pub fn get_key(&self, i: usize) -> &'g [u8] {
         get_key(&self.page, i)
     }
 
     /// Gets the `i`th value.
+    #[inline]
     pub fn get_value(&self, i: usize) -> &'g [u8] {
         get_value(&self.page, i)
     }
 
     /// Gets the number of keys in the leaf.
+    #[inline]
     pub fn get_num_keys(&self) -> usize {
         header::get_num_keys(&self.page)
     }
 
     /// Gets the number of bytes taken up by the leaf.
+    #[inline]
     pub fn get_num_bytes(&self) -> usize {
         get_num_bytes(&self.page)
     }
 
     /// Gets the page number associated to the leaf node.
+    #[inline]
     pub fn page_num(&self) -> usize {
         self.page.page_num()
     }
@@ -272,18 +277,18 @@ impl<'w, 's> Builder<'w, 's> {
     /// Adds a key-value pair to the builder.
     fn add_key_value(mut self, key: &[u8], val: &[u8]) -> Self {
         let n = header::get_num_keys(&self.page);
-        assert!(
+        debug_assert!(
             self.i < n,
             "add_key_value() called {} times, cannot be called more times than num_keys = {}",
             self.i + 1,
             n
         );
-        assert!(key.len() <= consts::MAX_KEY_SIZE);
-        assert!(val.len() <= consts::MAX_VALUE_SIZE);
+        debug_assert!(key.len() <= consts::MAX_KEY_SIZE);
+        debug_assert!(val.len() <= consts::MAX_VALUE_SIZE);
 
         let offset = set_next_offset(&mut self.page, self.i, key, val);
         let pos = 4 + n * 2 + offset;
-        assert!(
+        debug_assert!(
             pos + 4 + key.len() + val.len() <= consts::PAGE_SIZE,
             "builder unexpectedly overflowed: i = {}, n = {}",
             self.i,
@@ -302,13 +307,13 @@ impl<'w, 's> Builder<'w, 's> {
     /// Builds a leaf.
     fn build(self) -> Leaf<'w, WriterPage<'w, 's>> {
         let n = header::get_num_keys(&self.page);
-        assert!(
+        debug_assert!(
             self.i == n,
             "build() called after calling add_key_value() {} times < num_keys = {}",
             self.i,
             n
         );
-        assert_ne!(n, 0, "This case should be handled by Leaf::delete instead.");
+        debug_assert_ne!(n, 0, "This case should be handled by Leaf::delete instead.");
         Leaf {
             _phantom: PhantomData,
             page: self.page.read_only(),
@@ -322,7 +327,7 @@ fn find_split<'l, I>(itr: I, num_keys: usize) -> usize
 where
     I: Iterator<Item = (&'l [u8], &'l [u8])>,
 {
-    assert!(num_keys >= 2);
+    debug_assert!(num_keys >= 2);
 
     itr.scan(4usize, |size, (k, v)| {
         *size += 6 + k.len() + v.len();
@@ -332,33 +337,6 @@ where
         Some(())
     })
     .count()
-
-    // // Try to split such that both splits are sufficient
-    // // (i.e. have at least 2 keys).
-    // if num_keys < 4 {
-    //     // Relax the sufficiency requirement if impossible to meet.
-    //     return itr
-    //         .scan(4usize, |size, (k, v)| {
-    //             *size += 6 + k.len() + v.len();
-    //             if *size > consts::PAGE_SIZE {
-    //                 return None;
-    //             }
-    //             Some(())
-    //         })
-    //         .count();
-    // }
-    // itr.enumerate()
-    //     .scan(4usize, |size, (i, (k, v))| {
-    //         *size += 6 + k.len() + v.len();
-    //         if i < 2 {
-    //             return Some(());
-    //         }
-    //         if *size > consts::PAGE_SIZE || i >= num_keys - 2 {
-    //             return None;
-    //         }
-    //         Some(())
-    //     })
-    //     .count()
 }
 
 /// Builds a new leaf from the provided iterator of key-value pairs.
@@ -532,6 +510,7 @@ fn get_value<'g, P: ImmutablePage<'g>>(page: &P, i: usize) -> &'g [u8] {
 }
 
 /// Gets the `i`th offset value.
+#[inline]
 fn get_offset(page: &[u8], i: usize) -> usize {
     if i == 0 {
         return 0;
