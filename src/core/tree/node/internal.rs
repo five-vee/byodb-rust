@@ -20,16 +20,19 @@ type Result<T> = std::result::Result<T, NodeError>;
 pub struct Internal<'g, P: ImmutablePage<'g>> {
     _phantom: PhantomData<&'g ()>,
     page: P,
+    num_keys: usize,
 }
 
 impl<'g, P: ImmutablePage<'g>> Internal<'g, P> {
     pub fn read<G: Guard<'g, P>>(guard: &'g G, page_num: usize) -> Internal<'g, P> {
         let page = unsafe { guard.read_page(page_num) };
         let node_type = header::get_node_type(page.deref()).unwrap();
+        let num_keys = header::get_num_keys(&page);
         assert_eq!(node_type, NodeType::Internal);
         Internal {
             _phantom: PhantomData,
             page,
+            num_keys,
         }
     }
 
@@ -49,18 +52,18 @@ impl<'g, P: ImmutablePage<'g>> Internal<'g, P> {
     /// Gets the number of keys.
     #[inline]
     pub fn get_num_keys(&self) -> usize {
-        header::get_num_keys(&self.page)
+        self.num_keys
     }
 
     /// Gets the `i`th key in the internal buffer.
     #[inline]
     pub fn get_key(&self, i: usize) -> &'g [u8] {
-        get_key(&self.page, i)
+        get_key(&self.page, i, self.num_keys)
     }
 
     #[inline]
     pub fn get_num_bytes(&self) -> usize {
-        get_num_bytes(&self.page)
+        get_num_bytes(&self.page, self.num_keys)
     }
 
     /// Gets the page number associated to the internal node.
@@ -237,6 +240,7 @@ pub enum ChildEntry {
 // A builder of a B+ tree internal node.
 struct Builder<'w, 's> {
     i: usize,
+    n: usize,
     page: WriterPage<'w, 's>,
 }
 
@@ -246,28 +250,31 @@ impl<'w, 's> Builder<'w, 's> {
         let mut page = writer.new_page();
         header::set_node_type(&mut page, NodeType::Internal);
         header::set_num_keys(&mut page, num_keys);
-        Self { i: 0, page }
+        Self {
+            i: 0,
+            n: num_keys,
+            page,
+        }
     }
 
     /// Adds a child entry to the builder.
     fn add_child_entry(mut self, key: &[u8], page_num: usize) -> Self {
-        let n = header::get_num_keys(&self.page);
         debug_assert!(
-            self.i < n,
+            self.i < self.n,
             "add_child_entry() called {} times, cannot be called more times than num_keys = {}",
             self.i,
-            n
+            self.n
         );
         debug_assert!(key.len() <= consts::MAX_KEY_SIZE);
 
-        let offset = set_next_offset(&mut self.page, self.i, n, key);
+        let offset = set_next_offset(&mut self.page, self.i, self.n, key);
         set_child_pointer(&mut self.page, self.i, page_num);
-        let pos = 4 + n * 10 + offset;
+        let pos = 4 + self.n * 10 + offset;
         debug_assert!(
             pos + key.len() <= consts::PAGE_SIZE,
             "builder unexpectedly overflowed: i = {}, n = {}",
             self.i,
-            n,
+            self.n,
         );
 
         self.page[pos..pos + key.len()].copy_from_slice(key);
@@ -278,16 +285,16 @@ impl<'w, 's> Builder<'w, 's> {
 
     /// Builds an internal node.
     fn build(self) -> Internal<'w, WriterPage<'w, 's>> {
-        let n = header::get_num_keys(&self.page);
         debug_assert!(
-            self.i == n,
+            self.i == self.n,
             "build() called after calling add_child_entry() {} times < num_keys = {}",
             self.i,
-            n
+            self.n
         );
         Internal {
             _phantom: PhantomData,
             page: self.page.read_only(),
+            num_keys: self.n,
         }
     }
 }
@@ -443,10 +450,9 @@ where
 }
 
 /// Gets the `i`th key in an internal node's page buffer.
-fn get_key<'g, P: ImmutablePage<'g>>(page: &P, i: usize) -> &'g [u8] {
-    let n = header::get_num_keys(page);
-    let offset = get_offset(page, i);
-    let key_len = get_offset(page, i + 1) - offset;
+fn get_key<'g, P: ImmutablePage<'g>>(page: &P, i: usize, n: usize) -> &'g [u8] {
+    let offset = get_offset(page, i, n);
+    let key_len = get_offset(page, i + 1, n) - offset;
     let key = &page[4 + n * 10 + offset..4 + n * 10 + offset + key_len];
     // Safety: key borrows from page,
     // which itself borrows from a Reader/Writer (with lifetime 'g),
@@ -483,17 +489,16 @@ fn set_child_pointer(page: &mut [u8], i: usize, page_num: usize) {
 
 /// Gets the `i`th offset value.
 #[inline]
-fn get_offset(page: &[u8], i: usize) -> usize {
+fn get_offset(page: &[u8], i: usize, n: usize) -> usize {
     if i == 0 {
         return 0;
     }
-    let n = header::get_num_keys(page);
     u16::from_le_bytes([page[4 + n * 8 + 2 * (i - 1)], page[4 + n * 8 + 2 * i - 1]]) as usize
 }
 
 /// Sets the next (i.e. `i+1`th) offset and returns the current offset.
 fn set_next_offset(page: &mut [u8], i: usize, n: usize, key: &[u8]) -> usize {
-    let curr_offset = get_offset(page, i);
+    let curr_offset = get_offset(page, i, n);
     let next_offset = curr_offset + key.len();
     let next_i = i + 1;
     page[4 + n * 8 + 2 * (next_i - 1)..4 + n * 8 + 2 * next_i]
@@ -502,9 +507,8 @@ fn set_next_offset(page: &mut [u8], i: usize, n: usize, key: &[u8]) -> usize {
 }
 
 /// Gets the number of bytes consumed by a page.
-fn get_num_bytes(page: &[u8]) -> usize {
-    let n = header::get_num_keys(page);
-    let offset = get_offset(page, n);
+fn get_num_bytes(page: &[u8], n: usize) -> usize {
+    let offset = get_offset(page, n, n);
     4 + (n * 10) + offset
 }
 

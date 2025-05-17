@@ -7,9 +7,8 @@ use std::marker::PhantomData;
 
 use crate::core::consts;
 use crate::core::error::NodeError;
+use crate::core::header::{self, NodeType};
 use crate::core::mmap::{Guard, ImmutablePage, Writer, WriterPage};
-
-use super::header::{self, NodeType};
 
 type Result<T> = std::result::Result<T, NodeError>;
 
@@ -17,6 +16,7 @@ type Result<T> = std::result::Result<T, NodeError>;
 pub struct Leaf<'g, P: ImmutablePage<'g>> {
     _phantom: PhantomData<&'g ()>,
     page: P,
+    num_keys: usize,
 }
 
 impl<'g, P: ImmutablePage<'g>> Leaf<'g, P> {
@@ -24,10 +24,12 @@ impl<'g, P: ImmutablePage<'g>> Leaf<'g, P> {
     pub fn read<G: Guard<'g, P>>(guard: &'g G, page_num: usize) -> Leaf<'g, P> {
         let page = unsafe { guard.read_page(page_num) };
         let node_type = header::get_node_type(page.as_ref()).unwrap();
+        let num_keys = header::get_num_keys(&page);
         debug_assert_eq!(node_type, NodeType::Leaf);
         Leaf {
             _phantom: PhantomData,
             page,
+            num_keys,
         }
     }
 
@@ -39,25 +41,25 @@ impl<'g, P: ImmutablePage<'g>> Leaf<'g, P> {
     /// Gets the `i`th key.
     #[inline]
     pub fn get_key(&self, i: usize) -> &'g [u8] {
-        get_key(&self.page, i)
+        get_key(&self.page, i, self.num_keys)
     }
 
     /// Gets the `i`th value.
     #[inline]
     pub fn get_value(&self, i: usize) -> &'g [u8] {
-        get_value(&self.page, i)
+        get_value(&self.page, i, self.num_keys)
     }
 
     /// Gets the number of keys in the leaf.
     #[inline]
     pub fn get_num_keys(&self) -> usize {
-        header::get_num_keys(&self.page)
+        self.num_keys
     }
 
     /// Gets the number of bytes taken up by the leaf.
     #[inline]
     pub fn get_num_bytes(&self) -> usize {
-        get_num_bytes(&self.page)
+        get_num_bytes(&self.page, self.num_keys)
     }
 
     /// Gets the page number associated to the leaf node.
@@ -262,6 +264,7 @@ impl<'w, 's> LeafEffect<'w, 's> {
 // A builder of a B+ tree leaf node.
 struct Builder<'w, 's> {
     i: usize,
+    n: usize,
     page: WriterPage<'w, 's>,
 }
 
@@ -271,28 +274,31 @@ impl<'w, 's> Builder<'w, 's> {
         let mut page = writer.new_page();
         header::set_node_type(&mut page, NodeType::Leaf);
         header::set_num_keys(&mut page, num_keys);
-        Self { i: 0, page }
+        Self {
+            i: 0,
+            n: num_keys,
+            page,
+        }
     }
 
     /// Adds a key-value pair to the builder.
     fn add_key_value(mut self, key: &[u8], val: &[u8]) -> Self {
-        let n = header::get_num_keys(&self.page);
         debug_assert!(
-            self.i < n,
+            self.i < self.n,
             "add_key_value() called {} times, cannot be called more times than num_keys = {}",
             self.i + 1,
-            n
+            self.n
         );
         debug_assert!(key.len() <= consts::MAX_KEY_SIZE);
         debug_assert!(val.len() <= consts::MAX_VALUE_SIZE);
 
         let offset = set_next_offset(&mut self.page, self.i, key, val);
-        let pos = 4 + n * 2 + offset;
+        let pos = 4 + self.n * 2 + offset;
         debug_assert!(
             pos + 4 + key.len() + val.len() <= consts::PAGE_SIZE,
             "builder unexpectedly overflowed: i = {}, n = {}",
             self.i,
-            n
+            self.n
         );
 
         self.page[pos..pos + 2].copy_from_slice(&(key.len() as u16).to_le_bytes());
@@ -306,17 +312,20 @@ impl<'w, 's> Builder<'w, 's> {
 
     /// Builds a leaf.
     fn build(self) -> Leaf<'w, WriterPage<'w, 's>> {
-        let n = header::get_num_keys(&self.page);
         debug_assert!(
-            self.i == n,
+            self.i == self.n,
             "build() called after calling add_key_value() {} times < num_keys = {}",
             self.i,
-            n
+            self.n
         );
-        debug_assert_ne!(n, 0, "This case should be handled by Leaf::delete instead.");
+        debug_assert_ne!(
+            self.n, 0,
+            "This case should be handled by Leaf::delete instead."
+        );
         Leaf {
             _phantom: PhantomData,
             page: self.page.read_only(),
+            num_keys: self.n,
         }
     }
 }
@@ -461,14 +470,11 @@ impl<'w> Iterator for UpdateIterator<'_, 'w, '_> {
 }
 
 /// Gets the `i`th key in a leaf page buffer.
-fn get_key<'g, P: ImmutablePage<'g>>(page: &P, i: usize) -> &'g [u8] {
+fn get_key<'g, P: ImmutablePage<'g>>(page: &P, i: usize, n: usize) -> &'g [u8] {
     let offset = get_offset(page, i);
-    let num_keys = header::get_num_keys(page);
-    let key_len = u16::from_le_bytes([
-        page[4 + num_keys * 2 + offset],
-        page[4 + num_keys * 2 + offset + 1],
-    ]) as usize;
-    let key = &page[4 + num_keys * 2 + offset + 4..4 + num_keys * 2 + offset + 4 + key_len];
+    let key_len =
+        u16::from_le_bytes([page[4 + n * 2 + offset], page[4 + n * 2 + offset + 1]]) as usize;
+    let key = &page[4 + n * 2 + offset + 4..4 + n * 2 + offset + 4 + key_len];
     // Safety: key borrows from page,
     // which itself borrows from a Reader/Writer (with lifetime 'g),
     // which itself has a reference to a Store,
@@ -483,19 +489,13 @@ fn get_key<'g, P: ImmutablePage<'g>>(page: &P, i: usize) -> &'g [u8] {
 }
 
 /// Gets the `i`th value in a leaf page buffer.
-fn get_value<'g, P: ImmutablePage<'g>>(page: &P, i: usize) -> &'g [u8] {
+fn get_value<'g, P: ImmutablePage<'g>>(page: &P, i: usize, n: usize) -> &'g [u8] {
     let offset = get_offset(page, i);
-    let num_keys = header::get_num_keys(page);
-    let key_len = u16::from_le_bytes([
-        page[4 + num_keys * 2 + offset],
-        page[4 + num_keys * 2 + offset + 1],
-    ]) as usize;
-    let val_len = u16::from_le_bytes([
-        page[4 + num_keys * 2 + offset + 2],
-        page[4 + num_keys * 2 + offset + 3],
-    ]) as usize;
-    let val = &page[4 + num_keys * 2 + offset + 4 + key_len
-        ..4 + num_keys * 2 + offset + 4 + key_len + val_len];
+    let key_len =
+        u16::from_le_bytes([page[4 + n * 2 + offset], page[4 + n * 2 + offset + 1]]) as usize;
+    let val_len =
+        u16::from_le_bytes([page[4 + n * 2 + offset + 2], page[4 + n * 2 + offset + 3]]) as usize;
+    let val = &page[4 + n * 2 + offset + 4 + key_len..4 + n * 2 + offset + 4 + key_len + val_len];
     // Safety: val borrows from page,
     // which itself borrows from a Reader/Writer (with lifetime 'g),
     // which itself has a reference to a Store,
@@ -519,8 +519,7 @@ fn get_offset(page: &[u8], i: usize) -> usize {
 }
 
 /// Gets the number of bytes consumed by a page.
-fn get_num_bytes(page: &[u8]) -> usize {
-    let n = header::get_num_keys(page);
+fn get_num_bytes(page: &[u8], n: usize) -> usize {
     let offset = get_offset(page, n);
     4 + (n * 2) + offset
 }
