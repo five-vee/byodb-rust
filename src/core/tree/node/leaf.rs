@@ -491,12 +491,6 @@ fn get_key<'g, P: ImmutablePage<'g>>(page: &P, i: usize, n: usize) -> &'g [u8] {
     // which itself borrows from a Reader/Writer (with lifetime 'g),
     // which itself has a reference to a Store,
     // which itself is modeled as a slice of bytes.
-    // So long as the reader/writer is alive,
-    // the Store cannot be dropped,
-    // meaning the underlying slice of bytes cannot either.
-    // Thus, casting the borrow lifetime from 'l
-    // (the lifetime of leaf node)
-    // to 'g (the lifetime of the reader/writer) is safe.
     unsafe { std::slice::from_raw_parts(key.as_ptr(), key.len()) }
 }
 
@@ -508,16 +502,10 @@ fn get_value<'g, P: ImmutablePage<'g>>(page: &P, i: usize, n: usize) -> &'g [u8]
     let val_len =
         u16::from_le_bytes([page[4 + n * 2 + offset + 2], page[4 + n * 2 + offset + 3]]) as usize;
     let val = &page[4 + n * 2 + offset + 4 + key_len..4 + n * 2 + offset + 4 + key_len + val_len];
-    // Safety: val borrows from page,
+    // Safety: key borrows from page,
     // which itself borrows from a Reader/Writer (with lifetime 'g),
     // which itself has a reference to a Store,
     // which itself is modeled as a slice of bytes.
-    // So long as the reader/writer is alive,
-    // the Store cannot be dropped,
-    // meaning the underlying slice of bytes cannot either.
-    // Thus, casting the borrow lifetime from 'l
-    // (the lifetime of leaf node)
-    // to 'g (the lifetime of the reader/writer) is safe.
     unsafe { std::slice::from_raw_parts(val.as_ptr(), val.len()) }
 }
 

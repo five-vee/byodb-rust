@@ -254,8 +254,9 @@ impl WriterState {
     #[allow(clippy::mut_from_ref)] // This is the same as if inlined.
     fn mmap_mut(&self) -> &mut Mmap {
         // Safety: WriterState guarantees that mutable references of the mmap
-        // only touch [pages_ptr + flush_offset * PAGE_SIZE, mmap_end), which never overlaps
-        // with immutable reference reads of [pages_ptr, pages_ptr + flush_offset * PAGE_SIZE).
+        // only touch [mmap_start + flush_offset * PAGE_SIZE, mmap_end),
+        // which never overlaps with immutable reference reads of
+        // [mmap_start, mmap_start + flush_offset * PAGE_SIZE).
         unsafe { &mut *self.mmap.get() }
     }
 
@@ -614,10 +615,11 @@ impl Drop for Writer<'_> {
             return;
         }
 
-        /* Pages cannot be reclaimed back to the free list until it's
+        /*
+        Pages cannot be reclaimed back to the free list until it's
         guaranteed that no reader (or writer) can traverse to these pages,
         either from a B+ tree root node, or via the free list itself.
-         */
+        */
 
         // Safety: prev_root_page is never null.
         let root_page = if self.curr_root_page != unsafe { *self.prev_root_page } {
@@ -694,11 +696,11 @@ impl Deref for ReaderPage<'_> {
     type Target = [u8];
     #[inline]
     fn deref(&self) -> &Self::Target {
-        // Safety: [page_ptr, page_ptr + PAGE_SIZE) is a guaranteed valid region in the mmap.
-        // Due to the mutex guard in Writer, at most one mutable reference can
-        // touch this region at a time.
-        // page_ptr cannot dangle b/c the mmap is never dropped/realloc'ed so long as
-        // the writer mutex guard (&'w Writer<'s>) exists.
+        // Safety: the page at page_num is a guaranteed valid region in the
+        // mmap. This page is flushed, meaning it is immutable: we ensure no
+        // writer can access the page while a reader is concurrently accesssing
+        // it. Only Writer::overwrite_page can do so, but that method is unsafe
+        // and must be called safely.
         &unsafe { &*self.mmap.get() }.mmap[meta_node::META_PAGE_SIZE
             + self.page_num * consts::PAGE_SIZE
             ..meta_node::META_PAGE_SIZE + (self.page_num + 1) * consts::PAGE_SIZE]
@@ -735,8 +737,13 @@ impl Deref for WriterPage<'_, '_> {
     #[inline]
     fn deref(&self) -> &Self::Target {
         let borrow = self.writer.state_guard.borrow();
-        // Safety: Due to the mutex guard in Writer, at most one mutable
-        // reference can touch this region at a time.
+        // Safety: If the page at page_num is beyond flush_offset
+        // (via Writer::new_page/Writer::overwrite_page), then due to the
+        // mutex guard in Writer, at most one mutable reference can touch this
+        // region at a time.
+        // If the page is within flush_offset, it is done so via
+        // Writer::overwrite_page, an unsafe method; the caller must guarantee
+        // that there are no concurrent readers (via Reader::read_page).
         &unsafe { &*(borrow.mmap() as *const Mmap) }.mmap[meta_node::META_PAGE_SIZE
             + self.page_num * consts::PAGE_SIZE
             ..meta_node::META_PAGE_SIZE + (self.page_num + 1) * consts::PAGE_SIZE]
@@ -747,8 +754,13 @@ impl DerefMut for WriterPage<'_, '_> {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         let borrow_mut = self.writer.state_guard.borrow_mut();
-        // Safety: Due to the mutex guard in Writer, at most one mutable
-        // reference can touch this region at a time.
+        // Safety: If the page at page_num is beyond flush_offset
+        // (via Writer::new_page/Writer::overwrite_page), then due to the
+        // mutex guard in Writer, at most one mutable reference can touch this
+        // region at a time.
+        // If the page is within flush_offset, it is done so via
+        // Writer::overwrite_page, an unsafe method; the caller must guarantee
+        // that there are no concurrent readers (via Reader::read_page).
         &mut unsafe { &mut *(borrow_mut.mmap_mut() as *mut Mmap) }.mmap[meta_node::META_PAGE_SIZE
             + self.page_num * consts::PAGE_SIZE
             ..meta_node::META_PAGE_SIZE + (self.page_num + 1) * consts::PAGE_SIZE]

@@ -255,6 +255,7 @@ impl<'t, 'd> Txn<'t, WriterPage<'t, 'd>, Writer<'d>> {
     ///
     /// If `commit` is not called, the transaction will be automatically
     /// aborted when it goes out of scope.
+    #[inline]
     pub fn commit(self) {
         self.guard.flush(self.root_page);
     }
@@ -263,6 +264,7 @@ impl<'t, 'd> Txn<'t, WriterPage<'t, 'd>, Writer<'d>> {
     ///
     /// This is automatically called if the transaction goes out of scope
     /// without [`Txn::commit`] being called.
+    #[inline]
     pub fn abort(self) {
         self.guard.abort();
     }

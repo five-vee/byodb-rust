@@ -32,11 +32,6 @@ type Result<T> = std::result::Result<T, TreeError>;
 
 /// A copy-on-write (COW) B+ Tree data structure that stores data in disk.
 ///
-/// Only the tree's root node is stored in memory, as descendant nodes are
-/// loaded into memory (and unloaded once dropped) dynamically during
-/// read/write operations on the tree. The node contents are stored as pages
-/// on disk every time the node is modified, as per the COW approach.
-///
 /// Instead of directly updating the existing nodes in the tree when an
 /// insertion, deletion, or update occurs, the COW approach creates a modified
 /// copy of the node (or the path of nodes leading to the change). The original
@@ -150,27 +145,30 @@ impl<'g, P: ImmutablePage<'g>, G: Guard<'g, P>> Tree<'g, P, G> {
                 node: Tree::read(self.guard, self.node.page_num()),
             },
         )];
-        while let Some((i, tree)) = stack.pop() {
-            if i == tree.node.get_num_keys() {
+        while let Some((i, tree)) = stack.last_mut() {
+            if *i == tree.node.get_num_keys() {
+                stack.pop();
                 break;
             }
             match &tree.node {
                 Node::Leaf(leaf) => match leaf.iter().position(&leaf_predicate) {
                     // leaf range < start; try again up the stack
-                    None => {}
+                    None => {
+                        stack.pop();
+                    }
                     Some(j) => {
-                        stack.push((j, tree));
+                        *i = j;
                         break;
                     }
                 },
                 Node::Internal(internal) => {
-                    let child_idx = (i..internal.get_num_keys())
+                    let child_idx = (*i..internal.get_num_keys())
                         .rev()
                         .find(|&j| internal.get_key(j) <= start)
-                        .unwrap_or(i);
+                        .unwrap_or(*i);
                     let child_page = internal.get_child_pointer(child_idx);
                     let child = Tree::new(tree.guard, child_page);
-                    stack.push((child_idx + 1, tree));
+                    *i = child_idx + 1;
                     stack.push((0, child));
                 }
             }
@@ -533,13 +531,6 @@ impl<'g, P: ImmutablePage<'g>, G: Guard<'g, P>> Iterator for InOrder<'_, 'g, P, 
                         std::ops::Bound::Unbounded => {}
                     }
                     let val = leaf.get_value(*i);
-                    // self.stack.push((
-                    //     i + 1,
-                    //     Tree {
-                    //         guard: tree.guard,
-                    //         node: Node::Leaf(leaf),
-                    //     },
-                    // ));
                     *i += 1;
                     return Some((key, val));
                 }
@@ -549,13 +540,6 @@ impl<'g, P: ImmutablePage<'g>, G: Guard<'g, P>> Iterator for InOrder<'_, 'g, P, 
                         guard: tree.guard,
                         node: Tree::read(tree.guard, pn),
                     };
-                    // self.stack.push((
-                    //     i + 1,
-                    //     Tree {
-                    //         guard: tree.guard,
-                    //         node: Node::Internal(internal),
-                    //     },
-                    // ));
                     *i += 1;
                     self.stack.push((0, child));
                 }
