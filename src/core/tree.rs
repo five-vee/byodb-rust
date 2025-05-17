@@ -20,11 +20,10 @@
 
 mod node;
 
-use std::marker::PhantomData;
 use std::ops::RangeBounds;
 
 use crate::core::error::TreeError;
-use crate::core::mmap::{self, Guard, Writer};
+use crate::core::mmap::{Guard, Writer};
 use node::{ChildEntry, Internal, Node, NodeEffect, Sufficiency};
 
 use super::mmap::{ImmutablePage, WriterPage};
@@ -46,28 +45,28 @@ type Result<T> = std::result::Result<T, TreeError>;
 /// the data until they reach a point where they would naturally access the
 /// newly written parts.
 pub struct Tree<'g, P: ImmutablePage<'g>, G: Guard<'g, P>> {
-    _phantom: PhantomData<P>,
     guard: &'g G,
-    page_num: usize,
+    node: Node<'g, P>,
 }
 
 impl<'g, P: ImmutablePage<'g>, G: Guard<'g, P>> Tree<'g, P, G> {
     /// Loads the root of the tree at a specified root page num.
+    #[inline]
     pub fn new(guard: &'g G, page_num: usize) -> Self {
         Tree {
-            _phantom: PhantomData,
-            page_num,
             guard,
+            node: Self::read(guard, page_num),
         }
     }
 
     #[inline]
     pub fn page_num(&self) -> usize {
-        self.page_num
+        self.node.page_num()
     }
 
     /// Reads the page at `page_num` and returns it represented as a [`Node`].
     /// This is a convenience wrapper around the unsafe [`Node::read`].
+    #[inline]
     fn read(guard: &'g G, page_num: usize) -> Node<'g, P> {
         // Safety: The tree maintains the invariant that it'll only read nodes
         // that are traversible from the root, including the root itself.
@@ -76,14 +75,14 @@ impl<'g, P: ImmutablePage<'g>, G: Guard<'g, P>> Tree<'g, P, G> {
 
     /// Gets the value corresponding to the key.
     pub fn get(&self, key: &[u8]) -> Result<Option<&'g [u8]>> {
-        match Self::read(self.guard, self.page_num) {
+        match &self.node {
             Node::Internal(parent) => {
                 let child_idx = parent.find(key);
                 let child_num = parent.get_child_pointer(child_idx);
+                let child = Tree::read(self.guard, child_num);
                 let child = Tree {
-                    _phantom: PhantomData,
-                    page_num: child_num,
                     guard: self.guard,
+                    node: child,
                 };
                 child.get(key).map(|o| {
                     o.map(|val| {
@@ -100,8 +99,17 @@ impl<'g, P: ImmutablePage<'g>, G: Guard<'g, P>> Tree<'g, P, G> {
 
     /// Iterates through the entire tree in-order.
     pub fn in_order_iter(&self) -> InOrder<'g, 'g, P, G> {
+        let mut stack = Vec::new();
+        stack.reserve_exact(self.height());
+        stack.push((
+            0,
+            Tree {
+                guard: self.guard,
+                node: Tree::read(self.guard, self.node.page_num()),
+            },
+        ));
         InOrder {
-            stack: vec![(0, Self::new(self.guard, self.page_num))],
+            stack,
             end_bound: std::ops::Bound::Unbounded,
         }
     }
@@ -112,8 +120,17 @@ impl<'g, P: ImmutablePage<'g>, G: Guard<'g, P>> Tree<'g, P, G> {
         R: RangeBounds<[u8]>,
     {
         if matches!(range.start_bound(), std::ops::Bound::Unbounded) {
+            let mut stack = Vec::new();
+            stack.reserve_exact(self.height());
+            stack.push((
+                0,
+                Tree {
+                    guard: self.guard,
+                    node: Tree::read(self.guard, self.node.page_num()),
+                },
+            ));
             return InOrder {
-                stack: vec![(0, Self::new(self.guard, self.page_num))],
+                stack,
                 end_bound: range.end_bound(),
             };
         }
@@ -126,14 +143,18 @@ impl<'g, P: ImmutablePage<'g>, G: Guard<'g, P>> Tree<'g, P, G> {
             std::ops::Bound::Excluded(start) => (Box::new(move |pair| pair.0 > start), start),
             _ => unreachable!(),
         };
-        let mut stack = vec![(0, Self::new(self.guard, self.page_num))];
+        let mut stack = vec![(
+            0,
+            Tree {
+                guard: self.guard,
+                node: Tree::read(self.guard, self.node.page_num()),
+            },
+        )];
         while let Some((i, tree)) = stack.pop() {
-            let node = Tree::read(tree.guard, tree.page_num);
-            let n = node.get_num_keys();
-            if i == n {
+            if i == tree.node.get_num_keys() {
                 break;
             }
-            match &node {
+            match &tree.node {
                 Node::Leaf(leaf) => match leaf.iter().position(&leaf_predicate) {
                     // leaf range < start; try again up the stack
                     None => {}
@@ -159,6 +180,16 @@ impl<'g, P: ImmutablePage<'g>, G: Guard<'g, P>> Tree<'g, P, G> {
             end_bound: range.end_bound(),
         }
     }
+
+    /// Finds the height of the tree.
+    fn height(&self) -> usize {
+        match &self.node {
+            Node::Leaf(_) => 1,
+            Node::Internal(internal) => {
+                1 + Tree::new(self.guard, internal.get_child_pointer(0)).height()
+            }
+        }
+    }
 }
 
 impl<'w, 's> Tree<'w, WriterPage<'w, 's>, Writer<'s>> {
@@ -166,17 +197,14 @@ impl<'w, 's> Tree<'w, WriterPage<'w, 's>, Writer<'s>> {
     /// readers until the writer is externally flushed.
     pub fn insert(self, key: &[u8], val: &[u8]) -> Result<Self> {
         let writer = self.guard;
-        let new_page_num = match self.insert_helper(key, val)? {
-            NodeEffect::Intact(new_root) => new_root.page_num(),
-            NodeEffect::Split { left, right } => {
-                Self::parent_of_split(writer, &left, &right).page_num()
-            }
+        let new_root = match self.insert_helper(key, val)? {
+            NodeEffect::Intact(new_root) => new_root,
+            NodeEffect::Split { left, right } => Self::parent_of_split(writer, &left, &right),
             _ => unreachable!(),
         };
         Ok(Tree {
-            _phantom: PhantomData,
-            page_num: new_page_num,
             guard: writer,
+            node: new_root,
         })
     }
 
@@ -185,7 +213,7 @@ impl<'w, 's> Tree<'w, WriterPage<'w, 's>, Writer<'s>> {
     ///
     /// This is a recursive implementation of `insert`.
     fn insert_helper(self, key: &[u8], val: &[u8]) -> Result<NodeEffect<'w, 's>> {
-        match Self::read(self.guard, self.page_num) {
+        match self.node {
             // Base case
             Node::Leaf(leaf) => Ok(leaf.insert(self.guard, key, val)?.into()),
             // Recursive case
@@ -193,10 +221,10 @@ impl<'w, 's> Tree<'w, WriterPage<'w, 's>, Writer<'s>> {
                 // Find which child to recursively insert into.
                 let child_idx = internal.find(key);
                 let child_num = internal.get_child_pointer(child_idx);
+                let child = Tree::read(self.guard, child_num);
                 let child = Tree {
-                    _phantom: PhantomData,
-                    page_num: child_num,
                     guard: self.guard,
+                    node: child,
                 };
                 let child_entries = child.insert_helper(key, val)?.child_entries(child_idx);
                 let effect = internal.merge_child_entries(self.guard, child_entries.as_ref());
@@ -208,17 +236,14 @@ impl<'w, 's> Tree<'w, WriterPage<'w, 's>, Writer<'s>> {
     /// Updates the value corresponding to a key.
     pub fn update(self, key: &[u8], val: &[u8]) -> Result<Self> {
         let writer = self.guard;
-        let new_page_num = match self.update_helper(key, val)? {
-            NodeEffect::Intact(root) => root.page_num(),
-            NodeEffect::Split { left, right } => {
-                Self::parent_of_split(writer, &left, &right).page_num()
-            }
+        let new_root = match self.update_helper(key, val)? {
+            NodeEffect::Intact(new_root) => new_root,
+            NodeEffect::Split { left, right } => Self::parent_of_split(writer, &left, &right),
             _ => unreachable!(),
         };
         Ok(Tree {
-            _phantom: PhantomData,
-            page_num: new_page_num,
             guard: writer,
+            node: new_root,
         })
     }
 
@@ -227,7 +252,7 @@ impl<'w, 's> Tree<'w, WriterPage<'w, 's>, Writer<'s>> {
     ///
     /// This is a recursive implementation of `update`.
     fn update_helper(self, key: &[u8], val: &[u8]) -> Result<NodeEffect<'w, 's>> {
-        match Self::read(self.guard, self.page_num) {
+        match self.node {
             // Base case
             Node::Leaf(leaf) => Ok(leaf.update(self.guard, key, val)?.into()),
             // Recursive case
@@ -235,10 +260,10 @@ impl<'w, 's> Tree<'w, WriterPage<'w, 's>, Writer<'s>> {
                 // Find which child to recursively update at.
                 let child_idx = parent.find(key);
                 let child_num = parent.get_child_pointer(child_idx);
+                let child = Tree::read(self.guard, child_num);
                 let child = Tree {
-                    _phantom: PhantomData,
-                    page_num: child_num,
                     guard: self.guard,
+                    node: child,
                 };
                 let child = child.update_helper(key, val)?;
                 let child_entries = child.child_entries(child_idx);
@@ -251,24 +276,21 @@ impl<'w, 's> Tree<'w, WriterPage<'w, 's>, Writer<'s>> {
     /// Deletes a key and its corresponding value.
     pub fn delete(self, key: &[u8]) -> Result<Self> {
         let writer = self.guard;
-        let new_page_num = match self.delete_helper(key)? {
-            NodeEffect::Empty => mmap::write_empty_leaf(writer),
+        let new_root = match self.delete_helper(key)? {
+            NodeEffect::Empty => Node::<WriterPage<'w, 's>>::new_empty(writer),
             NodeEffect::Intact(root) => match node::sufficiency(&root) {
                 Sufficiency::Empty => unreachable!(),
-                Sufficiency::Underflow => match &root {
-                    Node::Leaf(_) => root.page_num(),
-                    Node::Internal(internal) => internal.get_child_pointer(0),
+                Sufficiency::Underflow => match root {
+                    Node::Leaf(_) => root,
+                    Node::Internal(internal) => Tree::read(writer, internal.get_child_pointer(0)),
                 },
-                Sufficiency::Sufficient => root.page_num(),
+                Sufficiency::Sufficient => root,
             },
-            NodeEffect::Split { left, right } => {
-                Self::parent_of_split(writer, &left, &right).page_num()
-            }
+            NodeEffect::Split { left, right } => Self::parent_of_split(writer, &left, &right),
         };
         Ok(Tree {
-            _phantom: PhantomData,
-            page_num: new_page_num,
             guard: writer,
+            node: new_root,
         })
     }
 
@@ -277,7 +299,7 @@ impl<'w, 's> Tree<'w, WriterPage<'w, 's>, Writer<'s>> {
     ///
     /// This is a recursive implementation of `delete`.
     fn delete_helper(self, key: &[u8]) -> Result<NodeEffect<'w, 's>> {
-        match Self::read(self.guard, self.page_num) {
+        match self.node {
             // Base case
             Node::Leaf(leaf) => Ok(leaf.delete(self.guard, key)?.into()),
             // Recursive case
@@ -285,10 +307,10 @@ impl<'w, 's> Tree<'w, WriterPage<'w, 's>, Writer<'s>> {
                 // Find which child to recursively delete from.
                 let child_idx = parent.find(key);
                 let child_num = parent.get_child_pointer(child_idx);
+                let child = Tree::read(self.guard, child_num);
                 let child = Tree {
-                    _phantom: PhantomData,
-                    page_num: child_num,
                     guard: self.guard,
+                    node: child,
                 };
                 match child.delete_helper(key)? {
                     NodeEffect::Empty => {
@@ -300,9 +322,9 @@ impl<'w, 's> Tree<'w, WriterPage<'w, 's>, Writer<'s>> {
                     }
                     NodeEffect::Intact(child) => match node::sufficiency(&child) {
                         Sufficiency::Empty => unreachable!(),
-                        Sufficiency::Underflow => {
-                            Ok(self.try_fix_underflow(parent, child, child_idx))
-                        }
+                        Sufficiency::Underflow => Ok(Self::try_fix_underflow(
+                            self.guard, parent, child, child_idx,
+                        )),
                         Sufficiency::Sufficient => {
                             let child_entries = [ChildEntry::Update {
                                 i: child_idx,
@@ -340,7 +362,7 @@ impl<'w, 's> Tree<'w, WriterPage<'w, 's>, Writer<'s>> {
     /// (either at `child_idx - 1` or `child_idx + 1`) within the
     /// parent (internal) node.
     fn try_fix_underflow(
-        &self,
+        writer: &'w Writer<'s>,
         parent: Internal<'w, WriterPage<'w, 's>>,
         child: Node<'w, WriterPage<'w, 's>>,
         child_idx: usize,
@@ -354,18 +376,25 @@ impl<'w, 's> Tree<'w, WriterPage<'w, 's>, Writer<'s>> {
             None
         };
         if let Some(sibling_idx) = sibling_idx {
-            let sibling = Self::read(self.guard, parent.get_child_pointer(sibling_idx));
+            let sibling = Self::read(writer, parent.get_child_pointer(sibling_idx));
             let can_steal_or_merge = node::can_steal(&sibling, &child, sibling_idx < child_idx)
                 || node::can_merge(&sibling, &child);
             if can_steal_or_merge {
-                return self.steal_or_merge(parent, child, child_idx, sibling, sibling_idx);
+                return Self::steal_or_merge(
+                    writer,
+                    parent,
+                    child,
+                    child_idx,
+                    sibling,
+                    sibling_idx,
+                );
             }
         }
 
         // Leave as underflow.
         parent
             .merge_child_entries(
-                self.guard,
+                writer,
                 &[ChildEntry::Update {
                     i: child_idx,
                     key: child.get_key(0).into(),
@@ -378,7 +407,7 @@ impl<'w, 's> Tree<'w, WriterPage<'w, 's>, Writer<'s>> {
     /// Fixes the underflow of `child` by stealing from or merging from
     /// one of its direct siblings.
     fn steal_or_merge(
-        &self,
+        writer: &'w Writer<'s>,
         parent: Internal<'w, WriterPage<'w, 's>>,
         child: Node<'w, WriterPage<'w, 's>>,
         child_idx: usize,
@@ -392,12 +421,12 @@ impl<'w, 's> Tree<'w, WriterPage<'w, 's>, Writer<'s>> {
             (left_idx, right_idx) = (child_idx, sibling_idx);
             (child, sibling)
         };
-        match node::steal_or_merge(left, right, self.guard) {
+        match node::steal_or_merge(left, right, writer) {
             NodeEffect::Empty => unreachable!(),
             NodeEffect::Intact(child) => {
                 // merged
                 let effect = parent.merge_child_entries(
-                    self.guard,
+                    writer,
                     &[
                         ChildEntry::Update {
                             i: left_idx,
@@ -412,7 +441,7 @@ impl<'w, 's> Tree<'w, WriterPage<'w, 's>, Writer<'s>> {
             NodeEffect::Split { left, right } => {
                 // stolen
                 let effect = parent.merge_child_entries(
-                    self.guard,
+                    writer,
                     &[
                         ChildEntry::Update {
                             i: left_idx,
@@ -447,23 +476,21 @@ impl<'w, 's> Tree<'w, WriterPage<'w, 's>, Writer<'s>> {
 
 #[cfg(test)]
 impl<'g, P: ImmutablePage<'g>, G: Guard<'g, P>> Tree<'g, P, G> {
-    /// Gets the height of the tree.
+    /// Checks the height invariant of the tree.
     /// This performs a scan of the entire tree, so it's not really efficient.
     #[allow(dead_code)]
-    fn height(&self) -> Result<u32> {
-        let node = Self::read(self.guard, self.page_num);
-        match &node {
+    pub fn check_height(&self) -> Result<u32> {
+        match &self.node {
             Node::Leaf(_) => Ok(1),
             Node::Internal(node) => {
                 assert!(node.get_num_keys() >= 2);
                 let mut height: Option<u32> = None;
                 for (_, pn) in node.iter() {
                     let child = Tree {
-                        _phantom: PhantomData,
-                        page_num: pn,
                         guard: self.guard,
+                        node: Tree::read(self.guard, pn),
                     };
-                    let child_height = child.height()?;
+                    let child_height = child.check_height()?;
                     if height.is_some() {
                         assert_eq!(height.unwrap(), 1 + child_height);
                     }
@@ -484,15 +511,14 @@ pub struct InOrder<'q, 'g, P: ImmutablePage<'g>, G: Guard<'g, P>> {
 impl<'g, P: ImmutablePage<'g>, G: Guard<'g, P>> Iterator for InOrder<'_, 'g, P, G> {
     type Item = (&'g [u8], &'g [u8]);
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some((i, tree)) = self.stack.pop() {
-            let node = Tree::read(tree.guard, tree.page_num);
-            let n = node.get_num_keys();
-            if i == n {
+        while let Some((i, tree)) = self.stack.last_mut() {
+            if *i == tree.node.get_num_keys() {
+                self.stack.pop();
                 continue;
             }
-            match &node {
+            match &tree.node {
                 Node::Leaf(leaf) => {
-                    let key = leaf.get_key(i);
+                    let key = leaf.get_key(*i);
                     match self.end_bound {
                         std::ops::Bound::Included(end) => {
                             if key > end {
@@ -506,17 +532,31 @@ impl<'g, P: ImmutablePage<'g>, G: Guard<'g, P>> Iterator for InOrder<'_, 'g, P, 
                         }
                         std::ops::Bound::Unbounded => {}
                     }
-                    self.stack.push((i + 1, tree));
-                    return Some((key, leaf.get_value(i)));
+                    let val = leaf.get_value(*i);
+                    // self.stack.push((
+                    //     i + 1,
+                    //     Tree {
+                    //         guard: tree.guard,
+                    //         node: Node::Leaf(leaf),
+                    //     },
+                    // ));
+                    *i += 1;
+                    return Some((key, val));
                 }
                 Node::Internal(internal) => {
-                    let pn = internal.get_child_pointer(i);
+                    let pn = internal.get_child_pointer(*i);
                     let child = Tree {
-                        _phantom: PhantomData,
-                        page_num: pn,
                         guard: tree.guard,
+                        node: Tree::read(tree.guard, pn),
                     };
-                    self.stack.push((i + 1, tree));
+                    // self.stack.push((
+                    //     i + 1,
+                    //     Tree {
+                    //         guard: tree.guard,
+                    //         node: Node::Internal(internal),
+                    //     },
+                    // ));
+                    *i += 1;
                     self.stack.push((0, child));
                 }
             }

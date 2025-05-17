@@ -762,13 +762,6 @@ impl ImmutablePage<'_> for WriterPage<'_, '_> {
     }
 }
 
-/// Allocates a new page as an empty leaf and writes it into the store.
-pub fn write_empty_leaf(writer: &Writer) -> usize {
-    let mut page = writer.new_page();
-    init_empty_leaf(&mut page);
-    page.read_only().page_num()
-}
-
 fn init_empty_leaf(page: &mut [u8]) {
     header::set_node_type(page, NodeType::Leaf);
     header::set_num_keys(page, 0);

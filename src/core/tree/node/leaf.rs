@@ -79,6 +79,18 @@ impl<'g, P: ImmutablePage<'g>> Leaf<'g, P> {
 }
 
 impl<'w, 's> Leaf<'w, WriterPage<'w, 's>> {
+    /// Creates an empty Leaf node. Useful for initializing an empty B+ tree.
+    pub fn new_empty(writer: &'w Writer<'s>) -> Leaf<'w, WriterPage<'w, 's>> {
+        let mut page = writer.new_page();
+        header::set_node_type(&mut page, NodeType::Leaf);
+        header::set_num_keys(&mut page, 0);
+        Leaf {
+            _phantom: PhantomData,
+            page: page.read_only(),
+            num_keys: 0,
+        }
+    }
+
     /// Inserts a key-value pair.
     pub fn insert(
         self,

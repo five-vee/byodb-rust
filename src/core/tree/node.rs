@@ -164,6 +164,11 @@ impl<'g, P: ImmutablePage<'g>> Node<'g, P> {
             Node::Internal(internal) => internal.get_num_bytes(),
         }
     }
+
+    /// Creates an empty Leaf node. Useful for initializing an empty B+ tree.
+    pub fn new_empty<'w, 's>(writer: &'w Writer<'s>) -> Node<'w, WriterPage<'w, 's>> {
+        Node::Leaf(Leaf::new_empty(writer))
+    }
 }
 
 /// An enum representing the effect of a node operation.

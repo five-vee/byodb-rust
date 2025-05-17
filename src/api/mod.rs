@@ -366,6 +366,8 @@ mod tests {
                 }
             }
         }
+        // Verify equal height invariant.
+        Tree::new(&t.guard, t.root_page).check_height().unwrap();
     }
 
     #[test]
@@ -387,9 +389,9 @@ mod tests {
             t.commit();
         }
         {
-            let r = db.r_txn();
+            let t = db.r_txn();
             for k in ks.iter() {
-                match r.get(k.as_bytes()) {
+                match t.get(k.as_bytes()) {
                     Err(err) => panic!("get({k}) unexpectedly got err {err}"),
                     Ok(None) => panic!("get({k}) unexpectedly got None"),
                     Ok(Some(got)) => {
@@ -400,6 +402,8 @@ mod tests {
                     }
                 }
             }
+            // Verify equal height invariant.
+            Tree::new(&t.guard, t.root_page).check_height().unwrap();
         }
     }
 
@@ -436,6 +440,8 @@ mod tests {
                 _ => {}
             };
         }
+        // Verify equal height invariant.
+        Tree::new(&t.guard, t.root_page).check_height().unwrap();
     }
 
     #[test]

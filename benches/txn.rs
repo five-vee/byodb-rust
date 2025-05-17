@@ -78,17 +78,16 @@ impl Iterator for Seeder {
 fn bench_readers(b: Bencher, n: usize) {
     let (db, _temp_file) = new_test_db();
     Seeder::new(n, DEFAULT_SEED).seed_db(&db).unwrap();
-    b.counter(n).bench({
-        move || {
-            let t = db.r_txn();
-            for (k, v) in t.in_order_iter() {
-                let (_k, _v) = (black_box(k), black_box(v));
-            }
+    b.counter(n).bench(move || {
+        let t = db.r_txn();
+        for (k, v) in t.in_order_iter() {
+            let (_k, _v) = (black_box(k), black_box(v));
         }
     });
 }
 
 #[divan::bench(threads = [1, 4], args = [1000, 4000, 10000, 40000])]
+#[ignore]
 fn bench_writer_and_readers(b: Bencher, n: usize) {
     // Setup.
     let (db, _temp_file) = new_test_db();
