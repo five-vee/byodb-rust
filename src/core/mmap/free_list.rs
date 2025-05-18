@@ -8,7 +8,7 @@
 //!
 //! List node format:
 //!
-//! ```ignore
+//! ```text
 //! | next | pointers | unused |
 //! |  8B  |   n*8B   |   ...  |
 //! ```

@@ -4,7 +4,7 @@
 //!
 //! Here is our node format. The 2nd row is the encoded field size in bytes.
 //!
-//! ```ignore
+//! ```text
 //! | type | nkeys |  pointers* |  offsets   | key-values** | unused |
 //! |  2B  |   2B  | nkeys × 8B | nkeys × 2B |     ...      |        |
 //!
@@ -23,7 +23,7 @@
 //! Each KV pair is prefixed by its size. For internal nodes,
 //! the value size is 0.
 //!
-//! ```ignore
+//! ```text
 //! | key_size* | val_size* | key | val** |
 //! |    2B     |    2B     | ... | ...   |
 //!
@@ -37,7 +37,7 @@
 //!
 //! For example, a leaf node `{"k1":"hi", "k3":"hello"}` is encoded as:
 //!
-//! ```ignore
+//! ```text
 //! | type | nkeys | offsets |            key-values           | unused |
 //! |   2  |   2   | 8 19    | 2 2 "k1" "hi"  2 5 "k3" "hello" |        |
 //! |  2B  |  2B   | 2×2B    | 4B + 2B + 2B + 4B + 2B + 5B     |        |

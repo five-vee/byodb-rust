@@ -9,7 +9,7 @@
 //!
 //! The mmap has the following structure:
 //!
-//! ```ignore
+//! ```text
 //! | meta page |   pages   |
 //! |    64B    | N * 4096B |
 //! ```

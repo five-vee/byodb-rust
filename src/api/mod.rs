@@ -316,7 +316,7 @@ mod tests {
                 let result = t.insert(k.as_bytes(), v.as_bytes());
                 if matches!(
                     result,
-                    Err(TxnError::Tree(TreeError::Node(NodeError::AlreadyExists)))
+                    Err(TxnError::Tree(TreeError::AlreadyExists))
                 ) {
                     // Skip
                     continue;

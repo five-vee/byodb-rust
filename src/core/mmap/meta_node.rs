@@ -5,7 +5,7 @@
 //!
 //! The meta node has the following format on disk:
 //!
-//! ```ignore
+//! ```text
 //! | root_page | num_pages | head_page | head_seq | tail_page | tail_seq |
 //! |     8B    |     8B    |    8B     |    8B    |     8B    |    8B    |
 //! ```

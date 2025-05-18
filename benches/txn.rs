@@ -45,10 +45,7 @@ impl Seeder {
         let mut t = db.rw_txn();
         for (i, (k, v)) in self.enumerate() {
             let result = t.insert(k.as_bytes(), v.as_bytes());
-            if matches!(
-                result,
-                Err(TxnError::Tree(TreeError::Node(NodeError::AlreadyExists)))
-            ) {
+            if matches!(result, Err(TxnError::Tree(TreeError::AlreadyExists))) {
                 // Skip
                 continue;
             }
