@@ -1,14 +1,14 @@
 //! Constants related to memory page size and offsets.
 
-/// Size of a B+ tree node page.
-// 4KB
-#[cfg(test)]
-pub(crate) const PAGE_SIZE: usize = 4096;
+const AARCH64_MACOS_NON_TEST: bool =
+    cfg!(all(target_arch = "aarch64", target_os = "macos", not(test)));
 
-/// Size of a B+ tree node page.
-// 16KB
-#[cfg(not(test))]
-pub(crate) const PAGE_SIZE: usize = 16384;
+/// Size of a page.
+pub(crate) const PAGE_SIZE: usize = if AARCH64_MACOS_NON_TEST {
+    16384 // 16KB
+} else {
+    4096 // 4KB
+};
 
 /// The maximum allowed key size in a tree.
 pub const MAX_KEY_SIZE: usize = 1000;

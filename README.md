@@ -76,7 +76,7 @@ fn main() -> Result<()> {
 
 ## Caveats/Limitations
 
-*   **Not production ready**: This project is primarily a learning exercise and lacks the robustness, extensive testing, and feature completeness required for production environments.
+*   **Not production ready**: This project is primarily a learning exercise and lacks the robustness, extensive testing, and feature completeness required for production environments. In particular, I've only tested this on aarch64 macos.
 *   **No checksum in pages yet**: Data pages do not currently include checksums, making it harder to detect silent data corruption on disk.
 *   **No disaster/corruption recovery**: Beyond basic meta page integrity for atomic commits, there are no advanced mechanisms for recovering from significant file corruption or disasters.
 *   **No network replication/CDC**: The database operates as a single-node instance; there's no support for replicating data to other nodes or Change Data Capture (CDC) for external systems.

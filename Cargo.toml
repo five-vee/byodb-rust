@@ -5,9 +5,11 @@ edition = "2024"
 description = "Build Your Own Database in Rust!"
 repository = "https://github.com/five-vee/byodb-rust"
 license = "MIT"
-include = [
-  "**/*.rs",
-  "LICENSE"
+keywords = ["database", "bplustree"]
+categories = ["database-implementations"]
+exclude = [
+  ".flox/*",
+  "justfile",
 ]
 
 [dependencies]
