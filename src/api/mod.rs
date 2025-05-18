@@ -282,10 +282,7 @@ mod tests {
     use rand_chacha::ChaCha8Rng;
     use tempfile::NamedTempFile;
 
-    use super::{
-        error::{NodeError, TreeError},
-        *,
-    };
+    use super::{error::TreeError, *};
 
     const DEFAULT_SEED: u64 = 1;
     const DEFAULT_NUM_SEEDED_KEY_VALS: usize = 1000;
@@ -314,10 +311,7 @@ mod tests {
             let mut t = db.rw_txn();
             for (i, (k, v)) in self.enumerate() {
                 let result = t.insert(k.as_bytes(), v.as_bytes());
-                if matches!(
-                    result,
-                    Err(TxnError::Tree(TreeError::AlreadyExists))
-                ) {
+                if matches!(result, Err(TxnError::Tree(TreeError::AlreadyExists))) {
                     // Skip
                     continue;
                 }

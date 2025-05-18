@@ -1,5 +1,7 @@
 # Build Your Own Database from Scratch (in Rust)
 
+[<img alt="docs.rs" src="https://img.shields.io/docsrs/byodb-rust">](https://docs.rs/byodb-rust/latest/byodb_rust/)
+
 https://build-your-own.org/database/, but instead of Go, use Rust. This a personal project to learn both database internals and the Rust programming language.
 
 ## Database Design

@@ -1,6 +1,6 @@
 [package]
 name = "byodb-rust"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "Build Your Own Database in Rust!"
 repository = "https://github.com/five-vee/byodb-rust"
